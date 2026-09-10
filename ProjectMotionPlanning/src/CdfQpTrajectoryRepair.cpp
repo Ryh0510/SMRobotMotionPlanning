@@ -221,6 +221,55 @@ namespace motion_planning
             return std::sqrt(sum);
         }
 
+        double nearestPointDistance(const collision::CollisionResult& collisionResult)
+        {
+            if(!collisionResult.hasNearestPoints) {
+                return std::numeric_limits<double>::max();
+            }
+            return (collisionResult.nearestPointA - collisionResult.nearestPointB).norm();
+        }
+
+        double maxContactPenetrationDepth(const collision::CollisionResult& collisionResult)
+        {
+            double penetrationDepth = 0.0;
+            for(const collision::Contact& contact : collisionResult.contacts) {
+                if(std::isfinite(contact.penetrationDepth)) {
+                    penetrationDepth = std::max(penetrationDepth, contact.penetrationDepth);
+                }
+            }
+            return penetrationDepth;
+        }
+
+        bool extractNearestDirection(
+            const collision::CollisionResult& collisionResult,
+            collision::Vec3* direction)
+        {
+            if(direction == nullptr) {
+                return false;
+            }
+
+            if(collisionResult.hasNearestPoints) {
+                const collision::Vec3 delta =
+                    collisionResult.nearestPointB - collisionResult.nearestPointA;
+                const double norm = delta.norm();
+                if(std::isfinite(norm) && norm > kTiny) {
+                    *direction = delta / norm;
+                    return true;
+                }
+            }
+
+            for(const collision::Contact& contact : collisionResult.contacts) {
+                const double norm = contact.normal.norm();
+                if(std::isfinite(norm) && norm > kTiny) {
+                    *direction = contact.normal / norm;
+                    return true;
+                }
+            }
+
+            direction->setZero();
+            return false;
+        }
+
         double dot(
             const std::vector<double>& lhs,
             const std::vector<double>& rhs)
@@ -301,6 +350,8 @@ namespace motion_planning
             bool inCollision = false;
             double phi = -std::numeric_limits<double>::max();
             double rawDistance = std::numeric_limits<double>::max();
+            collision::Vec3 nearestDirection = collision::Vec3::Zero();
+            bool hasNearestDirection = false;
             std::string message;
         };
 
@@ -323,6 +374,8 @@ namespace motion_planning
             bool checkedAnyDetector = false;
             double minimumPhi = std::numeric_limits<double>::max();
             double minimumDistance = std::numeric_limits<double>::max();
+            collision::Vec3 bestDirection = collision::Vec3::Zero();
+            bool bestDirectionValid = false;
             bool inCollision = false;
 
             for(const std::string& detectorId : scene.collisionDetectorIds()) {
@@ -342,23 +395,42 @@ namespace motion_planning
                     return sample;
                 }
 
+                double candidateDistance = std::numeric_limits<double>::max();
+                double candidatePhi = std::numeric_limits<double>::max();
+                collision::Vec3 candidateDirection = collision::Vec3::Zero();
+                bool candidateDirectionValid = false;
+
                 if(collisionResult->inCollision()) {
                     inCollision = true;
-                    double penetrationDepth = 0.0;
-                    for(const collision::Contact& contact : collisionResult->contacts) {
-                        if(std::isfinite(contact.penetrationDepth)) {
-                            penetrationDepth = std::max(penetrationDepth, contact.penetrationDepth);
-                        }
-                    }
-                    const double signedDistance = -(penetrationDepth > 0.0 ? penetrationDepth : 1.0e-5);
-                    minimumPhi = std::min(minimumPhi, signedDistance - safetyMargin);
-                    minimumDistance = std::min(minimumDistance, signedDistance);
-                    sawFiniteDistance = true;
+                    const double penetrationDepth = maxContactPenetrationDepth(*collisionResult);
+                    const double nearestDistance = nearestPointDistance(*collisionResult);
+                    const double collisionMagnitude =
+                        penetrationDepth > 0.0
+                            ? penetrationDepth
+                            : (std::isfinite(nearestDistance) && nearestDistance > 0.0
+                                ? nearestDistance
+                                : 1.0e-5);
+                    candidateDistance = collisionMagnitude;
+                    candidatePhi = -collisionMagnitude - safetyMargin;
+                    candidateDirectionValid = extractNearestDirection(*collisionResult, &candidateDirection);
                 } else if(std::isfinite(collisionResult->minDistance) &&
                     collisionResult->minDistance < std::numeric_limits<double>::max() * 0.25) {
+                    const double nearestDistance = nearestPointDistance(*collisionResult);
+                    candidateDistance = std::isfinite(nearestDistance) ? nearestDistance : collisionResult->minDistance;
+                    candidatePhi = candidateDistance - safetyMargin;
+                    candidateDirectionValid = extractNearestDirection(*collisionResult, &candidateDirection);
+                }
+
+                if(std::isfinite(candidatePhi) && std::isfinite(candidateDistance)) {
                     sawFiniteDistance = true;
-                    minimumDistance = std::min(minimumDistance, collisionResult->minDistance);
-                    minimumPhi = std::min(minimumPhi, collisionResult->minDistance - safetyMargin);
+                    if(candidatePhi < minimumPhi) {
+                        minimumPhi = candidatePhi;
+                        minimumDistance = candidateDistance;
+                        bestDirection = candidateDirection;
+                        bestDirectionValid = candidateDirectionValid;
+                    } else {
+                        minimumDistance = std::min(minimumDistance, candidateDistance);
+                    }
                 }
             }
 
@@ -383,6 +455,8 @@ namespace motion_planning
             sample.inCollision = inCollision;
             sample.rawDistance = minimumDistance;
             sample.phi = minimumPhi;
+            sample.nearestDirection = bestDirection;
+            sample.hasNearestDirection = bestDirectionValid;
             return sample;
         }
 
