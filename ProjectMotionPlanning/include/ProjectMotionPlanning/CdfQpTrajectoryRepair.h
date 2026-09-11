@@ -30,15 +30,18 @@ namespace motion_planning
         double targetClearance = 0.0;
         double finiteDifferenceStep = 5.0e-4;
         double distanceThreshold = 5.0;
-        double trustRegion = 0.02;
-        double seedCorridor = 0.10;
-        double smoothWeight = 0.16;
-        double seedTrackingWeight = 0.40;
-        double repairGain = 0.25;
-        int segmentIntermediateSamples = 1;
-        int maxIterations = 5;
+        double trustRegion = 0.012;
+        double seedCorridor = 0.06;
+        double smoothWeight = 0.12;
+        double seedTrackingWeight = 0.55;
+        double repairGain = 0.12;
+        int segmentIntermediateSamples = 2;
+        int maxIterations = 8;
+        int postSmoothingIterations = 3;
+        double postSmoothingStep = 0.25;
+        double postSmoothingSeedWeight = 0.10;
         bool keepEndpoints = true;
-        double validationMaxJointStep = 0.03;
+        double validationMaxJointStep = 0.02;
     };
 
     struct ProjectCdfQpRepairStatistics

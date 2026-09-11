@@ -1,13 +1,16 @@
 #include <ProjectMotionPlanning/CdfQpTrajectoryRepair.h>
 
 #include <ProjectMotionPlanning/ProjectMotionPlanning.h>
+#include <MotionPlanningOmpl/OmplMotionPlanner.h>
 #include <SimulationProject/ProjectDocument.h>
 #include <osqp.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <limits>
 #include <memory>
+#include <random>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -147,6 +150,12 @@ namespace motion_planning
             simulation_project::CollisionDetectorTargetDesc obstacleTarget;
             obstacleTarget.robotId = obstacleRobotId;
             detector.targets.push_back(std::move(obstacleTarget));
+
+            simulation_project::CollisionPairGeneratorDesc generator;
+            generator.type = "RobotRobot";
+            generator.robotA = planningRobotId;
+            generator.robotB = obstacleRobotId;
+            detector.pairGenerators.push_back(std::move(generator));
             return detector;
         }
 
@@ -175,6 +184,12 @@ namespace motion_planning
             simulation_project::CollisionDetectorTargetDesc obstacleTarget;
             obstacleTarget.objectId = obstacleObjectId;
             detector.targets.push_back(std::move(obstacleTarget));
+
+            simulation_project::CollisionPairGeneratorDesc generator;
+            generator.type = "RobotObject";
+            generator.robotId = planningRobotId;
+            generator.objectId = obstacleObjectId;
+            detector.pairGenerators.push_back(std::move(generator));
             return detector;
         }
 
@@ -217,6 +232,25 @@ namespace motion_planning
             double sum = 0.0;
             for(const double value : values) {
                 sum += value * value;
+            }
+            return std::sqrt(sum);
+        }
+
+        double stateDistance(
+            const std::vector<double>& from,
+            const std::vector<double>& to,
+            const std::vector<JointBound>& bounds)
+        {
+            double sum = 0.0;
+            const std::size_t count = std::min(from.size(), to.size());
+            for(std::size_t jointIndex = 0; jointIndex < count; ++jointIndex) {
+                double delta = to[jointIndex] - from[jointIndex];
+                const bool isContinuous = !bounds.empty() &&
+                    (jointIndex < bounds.size() ? bounds[jointIndex] : bounds.back()).continuous;
+                if(isContinuous) {
+                    delta = std::remainder(delta, kTwoPi);
+                }
+                sum += delta * delta;
             }
             return std::sqrt(sum);
         }
@@ -311,9 +345,10 @@ namespace motion_planning
                     double maxDelta = 0.0;
                     const std::size_t count = std::min(start.q.size(), end.q.size());
                     for(std::size_t jointIndex = 0; jointIndex < count; ++jointIndex) {
-                        const JointBound& jointBound = jointIndex < bounds.size() ? bounds[jointIndex] : bounds.back();
                         double delta = end.q[jointIndex] - start.q[jointIndex];
-                        if(jointBound.continuous) {
+                        const bool isContinuous = !bounds.empty() &&
+                            (jointIndex < bounds.size() ? bounds[jointIndex] : bounds.back()).continuous;
+                        if(isContinuous) {
                             delta = wrapContinuousAngle(delta);
                         }
                         maxDelta = std::max(maxDelta, std::abs(delta));
@@ -332,7 +367,16 @@ namespace motion_planning
                     for(std::size_t jointIndex = 0; jointIndex < start.q.size(); ++jointIndex) {
                         const double startValue = jointIndex < start.q.size() ? start.q[jointIndex] : 0.0;
                         const double endValue = jointIndex < end.q.size() ? end.q[jointIndex] : startValue;
-                        sample.q[jointIndex] = startValue + (endValue - startValue) * fraction;
+                        double delta = endValue - startValue;
+                        const bool isContinuous = !bounds.empty() &&
+                            (jointIndex < bounds.size() ? bounds[jointIndex] : bounds.back()).continuous;
+                        if(isContinuous) {
+                            delta = wrapContinuousAngle(delta);
+                        }
+                        const double interpolated = startValue + delta * fraction;
+                        sample.q[jointIndex] = isContinuous
+                            ? wrapContinuousAngle(interpolated)
+                            : interpolated;
                     }
                     sample.qd.clear();
                     sample.qdd.clear();
@@ -342,6 +386,623 @@ namespace motion_planning
             }
 
             return densePoints;
+        }
+
+        struct InvalidSegmentRun
+        {
+            std::size_t beginSegment = 0;
+            std::size_t endSegment = 0;
+        };
+
+        struct RepairWindow
+        {
+            std::size_t beginIndex = 0;
+            std::size_t endIndex = 0;
+        };
+
+        template<typename ValidationRequest>
+        std::vector<InvalidSegmentRun> collectInvalidSegmentRuns(
+            ProjectPlanningSceneSnapshot& scene,
+            const std::vector<std::vector<double>>& path,
+            const ValidationRequest& validation)
+        {
+            std::vector<InvalidSegmentRun> runs;
+            std::size_t index = 0;
+            while(index + 1 < path.size()) {
+                const StateValidationResult segmentValidation =
+                    scene.validateMotion(path[index], path[index + 1], validation);
+                if(segmentValidation.valid) {
+                    ++index;
+                    continue;
+                }
+
+                InvalidSegmentRun run;
+                run.beginSegment = index;
+                run.endSegment = index;
+                while(run.endSegment + 1 < path.size() - 1) {
+                    const std::size_t nextIndex = run.endSegment + 1;
+                    const StateValidationResult nextValidation =
+                        scene.validateMotion(path[nextIndex], path[nextIndex + 1], validation);
+                    if(nextValidation.valid) {
+                        break;
+                    }
+                    run.endSegment = nextIndex;
+                }
+                runs.push_back(run);
+                index = run.endSegment + 1;
+            }
+            return runs;
+        }
+
+        std::vector<double> interpolateJointState(
+            const std::vector<double>& from,
+            const std::vector<double>& to,
+            double fraction,
+            const std::vector<JointBound>& bounds)
+        {
+            std::vector<double> interpolated = from;
+            const std::size_t count = std::min(from.size(), to.size());
+            for(std::size_t jointIndex = 0; jointIndex < count; ++jointIndex) {
+                double delta = to[jointIndex] - from[jointIndex];
+                const bool isContinuous = !bounds.empty() &&
+                    (jointIndex < bounds.size() ? bounds[jointIndex] : bounds.back()).continuous;
+                if(isContinuous) {
+                    delta = std::remainder(delta, kTwoPi);
+                }
+                interpolated[jointIndex] = from[jointIndex] + delta * fraction;
+                if(isContinuous) {
+                    interpolated[jointIndex] = wrapContinuousAngle(interpolated[jointIndex]);
+                }
+            }
+            return clampToBounds(interpolated, bounds, nullptr);
+        }
+
+        std::vector<std::vector<double>> resampleJointPath(
+            const std::vector<std::vector<double>>& coarsePath,
+            std::size_t sampleCount,
+            const std::vector<JointBound>& bounds)
+        {
+            std::vector<std::vector<double>> samples;
+            if(coarsePath.empty() || sampleCount == 0) {
+                return samples;
+            }
+            if(coarsePath.size() == 1 || sampleCount == 1) {
+                samples.assign(sampleCount, clampToBounds(coarsePath.front(), bounds, nullptr));
+                return samples;
+            }
+
+            std::vector<double> cumulative(coarsePath.size(), 0.0);
+            for(std::size_t index = 1; index < coarsePath.size(); ++index) {
+                cumulative[index] = cumulative[index - 1] +
+                    stateDistance(coarsePath[index - 1], coarsePath[index], bounds);
+            }
+
+            const double totalDistance = cumulative.back();
+            samples.reserve(sampleCount);
+            for(std::size_t sampleIndex = 0; sampleIndex < sampleCount; ++sampleIndex) {
+                const double targetDistance = sampleCount > 1
+                    ? totalDistance * static_cast<double>(sampleIndex) / static_cast<double>(sampleCount - 1)
+                    : 0.0;
+
+                std::size_t segmentIndex = 0;
+                while(segmentIndex + 1 < cumulative.size() &&
+                    cumulative[segmentIndex + 1] < targetDistance) {
+                    ++segmentIndex;
+                }
+
+                if(segmentIndex + 1 >= cumulative.size()) {
+                    samples.push_back(clampToBounds(coarsePath.back(), bounds, nullptr));
+                    continue;
+                }
+
+                const double segmentDistance = cumulative[segmentIndex + 1] - cumulative[segmentIndex];
+                const double fraction = segmentDistance > kTiny
+                    ? (targetDistance - cumulative[segmentIndex]) / segmentDistance
+                    : 0.0;
+                samples.push_back(interpolateJointState(
+                    coarsePath[segmentIndex],
+                    coarsePath[segmentIndex + 1],
+                    std::clamp(fraction, 0.0, 1.0),
+                    bounds));
+            }
+
+            return samples;
+        }
+
+        bool locateSafeOmplAnchors(
+            ProjectPlanningSceneSnapshot& scene,
+            const std::vector<std::vector<double>>& path,
+            const InvalidSegmentRun& run,
+            std::size_t* beginIndex,
+            std::size_t* endIndex)
+        {
+            if(beginIndex == nullptr || endIndex == nullptr || path.size() < 2) {
+                return false;
+            }
+
+            std::size_t left = run.beginSegment;
+            while(true) {
+                if(scene.validateState(path[left]).valid) {
+                    break;
+                }
+                if(left == 0) {
+                    return false;
+                }
+                --left;
+            }
+
+            std::size_t right = run.endSegment + 1;
+            while(right < path.size() && !scene.validateState(path[right]).valid) {
+                ++right;
+            }
+            if(right >= path.size()) {
+                return false;
+            }
+
+            if(left >= right) {
+                return false;
+            }
+
+            *beginIndex = left;
+            *endIndex = right;
+            return true;
+        }
+
+        bool findNearbySafeState(
+            ProjectPlanningSceneSnapshot& scene,
+            const std::vector<double>& center,
+            const std::vector<JointBound>& bounds,
+            std::vector<double>* safeState)
+        {
+            if(safeState == nullptr || center.empty()) {
+                return false;
+            }
+
+            std::vector<double> candidate = clampToBounds(center, bounds, nullptr);
+            if(scene.validateState(candidate).valid) {
+                *safeState = std::move(candidate);
+                return true;
+            }
+
+            // Escape a configuration that starts inside the obstacle by probing
+            // small joint-space shells first. This changes only an invalid end
+            // point; all interior waypoints remain governed by OMPL validation.
+            const std::array<double, 6> radii = { 0.05, 0.10, 0.20, 0.35, 0.55, 0.80 };
+            for(const double radius : radii) {
+                for(std::size_t joint = 0; joint < center.size(); ++joint) {
+                    for(const double sign : { -1.0, 1.0 }) {
+                        candidate = center;
+                        candidate[joint] += sign * radius;
+                        candidate = clampToBounds(candidate, bounds, nullptr);
+                        if(scene.validateState(candidate).valid) {
+                            *safeState = std::move(candidate);
+                            return true;
+                        }
+                    }
+                }
+            }
+
+            std::mt19937 generator(928371u);
+            std::uniform_real_distribution<double> perturbation(-1.0, 1.0);
+            for(std::size_t sample = 0; sample < 256; ++sample) {
+                candidate = center;
+                const double radius = 0.10 + 0.90 * static_cast<double>(sample) / 255.0;
+                for(std::size_t joint = 0; joint < center.size(); ++joint) {
+                    candidate[joint] += radius * perturbation(generator);
+                }
+                candidate = clampToBounds(candidate, bounds, nullptr);
+                if(scene.validateState(candidate).valid) {
+                    *safeState = std::move(candidate);
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        std::vector<std::vector<double>> unwrapContinuousPath(
+            const std::vector<std::vector<double>>& source,
+            const std::vector<JointBound>& bounds)
+        {
+            std::vector<std::vector<double>> result = source;
+            if(result.empty()) {
+                return result;
+            }
+
+            for(std::size_t point = 1; point < result.size(); ++point) {
+                const std::size_t count = std::min(result[point].size(), bounds.size());
+                for(std::size_t joint = 0; joint < count; ++joint) {
+                    if(!bounds[joint].continuous) {
+                        continue;
+                    }
+                    result[point][joint] = result[point - 1][joint] +
+                        std::remainder(result[point][joint] - result[point - 1][joint], kTwoPi);
+                }
+            }
+            return result;
+        }
+
+        double localSmoothingCost(
+            const std::vector<double>& previous,
+            const std::vector<double>& current,
+            const std::vector<double>& next,
+            const std::vector<double>& reference,
+            const std::vector<JointBound>& bounds,
+            double seedWeight)
+        {
+            double cost = 0.0;
+            const std::size_t count = std::min(current.size(), std::min(previous.size(), next.size()));
+            for(std::size_t joint = 0; joint < count; ++joint) {
+                const bool continuous = joint < bounds.size() && bounds[joint].continuous;
+                const double midpoint = 0.5 * (previous[joint] + next[joint]);
+                const double curvature = current[joint] - midpoint;
+                double referenceValue = joint < reference.size() ? reference[joint] : current[joint];
+                if(continuous) {
+                    referenceValue = current[joint] +
+                        std::remainder(referenceValue - current[joint], kTwoPi);
+                }
+                const double seedError = current[joint] - referenceValue;
+                cost += curvature * curvature + seedWeight * seedError * seedError;
+            }
+            return cost;
+        }
+
+        bool smoothCollisionFreePath(
+            ProjectPlanningSceneSnapshot& scene,
+            const std::vector<JointBound>& bounds,
+            const MotionValidationOptions& validation,
+            const std::vector<std::vector<double>>& referencePath,
+            int iterationCount,
+            double smoothingStep,
+            double seedWeight,
+            bool keepEndpoints,
+            std::vector<std::vector<double>>* path)
+        {
+            if(path == nullptr || path->size() < 3) {
+                return false;
+            }
+
+            *path = unwrapContinuousPath(*path, bounds);
+            const std::vector<std::vector<double>> reference =
+                unwrapContinuousPath(referencePath, bounds);
+            const int passes = std::max(0, std::min(iterationCount, 8));
+            const double step = std::clamp(
+                std::isfinite(smoothingStep) ? smoothingStep : 0.25,
+                0.02,
+                0.50);
+            const double effectiveSeedWeight = std::clamp(
+                std::isfinite(seedWeight) ? seedWeight : 0.10,
+                0.0,
+                1.0);
+            bool changed = false;
+
+            for(int pass = 0; pass < passes; ++pass) {
+                for(std::size_t point = 1; point + 1 < path->size(); ++point) {
+                    if(keepEndpoints && (point == 0 || point + 1 == path->size())) {
+                        continue;
+                    }
+
+                    const std::vector<double>& previous = (*path)[point - 1];
+                    const std::vector<double>& current = (*path)[point];
+                    const std::vector<double>& next = (*path)[point + 1];
+                    const std::vector<double>& referencePoint = point < reference.size()
+                        ? reference[point]
+                        : current;
+                    std::vector<double> candidate = current;
+                    const std::size_t count = std::min(candidate.size(), std::min(previous.size(), next.size()));
+                    for(std::size_t joint = 0; joint < count; ++joint) {
+                        const bool continuous = joint < bounds.size() && bounds[joint].continuous;
+                        const double midpoint = 0.5 * (previous[joint] + next[joint]);
+                        double referenceValue = joint < referencePoint.size()
+                            ? referencePoint[joint]
+                            : current[joint];
+                        if(continuous) {
+                            referenceValue = current[joint] +
+                                std::remainder(referenceValue - current[joint], kTwoPi);
+                        }
+                        const double desired = (1.0 - effectiveSeedWeight) * midpoint +
+                            effectiveSeedWeight * referenceValue;
+                        candidate[joint] = current[joint] + step * (desired - current[joint]);
+                    }
+                    for(std::size_t joint = 0; joint < count && joint < bounds.size(); ++joint) {
+                        if(!bounds[joint].continuous) {
+                            candidate[joint] = std::max(
+                                bounds[joint].lower,
+                                std::min(bounds[joint].upper, candidate[joint]));
+                        }
+                    }
+
+                    const double beforeCost = localSmoothingCost(
+                        previous, current, next, referencePoint, bounds, effectiveSeedWeight);
+                    const double afterCost = localSmoothingCost(
+                        previous, candidate, next, referencePoint, bounds, effectiveSeedWeight);
+                    if(!(afterCost + 1.0e-12 < beforeCost) ||
+                        !scene.validateState(candidate).valid ||
+                        !scene.validateMotion(previous, candidate, validation).valid ||
+                        !scene.validateMotion(candidate, next, validation).valid) {
+                        continue;
+                    }
+
+                    (*path)[point] = std::move(candidate);
+                    changed = true;
+                }
+            }
+            return changed;
+        }
+
+        std::vector<std::vector<double>> pathSegmentFromTrajectory(
+            const robottrajectory::JointTrajectory& trajectory)
+        {
+            std::vector<std::vector<double>> path;
+            path.reserve(trajectory.points.size());
+            for(const robottrajectory::TimedJointPoint& point : trajectory.points) {
+                path.push_back(point.q);
+            }
+            return path;
+        }
+
+        bool repairCollisionRunsWithOmpl(
+            ProjectPlanningSceneSnapshot& scene,
+            const std::vector<JointBound>& bounds,
+            const MotionValidationOptions& validation,
+            const ProjectCdfQpRepairOptions& options,
+            ProjectCdfQpRepairStatistics* statistics,
+            std::vector<MotionPlanningDiagnostic>* diagnostics,
+            std::vector<std::vector<double>>* path)
+        {
+            (void)options;
+            (void)statistics;
+            if(path == nullptr || path->size() < 2) {
+                return false;
+            }
+
+            // A long imported trajectory can contain many disconnected collision
+            // runs. Give each run several chances with progressively wider local
+            // bounds, but keep every attempt short so one bad window cannot stall
+            // the complete repair.
+            const int maxPasses = path->size() > 100 ? 96 : 12;
+            bool changedAny = false;
+            std::vector<std::pair<std::size_t, std::size_t>> failedIntervals;
+            for(int pass = 0; pass < maxPasses; ++pass) {
+                const std::vector<InvalidSegmentRun> runs =
+                    collectInvalidSegmentRuns(scene, *path, validation);
+                if(runs.empty()) {
+                    return changedAny;
+                }
+
+                const InvalidSegmentRun* selectedRun = nullptr;
+                for(const InvalidSegmentRun& candidate : runs) {
+                    const auto candidateKey = std::make_pair(candidate.beginSegment, candidate.endSegment);
+                    if(std::find(failedIntervals.begin(), failedIntervals.end(), candidateKey) != failedIntervals.end()) {
+                        continue;
+                    }
+                    const std::size_t candidateLength =
+                        candidate.endSegment >= candidate.beginSegment
+                            ? (candidate.endSegment - candidate.beginSegment + 1)
+                            : 0;
+                    const std::size_t selectedLength = selectedRun == nullptr
+                        ? 0
+                        : (selectedRun->endSegment >= selectedRun->beginSegment
+                            ? (selectedRun->endSegment - selectedRun->beginSegment + 1)
+                            : 0);
+                    if(selectedRun == nullptr || candidateLength > selectedLength) {
+                        selectedRun = &candidate;
+                    }
+                }
+
+                if(selectedRun == nullptr) {
+                    return changedAny;
+                }
+
+                const InvalidSegmentRun& run = *selectedRun;
+                const auto intervalKey = std::make_pair(run.beginSegment, run.endSegment);
+                std::size_t beginAnchor = 0;
+                std::size_t endAnchor = 0;
+                const bool hasRegularAnchors = locateSafeOmplAnchors(
+                    scene,
+                    *path,
+                    run,
+                    &beginAnchor,
+                    &endAnchor);
+                std::vector<double> escapedStart;
+                std::vector<double> escapedGoal;
+                if(!hasRegularAnchors) {
+                    const bool touchesStart = run.beginSegment == 0;
+                    const bool touchesEnd = run.endSegment + 1 >= path->size() - 1;
+                    if(touchesStart) {
+                        endAnchor = run.endSegment + 1;
+                        if(endAnchor >= path->size() ||
+                            !scene.validateState((*path)[endAnchor]).valid ||
+                            !findNearbySafeState(scene, (*path)[0], bounds, &escapedStart)) {
+                            escapedStart.clear();
+                        }
+                        beginAnchor = 0;
+                    }
+                    if(touchesEnd && escapedStart.empty()) {
+                        beginAnchor = run.beginSegment;
+                        if(!scene.validateState((*path)[beginAnchor]).valid ||
+                            !findNearbySafeState(scene, path->back(), bounds, &escapedGoal)) {
+                            escapedGoal.clear();
+                        }
+                        endAnchor = path->size() - 1;
+                    }
+                    if((!touchesStart && !touchesEnd) ||
+                        (escapedStart.empty() && escapedGoal.empty())) {
+                        addDiagnostic(
+                            diagnostics,
+                            "ompl_anchor_missing",
+                            "Failed to locate safe anchor states around collision interval "
+                                + std::to_string(run.beginSegment + 1)
+                                + " -> " + std::to_string(run.endSegment + 2) + ".");
+                        failedIntervals.push_back(intervalKey);
+                        continue;
+                    }
+                }
+
+                if(endAnchor <= beginAnchor + 1) {
+                    failedIntervals.push_back(intervalKey);
+                    continue;
+                }
+
+                std::vector<std::vector<double>> rawSegment;
+                rawSegment.reserve(endAnchor - beginAnchor + 1);
+                for(std::size_t index = beginAnchor; index <= endAnchor; ++index) {
+                    rawSegment.push_back((*path)[index]);
+                }
+
+                const std::size_t replacementCount = endAnchor - beginAnchor + 1;
+                std::vector<double> rawStart = escapedStart.empty()
+                    ? (*path)[beginAnchor]
+                    : escapedStart;
+                std::vector<double> rawGoal = escapedGoal.empty()
+                    ? (*path)[endAnchor]
+                    : escapedGoal;
+
+                // Limit OMPL to a corridor around the original collision interval.
+                // A global joint-space RRT can legally solve the problem by taking a
+                // very large detour, which is unsafe for a surface-following path.
+                std::vector<JointBound> localBounds = bounds;
+                for(std::size_t joint = 0; joint < localBounds.size(); ++joint) {
+                    const JointBound& globalBound = bounds[joint];
+                    double reference = joint < rawStart.size() ? rawStart[joint] : 0.0;
+                    double minimum = reference;
+                    double maximum = reference;
+                    for(const std::vector<double>& state : rawSegment) {
+                        if(joint >= state.size()) {
+                            continue;
+                        }
+                        double value = state[joint];
+                        if(globalBound.continuous) {
+                            value = reference + std::remainder(value - reference, kTwoPi);
+                        }
+                        minimum = std::min(minimum, value);
+                        maximum = std::max(maximum, value);
+                    }
+
+                    // Try progressively wider local corridors. Continuous joints
+                    // are represented in this local unwrapped chart; the planning
+                    // scene normalizes them again before collision evaluation.
+                    const double corridor = pass < 4 ? 0.25 : (pass < 8 ? 0.45 : 0.75);
+                    const double lower = globalBound.continuous
+                        ? minimum - corridor
+                        : std::max(globalBound.lower, minimum - corridor);
+                    const double upper = globalBound.continuous
+                        ? maximum + corridor
+                        : std::min(globalBound.upper, maximum + corridor);
+                    if(std::isfinite(lower) && std::isfinite(upper) && lower < upper) {
+                        localBounds[joint].lower = lower;
+                        localBounds[joint].upper = upper;
+                    }
+                }
+
+                JointPlanningProblem problem;
+                problem.robotId = scene.robotId();
+                problem.jointNames = scene.jointNames();
+                problem.jointBounds = localBounds;
+                problem.start = rawStart;
+                problem.goal = rawGoal;
+                for(std::size_t joint = 0; joint < problem.start.size() && joint < localBounds.size(); ++joint) {
+                    if(localBounds[joint].continuous) {
+                        const double reference = rawStart[joint];
+                        problem.start[joint] = reference;
+                        problem.goal[joint] = reference + std::remainder(rawGoal[joint] - reference, kTwoPi);
+                    }
+                }
+                problem.planner.plannerId = "RRTConnect";
+                problem.planner.timeoutSeconds = pass < 8 ? 1.0 : 1.5;
+                problem.planner.range = 0.0;
+                problem.planner.randomSeed = static_cast<std::uint32_t>(1337u + pass * 97u + run.beginSegment * 13u);
+                problem.planner.simplifyPath = true;
+                problem.validation = validation;
+                problem.validation.maxJointStep = std::min(
+                    std::max(validation.maxJointStep, 0.005),
+                    0.02);
+                problem.postProcess.duration = std::max(
+                    1.0,
+                    static_cast<double>(replacementCount > 1 ? replacementCount - 1 : 1));
+                problem.postProcess.minimumWaypointCount = std::max<std::size_t>(
+                    rawSegment.size(),
+                    6);
+
+                OmplMotionPlanner omplPlanner;
+                MotionPlanningResult omplResult = omplPlanner.plan(problem, scene);
+                if(!omplResult.succeeded() || omplResult.trajectory.points.size() < 2) {
+                    addDiagnostic(
+                        diagnostics,
+                        "ompl_segment_failed",
+                        omplResult.diagnostics.empty()
+                            ? "OMPL failed to repair a collision interval."
+                            : omplResult.diagnostics.front().message);
+                    failedIntervals.push_back(intervalKey);
+                    continue;
+                }
+
+                std::vector<std::vector<double>> coarseSegment =
+                    pathSegmentFromTrajectory(omplResult.trajectory);
+                if(coarseSegment.size() < 2) {
+                    failedIntervals.push_back(intervalKey);
+                    continue;
+                }
+
+                std::vector<std::vector<double>> densifiedSegment =
+                    resampleJointPath(coarseSegment, replacementCount, bounds);
+                if(densifiedSegment.size() != replacementCount) {
+                    addDiagnostic(
+                        diagnostics,
+                        "ompl_segment_resample_failed",
+                        "Failed to resample OMPL repaired segment to the original waypoint count.");
+                    failedIntervals.push_back(intervalKey);
+                    continue;
+                }
+
+                std::vector<std::vector<double>> candidatePath = *path;
+                for(std::size_t index = 0; index < replacementCount; ++index) {
+                    candidatePath[beginAnchor + index] = densifiedSegment[index];
+                }
+
+                bool replacementValid = true;
+                for(std::size_t index = beginAnchor; index < endAnchor; ++index) {
+                    if(!scene.validateMotion(candidatePath[index], candidatePath[index + 1], validation).valid) {
+                        replacementValid = false;
+                        break;
+                    }
+                }
+                // Check the two seams as well. A replacement may be valid in its
+                // interior yet invalidate an already repaired neighbouring edge.
+                if(replacementValid && beginAnchor > 0) {
+                    replacementValid = scene.validateMotion(
+                        candidatePath[beginAnchor - 1],
+                        candidatePath[beginAnchor],
+                        validation).valid;
+                }
+                if(replacementValid && endAnchor + 1 < candidatePath.size()) {
+                    replacementValid = scene.validateMotion(
+                        candidatePath[endAnchor],
+                        candidatePath[endAnchor + 1],
+                        validation).valid;
+                }
+                if(!replacementValid) {
+                    addDiagnostic(
+                        diagnostics,
+                        "ompl_segment_validation_failed",
+                        "Rejected OMPL replacement because its resampled segment is still invalid.");
+                    failedIntervals.push_back(intervalKey);
+                    continue;
+                }
+
+                for(std::size_t index = 0; index < replacementCount; ++index) {
+                    (*path)[beginAnchor + index] = std::move(candidatePath[beginAnchor + index]);
+                }
+                addDiagnostic(
+                    diagnostics,
+                    "ompl_segment_repaired",
+                    "Repaired collision interval "
+                        + std::to_string(run.beginSegment + 1) + " -> "
+                        + std::to_string(run.endSegment + 2)
+                        + " with OMPL/RRTConnect before CDF/QP smoothing.");
+                changedAny = true;
+            }
+
+            return changedAny;
         }
 
         struct SignedDistanceSample
@@ -395,11 +1056,6 @@ namespace motion_planning
                     return sample;
                 }
 
-                double candidateDistance = std::numeric_limits<double>::max();
-                double candidatePhi = std::numeric_limits<double>::max();
-                collision::Vec3 candidateDirection = collision::Vec3::Zero();
-                bool candidateDirectionValid = false;
-
                 if(collisionResult->inCollision()) {
                     inCollision = true;
                     const double penetrationDepth = maxContactPenetrationDepth(*collisionResult);
@@ -410,26 +1066,34 @@ namespace motion_planning
                             : (std::isfinite(nearestDistance) && nearestDistance > 0.0
                                 ? nearestDistance
                                 : 1.0e-5);
-                    candidateDistance = collisionMagnitude;
-                    candidatePhi = -collisionMagnitude - safetyMargin;
-                    candidateDirectionValid = extractNearestDirection(*collisionResult, &candidateDirection);
+                    const double signedDistance = -collisionMagnitude;
+                    collision::Vec3 direction = collision::Vec3::Zero();
+                    const bool directionValid = extractNearestDirection(*collisionResult, &direction);
+                    const double candidatePhi = signedDistance - safetyMargin;
+                    if(candidatePhi < minimumPhi) {
+                        minimumPhi = candidatePhi;
+                        minimumDistance = signedDistance;
+                        bestDirection = direction;
+                        bestDirectionValid = directionValid;
+                    } else {
+                        minimumDistance = std::min(minimumDistance, signedDistance);
+                    }
+                    sawFiniteDistance = true;
                 } else if(std::isfinite(collisionResult->minDistance) &&
                     collisionResult->minDistance < std::numeric_limits<double>::max() * 0.25) {
                     const double nearestDistance = nearestPointDistance(*collisionResult);
-                    candidateDistance = std::isfinite(nearestDistance) ? nearestDistance : collisionResult->minDistance;
-                    candidatePhi = candidateDistance - safetyMargin;
-                    candidateDirectionValid = extractNearestDirection(*collisionResult, &candidateDirection);
-                }
-
-                if(std::isfinite(candidatePhi) && std::isfinite(candidateDistance)) {
+                    const double signedDistance =
+                        std::isfinite(nearestDistance) ? nearestDistance : collisionResult->minDistance;
+                    collision::Vec3 direction = collision::Vec3::Zero();
+                    const bool directionValid = extractNearestDirection(*collisionResult, &direction);
                     sawFiniteDistance = true;
-                    if(candidatePhi < minimumPhi) {
-                        minimumPhi = candidatePhi;
-                        minimumDistance = candidateDistance;
-                        bestDirection = candidateDirection;
-                        bestDirectionValid = candidateDirectionValid;
+                    if(signedDistance - safetyMargin < minimumPhi) {
+                        minimumPhi = signedDistance - safetyMargin;
+                        minimumDistance = signedDistance;
+                        bestDirection = direction;
+                        bestDirectionValid = directionValid;
                     } else {
-                        minimumDistance = std::min(minimumDistance, candidateDistance);
+                        minimumDistance = std::min(minimumDistance, signedDistance);
                     }
                 }
             }
@@ -590,6 +1254,9 @@ namespace motion_planning
             double regularizer = 1.0e-5;
             double slackPenalty = 1.0e3;
             double smoothScale = 1.0;
+            int maxIterations = 4000;
+            double epsAbs = 1.0e-4;
+            double epsRel = 1.0e-4;
             const char* label = "default";
         };
 
@@ -832,9 +1499,10 @@ namespace motion_planning
             };
 
             const std::vector<QpNumericsAttempt> attempts = {
-                { 1.0e-4, 1.0e3, 0.0, "diagonal_regularized" },
-                { 1.0e-3, 1.0e3, 0.0, "strong_diagonal_regularized" },
-                { 1.0e-2, 1.0e2, 0.0, "very_strong_diagonal_regularized" }
+                { 1.0e-4, 1.0e3, 0.35, 5000, 2.0e-4, 2.0e-4, "mild_smooth_regularized" },
+                { 1.0e-3, 8.0e2, 0.15, 7000, 3.0e-4, 3.0e-4, "reduced_smooth_regularized" },
+                { 1.0e-2, 5.0e2, 0.0, 12000, 5.0e-4, 5.0e-4, "strict_diagonal_fallback" },
+                { 1.0e-1, 2.0e2, 0.0, 16000, 1.0e-3, 1.0e-3, "loose_diagonal_fallback" }
             };
 
             std::string lastFailure;
@@ -859,9 +1527,9 @@ namespace motion_planning
                 settings.verbose = 0;
                 settings.warm_start = 1;
                 settings.polish = 0;
-                settings.max_iter = 4000;
-                settings.eps_abs = 1.0e-4;
-                settings.eps_rel = 1.0e-4;
+                settings.max_iter = attempt.maxIterations;
+                settings.eps_abs = static_cast<c_float>(attempt.epsAbs);
+                settings.eps_rel = static_cast<c_float>(attempt.epsRel);
                 settings.sigma = std::max(settings.sigma, static_cast<c_float>(attempt.regularizer));
                 settings.check_termination = 25;
 
@@ -960,52 +1628,6 @@ namespace motion_planning
                 stream << ": " << validation.message;
             }
             return stream.str();
-        }
-
-        struct InvalidSegmentRun
-        {
-            std::size_t beginSegment = 0;
-            std::size_t endSegment = 0;
-        };
-
-        struct RepairWindow
-        {
-            std::size_t beginIndex = 0;
-            std::size_t endIndex = 0;
-        };
-
-        template<typename ValidationRequest>
-        std::vector<InvalidSegmentRun> collectInvalidSegmentRuns(
-            ProjectPlanningSceneSnapshot& scene,
-            const std::vector<std::vector<double>>& path,
-            const ValidationRequest& validation)
-        {
-            std::vector<InvalidSegmentRun> runs;
-            std::size_t index = 0;
-            while(index + 1 < path.size()) {
-                const StateValidationResult segmentValidation =
-                    scene.validateMotion(path[index], path[index + 1], validation);
-                if(segmentValidation.valid) {
-                    ++index;
-                    continue;
-                }
-
-                InvalidSegmentRun run;
-                run.beginSegment = index;
-                run.endSegment = index;
-                while(run.endSegment + 1 < path.size() - 1) {
-                    const std::size_t nextIndex = run.endSegment + 1;
-                    const StateValidationResult nextValidation =
-                        scene.validateMotion(path[nextIndex], path[nextIndex + 1], validation);
-                    if(nextValidation.valid) {
-                        break;
-                    }
-                    run.endSegment = nextIndex;
-                }
-                runs.push_back(run);
-                index = run.endSegment + 1;
-            }
-            return runs;
         }
 
         std::vector<RepairWindow> buildRepairWindows(
@@ -1425,6 +2047,7 @@ namespace motion_planning
                 scene->jointBounds(),
                 &result.statistics.clampedSeedValues));
         }
+        const std::vector<std::vector<double>> originalReferencePath = path;
 
         auto evaluatePathMinimum = [&](const std::vector<std::vector<double>>& candidate) {
             double minimumPhi = std::numeric_limits<double>::max();
@@ -1487,9 +2110,40 @@ namespace motion_planning
 
         const double targetPhi = options.targetClearance;
         const int maxIterations = std::max(1, options.maxIterations);
-        const std::vector<std::vector<double>> seedPath = path;
+        std::vector<std::vector<double>> seedPath = path;
 
-        for(int iteration = 0; iteration < maxIterations; ++iteration) {
+        if(countInvalidSegments(path) != 0) {
+            const bool omplRepaired = repairCollisionRunsWithOmpl(
+                *scene,
+                scene->jointBounds(),
+                request.validation,
+                options,
+                &result.statistics,
+                &result.diagnostics,
+                &path);
+            if(omplRepaired) {
+                seedPath = path;
+                result.statistics.finalMinimumPhi = evaluatePathMinimum(path);
+                if(result.statistics.finalMinimumPhi <= -std::numeric_limits<double>::max() * 0.25) {
+                    return result;
+                }
+            }
+        }
+
+        // A CDF linearization is not meaningful for a configuration that is
+        // already deeply inside geometry. OMPL is responsible for leaving such
+        // regions first; only a collision-free path is eligible for global QP
+        // smoothing. Remaining invalid windows are handled by the local repair
+        // stage below, where every candidate is hard-validated before write-back.
+        const bool pathWasInitiallyCollisionFree = countInvalidSegments(path) == 0;
+        if(!pathWasInitiallyCollisionFree) {
+            addDiagnostic(
+                &result.diagnostics,
+                "cdf_qp_deferred_until_collision_free",
+                "Global CDF/QP smoothing was deferred because the seed still contains collision segments after OMPL pre-repair.");
+        }
+
+        for(int iteration = 0; pathWasInitiallyCollisionFree && iteration < maxIterations; ++iteration) {
             std::vector<CdfLinearization> linearizations;
             linearizations.reserve(path.size());
 
@@ -1591,24 +2245,26 @@ namespace motion_planning
 
         auto repairInvalidWindows = [&]() -> bool {
             ProjectCdfQpRepairOptions localOptions = options;
-            localOptions.trustRegion = std::max(0.003, std::min(options.trustRegion, 0.008));
-            localOptions.seedCorridor = std::max(0.02, std::min(options.seedCorridor, 0.04));
-            localOptions.repairGain = std::max(0.10, std::min(options.repairGain, 0.18));
-            localOptions.seedTrackingWeight = std::max(options.seedTrackingWeight, 0.60);
-            localOptions.smoothWeight = std::max(options.smoothWeight, 0.24);
+            localOptions.trustRegion = std::max(0.0025, std::min(options.trustRegion, 0.006));
+            localOptions.seedCorridor = std::max(0.012, std::min(options.seedCorridor, 0.028));
+            localOptions.repairGain = std::max(0.06, std::min(options.repairGain, 0.10));
+            localOptions.seedTrackingWeight = std::max(options.seedTrackingWeight, 0.75);
+            localOptions.smoothWeight = std::max(options.smoothWeight, 0.18);
             localOptions.targetClearance = std::max(options.targetClearance, 0.001);
-            localOptions.maxIterations = 1;
+            localOptions.maxIterations = 2;
             localOptions.keepEndpoints = true;
 
             MotionValidationOptions localValidation = request.validation;
             if(localValidation.maxJointStep > 0.0 && std::isfinite(localValidation.maxJointStep)) {
-                localValidation.maxJointStep = std::min(localValidation.maxJointStep, 0.01);
+                localValidation.maxJointStep = std::min(localValidation.maxJointStep, 0.008);
             }
 
-            const std::size_t primaryWindowPoints = 32;
-            const std::size_t secondaryWindowPoints = 20;
+            const std::size_t primaryWindowPoints = 18;
+            const std::size_t secondaryWindowPoints = 12;
+            const std::size_t tertiaryWindowPoints = 8;
             const std::size_t primaryOverlap = 2;
-            const std::size_t secondaryOverlap = 1;
+            const std::size_t secondaryOverlap = 2;
+            const std::size_t tertiaryOverlap = 1;
 
             auto sortWindowsByRisk = [](std::vector<RepairWindow>& windows) {
                 std::sort(
@@ -1673,6 +2329,24 @@ namespace motion_planning
                         }
                         if(windowSeed.size() != windowPath.size()) {
                             windowSeed = windowPath;
+                        }
+
+                        // Never linearize CDF inside a penetrating configuration.
+                        // First give this window its own OMPL chance. QP is only a
+                        // local smoother after the complete window is collision-free.
+                        const bool omplWindowChanged = repairCollisionRunsWithOmpl(
+                            *scene,
+                            scene->jointBounds(),
+                            localValidation,
+                            localOptions,
+                            &result.statistics,
+                            &result.diagnostics,
+                            &windowPath);
+                        if(omplWindowChanged) {
+                            windowSeed = windowPath;
+                        }
+                        if(countInvalidSegments(windowPath) != 0) {
+                            return resultWindow;
                         }
 
                         std::vector<std::vector<double>> repairedWindow;
@@ -1758,21 +2432,45 @@ namespace motion_planning
             std::vector<RepairWindow> secondaryWindows = buildRepairWindows(
                 remainingRuns,
                 path.size(),
-                6,
+                5,
                 secondaryWindowPoints,
                 secondaryOverlap,
-                12);
+                16);
             sortWindowsByRisk(secondaryWindows);
             repairWindowSet(secondaryWindows, 8, "secondary", &failedWindows);
 
             remainingRuns = collectInvalidSegmentRuns(*scene, path, localValidation);
+            if(!remainingRuns.empty()) {
+                ProjectCdfQpRepairOptions tertiaryOptions = localOptions;
+                tertiaryOptions.trustRegion = std::max(0.0015, std::min(localOptions.trustRegion, 0.004));
+                tertiaryOptions.seedCorridor = std::max(0.008, std::min(localOptions.seedCorridor, 0.018));
+                tertiaryOptions.repairGain = std::max(0.04, std::min(localOptions.repairGain, 0.07));
+                tertiaryOptions.seedTrackingWeight = std::max(localOptions.seedTrackingWeight, 0.90);
+                tertiaryOptions.smoothWeight = std::max(localOptions.smoothWeight, 0.24);
+                tertiaryOptions.maxIterations = 3;
+
+                const ProjectCdfQpRepairOptions savedLocalOptions = localOptions;
+                localOptions = tertiaryOptions;
+                std::vector<RepairWindow> tertiaryWindows = buildRepairWindows(
+                    remainingRuns,
+                    path.size(),
+                    8,
+                    tertiaryWindowPoints,
+                    tertiaryOverlap,
+                    20);
+                sortWindowsByRisk(tertiaryWindows);
+                repairWindowSet(tertiaryWindows, 10, "tertiary", &failedWindows);
+                localOptions = savedLocalOptions;
+                remainingRuns = collectInvalidSegmentRuns(*scene, path, localValidation);
+            }
+
             if(!remainingRuns.empty()) {
                 for(std::size_t ordinal = 0; ordinal < remainingRuns.size(); ++ordinal) {
                     std::ostringstream stream;
                     stream << "Remaining collision interval #" << (ordinal + 1)
                            << " spans segment " << (remainingRuns[ordinal].beginSegment + 1)
                            << " -> " << (remainingRuns[ordinal].endSegment + 2)
-                           << " after primary and secondary CDF/QP repair.";
+                           << " after primary, secondary, and tertiary CDF/QP repair.";
                     addDiagnostic(&result.diagnostics, "cdf_repair_window_failed", stream.str());
                 }
                 for(const std::string& message : failedWindows) {
@@ -1797,6 +2495,25 @@ namespace motion_planning
                 &result.diagnostics,
                 "cdf_repair_segment_window_invalid",
                 "High-risk CDF/QP windows still contain collision segments after local repair.");
+        }
+
+        if(countInvalidSegments(path) == 0) {
+            const bool smoothed = smoothCollisionFreePath(
+                *scene,
+                scene->jointBounds(),
+                request.validation,
+                originalReferencePath,
+                options.postSmoothingIterations,
+                options.postSmoothingStep,
+                options.postSmoothingSeedWeight,
+                options.keepEndpoints,
+                &path);
+            if(smoothed) {
+                addDiagnostic(
+                    &result.diagnostics,
+                    "cdf_collision_constrained_smoothing",
+                    "Applied conservative collision-validated smoothing while tracking the imported trajectory.");
+            }
         }
 
         result.statistics.finalMinimumPhi = evaluatePathMinimum(path);
