@@ -5,6 +5,7 @@
 #include <Eigen/Geometry>
 
 #include <cstddef>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -32,6 +33,10 @@ namespace motion_planning
         double tolerance = 1.0e-6;
         double stepSize = 0.1;
         double damping = 0.01;
+        // Optional actual-model FK in world coordinates, consuming the stored IK joint
+        // convention. Includes the chosen TCP/flange transform; toolMode is then ignored.
+        // Without it, the legacy nominal IRB4600 DH model remains available.
+        std::function<Eigen::Isometry3d(const std::vector<double>&)> worldForwardKinematics;
     };
 
     struct CartesianIkPointResult

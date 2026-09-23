@@ -185,6 +185,83 @@ namespace motion_planning
             double errorNorm = std::numeric_limits<double>::infinity();
         };
 
+        Eigen::Matrix<double, 6, 1> rigidPoseError(
+            const Eigen::Matrix4d& current, const Eigen::Matrix4d& desired)
+        {
+            Eigen::Matrix<double, 6, 1> error;
+            error.head<3>() = desired.block<3, 1>(0, 3) - current.block<3, 1>(0, 3);
+            const Eigen::AngleAxisd rotation(desired.block<3, 3>(0, 0) *
+                current.block<3, 3>(0, 0).transpose());
+            error.tail<3>() = rotation.axis() * rotation.angle();
+            return error;
+        }
+
+        bool rigidTarget(const Eigen::Matrix4d& input, Eigen::Matrix4d& target)
+        {
+            if(!input.allFinite() ||
+                (input.row(3) - Eigen::RowVector4d(0, 0, 0, 1)).norm() > 1.0e-8) { return false; }
+            const Eigen::Matrix3d rotation = input.block<3, 3>(0, 0);
+            if(rotation.determinant() <= 0.0 ||
+                (rotation.transpose() * rotation - Eigen::Matrix3d::Identity()).norm() > 0.05) {
+                return false;
+            }
+            // Imported decimal matrices may not lie exactly on SO(3).
+            const Eigen::JacobiSVD<Eigen::Matrix3d> svd(rotation, Eigen::ComputeFullU | Eigen::ComputeFullV);
+            target = input;
+            target.block<3, 3>(0, 0) = svd.matrixU() * svd.matrixV().transpose();
+            return true;
+        }
+
+        IkAttempt solveModelPose(const Eigen::Matrix4d& desired,
+            const std::vector<double>& seed, const CartesianIkOptions& options)
+        {
+            IkAttempt attempt;
+            attempt.joints = seed;
+            constexpr double probe = 1.0e-6;
+            for(int iteration = 0; iteration < options.maxIterations; ++iteration) {
+                const Eigen::Matrix4d current = options.worldForwardKinematics(attempt.joints).matrix();
+                if(!current.allFinite()) { return attempt; }
+                const auto error = rigidPoseError(current, desired);
+                attempt.errorNorm = error.norm();
+                if(attempt.errorNorm <= options.tolerance) { attempt.success = true; return attempt; }
+                Eigen::Matrix<double, 6, 6> jacobian;
+                for(std::size_t column = 0; column < kIrb4600JointCount; ++column) {
+                    auto perturbed = attempt.joints;
+                    perturbed[column] += probe;
+                    const Eigen::Matrix4d pose = options.worldForwardKinematics(perturbed).matrix();
+                    if(!pose.allFinite()) { return attempt; }
+                    jacobian.col(static_cast<int>(column)) = rigidPoseError(current, pose) / probe;
+                }
+                const Eigen::Matrix<double, 6, 6> regularizer =
+                    options.damping * options.damping * Eigen::Matrix<double, 6, 6>::Identity();
+                Eigen::Matrix<double, 6, 1> delta = jacobian.transpose() *
+                    (jacobian * jacobian.transpose() + regularizer).ldlt().solve(error);
+                if(!delta.allFinite()) { return attempt; }
+                // Limit joint steps and backtrack near singularities or distant initial seeds.
+                delta *= std::min(options.stepSize, 0.35 / std::max(0.35, delta.cwiseAbs().maxCoeff()));
+                bool improved = false;
+                for(int backtrack = 0; backtrack < 12; ++backtrack) {
+                    auto candidate = attempt.joints;
+                    for(std::size_t j = 0; j < candidate.size(); ++j) {
+                        candidate[j] = normalizeAngle(candidate[j] + delta(static_cast<int>(j)));
+                    }
+                    const Eigen::Matrix4d pose = options.worldForwardKinematics(candidate).matrix();
+                    const double norm = pose.allFinite() ? rigidPoseError(pose, desired).norm()
+                        : std::numeric_limits<double>::infinity();
+                    if(norm < attempt.errorNorm) {
+                        attempt.joints = std::move(candidate);
+                        attempt.errorNorm = norm;
+                        improved = true;
+                        break;
+                    }
+                    delta *= 0.5;
+                }
+                if(!improved) { break; }
+            }
+            attempt.success = attempt.errorNorm <= options.tolerance;
+            return attempt;
+        }
+
         IkAttempt solveSinglePose(
             const std::vector<DhParam>& dhParams,
             const Eigen::Matrix4d& desired,
@@ -356,6 +433,12 @@ namespace motion_planning
             return result;
         }
 
+        if(options.maxIterations <= 0 || !std::isfinite(options.tolerance) || options.tolerance <= 0.0 ||
+            !std::isfinite(options.stepSize) || options.stepSize <= 0.0 ||
+            !std::isfinite(options.damping) || options.damping <= 0.0) {
+            result.diagnostics.push_back(diagnostic("invalid_ik_options", "IK parameters must be finite and positive."));
+            return result;
+        }
         result.plan.robotId = robotId;
         result.plan.jointNames = resolvedJointNames(plan, options);
 
@@ -383,12 +466,21 @@ namespace motion_planning
             CartesianIkPointResult pointResult;
             pointResult.pointIndex = pointIndex;
 
+            Eigen::Matrix4d worldTarget;
+            if(options.worldForwardKinematics && !rigidTarget(cartesianPoint.tcpPose.matrix(), worldTarget)) {
+                pointResult.message = "Invalid cartesian target: expected a finite rigid pose.";
+                result.diagnostics.push_back(diagnostic("invalid_ik_pose", pointResult.message));
+                result.points.push_back(std::move(pointResult));
+                continue;
+            }
             IkAttempt bestAttempt;
             const std::vector<std::vector<double>> seeds = makeSeedSet(
                 preferredSeed,
                 options.usePreviousSolutionAsSeed ? previousSolution : std::vector<double>());
             for(const std::vector<double>& seed : seeds) {
-                IkAttempt attempt = solveSinglePose(dhParams, flangeTarget, seed, options);
+                IkAttempt attempt = options.worldForwardKinematics
+                    ? solveModelPose(worldTarget, seed, options)
+                    : solveSinglePose(dhParams, flangeTarget, seed, options);
                 if(attempt.errorNorm < bestAttempt.errorNorm) {
                     bestAttempt = std::move(attempt);
                 }
