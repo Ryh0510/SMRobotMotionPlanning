@@ -90,3 +90,15 @@ if(BuildTests)
         LABELS "SMRobotMotionPlanning;ProjectMotionPlanning;Regression"
         WORKING_DIRECTORY $<TARGET_FILE_DIR:ProjectMotionPlanning-Headless>)
 endif()
+
+if(BuildTests)
+    add_executable(IkGraphTests LayeredIkGraphTests.cpp)
+    target_link_libraries(IkGraphTests PRIVATE ${PACKAGE_NAME}::ProjectMotionPlanning)
+    target_compile_features(IkGraphTests PRIVATE cxx_std_17)
+    set_target_properties(IkGraphTests PROPERTIES FOLDER "Regression/SMRobotMotionPlanning")
+    copy_runtime_dlls(IkGraphTests)
+    add_test(NAME ProjectMotionPlanningLayeredIkGraph COMMAND $<TARGET_FILE:IkGraphTests>)
+    set_tests_properties(ProjectMotionPlanningLayeredIkGraph PROPERTIES
+        LABELS "SMRobotMotionPlanning;ProjectMotionPlanning;Regression"
+        WORKING_DIRECTORY $<TARGET_FILE_DIR:IkGraphTests>)
+endif()
