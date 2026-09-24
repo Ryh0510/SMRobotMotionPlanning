@@ -1,6 +1,7 @@
 #include <ProjectMotionPlanning/TrajectoryInverseKinematics.h>
 
 #include <SimulationProject/ProjectDocument.h>
+#include <SimulationRuntime/ProjectSimulationRuntime.h>
 
 #include <Eigen/Dense>
 
@@ -213,17 +214,23 @@ namespace motion_planning
         }
 
         IkAttempt solveModelPose(const Eigen::Matrix4d& desired,
-            const std::vector<double>& seed, const CartesianIkOptions& options)
+            const std::vector<double>& seed, const CartesianIkOptions& options,
+            const CartesianMultiIkOptions* multi = nullptr)
         {
             IkAttempt attempt;
             attempt.joints = seed;
             constexpr double probe = 1.0e-6;
             for(int iteration = 0; iteration < options.maxIterations; ++iteration) {
+                if(multi && multi->cancelled && multi->cancelled()) { return attempt; }
                 const Eigen::Matrix4d current = options.worldForwardKinematics(attempt.joints).matrix();
                 if(!current.allFinite()) { return attempt; }
                 const auto error = rigidPoseError(current, desired);
                 attempt.errorNorm = error.norm();
-                if(attempt.errorNorm <= options.tolerance) { attempt.success = true; return attempt; }
+                if(multi ? (error.head<3>().norm() <= multi->positionTolerance &&
+                            error.tail<3>().norm() <= multi->orientationTolerance)
+                         : attempt.errorNorm <= options.tolerance) {
+                    attempt.success = true; return attempt;
+                }
                 Eigen::Matrix<double, 6, 6> jacobian;
                 for(std::size_t column = 0; column < kIrb4600JointCount; ++column) {
                     auto perturbed = attempt.joints;
@@ -243,7 +250,8 @@ namespace motion_planning
                 for(int backtrack = 0; backtrack < 12; ++backtrack) {
                     auto candidate = attempt.joints;
                     for(std::size_t j = 0; j < candidate.size(); ++j) {
-                        candidate[j] = normalizeAngle(candidate[j] + delta(static_cast<int>(j)));
+                        candidate[j] += delta(static_cast<int>(j));
+                        if(!multi) { candidate[j] = normalizeAngle(candidate[j]); }
                     }
                     const Eigen::Matrix4d pose = options.worldForwardKinematics(candidate).matrix();
                     const double norm = pose.allFinite() ? rigidPoseError(pose, desired).norm()
@@ -569,4 +577,180 @@ namespace motion_planning
         }
         return true;
     }
+
+    bool ProjectTrajectoryInverseKinematics::readRevoluteJointLimits(
+        const simulation_project::ProjectDocument& document,
+        const std::filesystem::path& basePath, const std::string& robotId,
+        const std::vector<std::string>& names, std::vector<double>& lower,
+        std::vector<double>& upper, std::string& error)
+    {
+        simulation_runtime::ProjectSimulationRuntime runtime;
+        const auto loaded = runtime.loadProject(document, basePath);
+        if(!loaded.success) { error = loaded.message; return false; }
+        const auto* item = runtime.robot(robotId);
+        if(!item) { error = "Robot model not available."; return false; }
+        lower.clear(); upper.clear();
+        for(const auto& name : names) {
+            const auto it = std::find_if(item->model.joints.begin(), item->model.joints.end(),
+                [&](const robot::RobotJoint& joint) { return joint.name == name; });
+            if(it == item->model.joints.end() || it->type != robot::JointType::Revolute ||
+                it->isLoop || it->dofIndex < 0) {
+                error = "Multi IK requires six independent revolute joints: " + name;
+                return false;
+            }
+            if(!it->continuous && (!it->hasPositionLimits ||
+                !std::isfinite(it->lowerPositionLimit) || !std::isfinite(it->upperPositionLimit) ||
+                it->lowerPositionLimit > it->upperPositionLimit)) {
+                error = "Missing joint position limits: " + name; return false;
+            }
+            lower.push_back(it->continuous ? -std::numeric_limits<double>::infinity() : it->lowerPositionLimit);
+            upper.push_back(it->continuous ? std::numeric_limits<double>::infinity() : it->upperPositionLimit);
+        }
+        return true;
+    }
+
+    CartesianMultiIkResult ProjectTrajectoryInverseKinematics::solveAllCartesianControlPoints(
+        const StoredMotionPlan& plan, const CartesianMultiIkOptions& options)
+    {
+        CartesianMultiIkResult result;
+        result.source = plan;
+        result.source.jointNames = options.model.jointNames;
+        result.source.trajectory.points.clear();
+        const auto cancelled = [&]() { return options.cancelled && options.cancelled(); };
+        const auto invalid = [&](const std::string& message) {
+            result.message = message; return result;
+        };
+        if(!options.model.worldForwardKinematics || options.model.jointNames.size() != 6 ||
+            options.lower.size() != 6 || options.upper.size() != 6 || plan.cartesianControlPoints.empty() ||
+            options.seedCount < 1 || options.seedCount > 4096 || options.maxIterations < 1 ||
+            options.maxCandidatesPerPoint < 1 || options.maxCandidatesPerPoint > 65536 ||
+            !std::isfinite(options.positionTolerance) || options.positionTolerance <= 0 ||
+            !std::isfinite(options.orientationTolerance) || options.orientationTolerance <= 0 ||
+            !std::isfinite(options.duplicateTolerance) || options.duplicateTolerance <= 0) {
+            return invalid("Multi IK requires actual FK, six joints, finite bounds and positive search settings.");
+        }
+        for(std::size_t j = 0; j < 6; ++j) {
+            if(!std::isfinite(options.lower[j]) || !std::isfinite(options.upper[j]) ||
+                options.lower[j] > options.upper[j] || std::abs(options.lower[j]) > 1.0e6 ||
+                std::abs(options.upper[j]) > 1.0e6) { return invalid("Invalid finite joint search range."); }
+        }
+        auto solver = options.model;
+        solver.maxIterations = options.maxIterations;
+        solver.stepSize = 1.0;
+        solver.damping = 0.001;
+        solver.tolerance = std::min(options.positionTolerance, options.orientationTolerance);
+        const auto radicalInverse = [](int n, int base) {
+            double value = 0, fraction = 1.0 / base;
+            while(n > 0) { value += (n % base) * fraction; n /= base; fraction /= base; }
+            return value;
+        };
+        const int primes[] = {2, 3, 5, 7, 11, 13};
+        std::vector<std::vector<double>> previousRoots;
+        std::size_t solved = 0, total = 0, truncated = 0;
+        for(std::size_t index = 0; index < plan.cartesianControlPoints.points.size(); ++index) {
+            if(cancelled()) { result.cancelled = true; break; }
+            const auto& point = plan.cartesianControlPoints.points[index];
+            CartesianIkLayer layer;
+            layer.pointIndex = index; layer.time = point.time;
+            Eigen::Matrix4d desired;
+            if(!std::isfinite(point.time) || !rigidTarget(point.tcpPose.matrix(), desired)) {
+                layer.message = "Invalid target pose/time.";
+            } else {
+                std::vector<std::vector<double>> seeds = previousRoots;
+                if(solver.seedJoints.size() == 6 && std::all_of(solver.seedJoints.begin(), solver.seedJoints.end(),
+                    [](double value) { return std::isfinite(value); })) { seeds.push_back(solver.seedJoints); }
+                for(int n = 1; n <= options.seedCount; ++n) {
+                    std::vector<double> seed(6);
+                    for(int j = 0; j < 6; ++j) { seed[j] = -kPi + 2 * kPi * radicalInverse(n, primes[j]); }
+                    seeds.push_back(std::move(seed));
+                }
+                std::vector<std::vector<double>> roots;
+                for(const auto& seed : seeds) {
+                    if(cancelled()) { result.cancelled = true; break; }
+                    const auto attempt = solveModelPose(desired, seed, solver, &options);
+                    if(!attempt.success) { continue; }
+                    auto root = attempt.joints;
+                    for(auto& q : root) { q = normalizeAngle(q); }
+                    const bool duplicate = std::any_of(roots.begin(), roots.end(), [&](const auto& other) {
+                        for(std::size_t j = 0; j < 6; ++j) {
+                            if(std::abs(std::remainder(root[j] - other[j], 2 * kPi)) > options.duplicateTolerance) { return false; }
+                        }
+                        return true;
+                    });
+                    if(duplicate) { continue; }
+                    // A singular pose can have an infinite family: retain a bounded numerical sample.
+                    if(roots.size() >= 64) { layer.truncated = true; break; }
+                    roots.push_back(root);
+                    std::vector<double> lifted(6);
+                    std::vector<int> turns(6);
+                    std::function<void(std::size_t)> expand = [&](std::size_t j) {
+                        if(cancelled() || layer.truncated) { return; }
+                        if(j < 6) {
+                            const int first = static_cast<int>(std::ceil((options.lower[j] - root[j] - 1.0e-10) / (2 * kPi)));
+                            const int last = static_cast<int>(std::floor((options.upper[j] - root[j] + 1.0e-10) / (2 * kPi)));
+                            for(int turn = first; turn <= last && !layer.truncated && !cancelled(); ++turn) {
+                                lifted[j] = std::clamp(root[j] + 2 * kPi * turn, options.lower[j], options.upper[j]);
+                                turns[j] = static_cast<int>(std::floor((lifted[j] + kPi) / (2 * kPi)));
+                                expand(j + 1);
+                            }
+                            return;
+                        }
+                        const auto actual = solver.worldForwardKinematics(lifted).matrix().eval();
+                        if(!actual.allFinite()) { return; }
+                        const auto error = rigidPoseError(actual, desired);
+                        if(error.head<3>().norm() > options.positionTolerance ||
+                            error.tail<3>().norm() > options.orientationTolerance) { return; }
+                        if(layer.candidates.size() >= options.maxCandidatesPerPoint) { layer.truncated = true; return; }
+                        layer.candidates.push_back({lifted, turns, error.head<3>().norm(), error.tail<3>().norm()});
+                    };
+                    expand(0);
+                    if(layer.truncated) { break; }
+                }
+                previousRoots = std::move(roots);
+                std::sort(layer.candidates.begin(), layer.candidates.end(), [](const auto& a, const auto& b) {
+                    return a.joints < b.joints;
+                });
+                layer.message = layer.candidates.empty() ? "No valid root found within search budget/range." :
+                    (layer.truncated ? "Candidate budget reached; partial enumeration." : "Numerical candidates; completeness not guaranteed.");
+            }
+            if(result.cancelled || cancelled()) { result.cancelled = true; break; }
+            if(!layer.candidates.empty()) { ++solved; }
+            if(layer.truncated) { ++truncated; }
+            total += layer.candidates.size();
+            result.layers.push_back(std::move(layer));
+            if(options.progress) { options.progress(index + 1, plan.cartesianControlPoints.points.size()); }
+        }
+        result.success = !result.cancelled && solved == plan.cartesianControlPoints.points.size();
+        std::ostringstream summary;
+        summary << (result.cancelled ? "Cancelled. " : "Search finished. ") << solved << "/"
+            << plan.cartesianControlPoints.points.size() << " points, " << total << " candidates, "
+            << truncated << " truncated layers. Numerical search; completeness is not guaranteed.";
+        result.message = summary.str();
+        return result;
+    }
+
+    bool ProjectTrajectoryInverseKinematics::selectMultiIkTrajectory(const CartesianMultiIkResult& result,
+        const std::vector<std::size_t>& selections, StoredMotionPlan& plan, std::string& error)
+    {
+        if(result.cancelled || result.layers.empty() || selections.size() != result.layers.size() ||
+            result.layers.size() != result.source.cartesianControlPoints.points.size()) {
+            error = "Incomplete multi IK result; every control point requires a selected solution."; return false;
+        }
+        StoredMotionPlan selected = result.source;
+        selected.trajectory.points.clear();
+        for(std::size_t i = 0; i < result.layers.size(); ++i) {
+            const auto& layer = result.layers[i];
+            if(layer.pointIndex != i || selections[i] >= layer.candidates.size()) {
+                error = "Missing solution at control point " + std::to_string(i + 1); return false;
+            }
+            robottrajectory::TimedJointPoint point;
+            point.time = layer.time;
+            point.q = layer.candidates[selections[i]].joints;
+            selected.trajectory.points.push_back(std::move(point));
+        }
+        selected.trajectory.interpolation = robottrajectory::TrajectoryInterpolation::Linear;
+        plan = std::move(selected);
+        return true;
+    }
+
 }
