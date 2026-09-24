@@ -1,4 +1,5 @@
 #include <ProjectMotionPlanning/ProjectMotionPlanning.h>
+#include "../../src/CdfDistanceField.h"
 #include <ProjectMotionPlanning/CdfJointAngleImport.h>
 #include <ProjectMotionPlanning/CdfQpTrajectoryRepair.h>
 #include <ProjectMotionPlanning/TrajectoryControlPointEditing.h>
@@ -15,10 +16,12 @@
 
 #include <algorithm>
 #include <cmath>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <random>
 #include <sstream>
 #include <string>
@@ -38,6 +41,14 @@ namespace
         bool discover = false;
         bool importOnly = false;
         bool cdfRepair = false;
+        bool cdfInspect = false;
+        bool cdfGradientCheck = false;
+        bool cdfGuiDefaults = false;
+        double verificationStep = 0.005;
+        int cdfIterations = 1;
+        double cdfMaxCorrection = std::numeric_limits<double>::infinity();
+        bool linearInput = false;
+        std::filesystem::path cdfOutput;
     };
 
     bool parseOptions(int argc, char** argv, Options& options)
@@ -56,6 +67,30 @@ namespace
                 options.cdfRepair = true;
                 options.cdfFilePath = std::filesystem::u8path(argv[++index]);
             }
+            else if (argument == "--linear-input")
+                options.linearInput = true;
+            else if (argument == "--cdf-iterations" && index + 1 < argc) {
+                std::istringstream value(argv[++index]);
+                if(!(value >> options.cdfIterations) || !value.eof() || options.cdfIterations < 1) return false;
+            }
+            else if (argument == "--cdf-max-correction" && index + 1 < argc) {
+                std::istringstream value(argv[++index]);
+                if(!(value >> options.cdfMaxCorrection) || !value.eof() ||
+                    !std::isfinite(options.cdfMaxCorrection) || options.cdfMaxCorrection < 0.0) return false;
+            }
+            else if (argument == "--verification-step" && index + 1 < argc) {
+                std::istringstream value(argv[++index]);
+                if(!(value >> options.verificationStep) || !value.eof() ||
+                    !std::isfinite(options.verificationStep) || options.verificationStep <= 0.0) return false;
+            }
+            else if (argument == "--cdf-gui-defaults")
+                options.cdfGuiDefaults = true;
+            else if (argument == "--cdf-gradient-check")
+                options.cdfGradientCheck = true;
+            else if (argument == "--cdf-inspect")
+                options.cdfInspect = true;
+            else if (argument == "--cdf-output" && index + 1 < argc)
+                options.cdfOutput = std::filesystem::u8path(argv[++index]);
             else if (argument == "--robot" && index + 1 < argc)
             {
                 options.robotId = argv[++index];
@@ -602,6 +637,18 @@ namespace
         }
 
         motion_planning::ProjectCdfQpRepairOptions repairOptions;
+        repairOptions.maxIterations = options.cdfIterations;
+        if(options.cdfGuiDefaults) {
+            repairOptions.trustRegion = 0.02;
+            repairOptions.seedCorridor = 0.10;
+            repairOptions.seedTrackingWeight = 0.40;
+            repairOptions.segmentIntermediateSamples = 1;
+        }
+        const auto started = std::chrono::steady_clock::now();
+        repairOptions.progress = [&](const std::string& message) {
+            std::cout << "[" << std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count()
+                      << "s] " << message << std::endl;
+        };
         repairOptions.detectorId = "cdf_abb4600_burnner_detector";
         repairOptions.obstacleId = "burnner";
         repairOptions.obstacleName = "burnner";
@@ -645,6 +692,71 @@ namespace
                 : setupDiagnostics.front().message);
         }
 
+        motion_planning::ProjectPlanningRequest verificationRequest;
+        verificationRequest.robotId = robotId;
+        verificationRequest.jointNames = robotJointNames;
+        verificationRequest.start = seedTrajectory.points.front().q;
+        verificationRequest.goal = seedTrajectory.points.back().q;
+        verificationRequest.collisionDetectorIds = { setupDetectorId };
+        verificationRequest.validation.maxJointStep = options.verificationStep;
+        auto verificationScene = motion_planning::ProjectPlanningSceneBuilder::build(
+            document, projectBase, verificationRequest, &errorMessage);
+        if(!verificationScene) return fail(errorMessage);
+        auto linearMotionValid = [&](const auto& a, const auto& b) {
+            double maximumDelta = 0.0;
+            for(std::size_t j = 0; j < a.size(); ++j) maximumDelta = std::max(maximumDelta, std::abs(b[j] - a[j]));
+            const std::size_t steps = std::max<std::size_t>(1, static_cast<std::size_t>(std::ceil(maximumDelta / options.verificationStep)));
+            for(std::size_t i = 0; i <= steps; ++i) {
+                auto q = a;
+                for(std::size_t j = 0; j < q.size(); ++j) q[j] += (b[j] - a[j]) * static_cast<double>(i) / steps;
+                if(!verificationScene->validateState(q).valid) return false;
+            }
+            return true;
+        };
+        int initialInvalidSegments = 0;
+        for(std::size_t i = 0; i + 1 < seedTrajectory.points.size(); ++i)
+            if(!(options.linearInput
+                ? linearMotionValid(seedTrajectory.points[i].q, seedTrajectory.points[i + 1].q)
+                : verificationScene->validateMotion(seedTrajectory.points[i].q,
+                    seedTrajectory.points[i + 1].q, verificationRequest.validation).valid)) ++initialInvalidSegments;
+        std::cout << "input points: " << seedTrajectory.points.size()
+                  << "; invalid original segments: " << initialInvalidSegments
+                  << "; start valid: " << verificationScene->validateState(seedTrajectory.points.front().q).valid
+                  << "; goal valid: " << verificationScene->validateState(seedTrajectory.points.back().q).valid << std::endl;
+        if(options.cdfInspect) return initialInvalidSegments == 0 ? 0 : 1;
+        if(options.cdfGradientCheck) {
+            double maxError = 0.0;
+            int checked = 0, accelerated = 0;
+            motion_planning::ProjectCdfQpRepairStatistics statistics;
+            for(std::size_t i = 0; i < seedTrajectory.points.size(); i += 17) {
+                const auto& q = seedTrajectory.points[i].q;
+                const auto field = motion_planning::detail::linearizeSignedPhi(*verificationScene, q,
+                    verificationScene->jointBounds(), repairOptions.safetyMargin,
+                    repairOptions.distanceThreshold, 1.0e-5, statistics);
+                if(!field.sample.valid) return fail(field.sample.message);
+                if(field.sample.inCollision || field.sample.rawDistance < 0.001) continue;
+                if(field.sample.hasNearestFeature) ++accelerated;
+                for(std::size_t j = 0; j < q.size(); ++j) {
+                    auto plus = q, minus = q;
+                    plus[j] += 1.0e-5;
+                    minus[j] -= 1.0e-5;
+                    const auto a = motion_planning::detail::evaluateSignedPhi(*verificationScene, plus,
+                        repairOptions.safetyMargin, repairOptions.distanceThreshold, statistics);
+                    const auto b = motion_planning::detail::evaluateSignedPhi(*verificationScene, minus,
+                        repairOptions.safetyMargin, repairOptions.distanceThreshold, statistics);
+                    if(!a.valid || !b.valid) return fail("Gradient reference distance failed.");
+                    const double error = std::abs(field.gradient[j] - (a.phi - b.phi) / 2.0e-5);
+                    maxError = std::max(maxError, error);
+                    if(error > 0.002) std::cout << "gradient mismatch: point=" << i << ", joint=" << j
+                        << ", error=" << error << std::endl;
+                }
+                ++checked;
+            }
+            std::cout << "nearest-feature gradient check: states=" << checked << ", accelerated=" << accelerated
+                      << ", maximum error=" << maxError << std::endl;
+            return checked > 0 && accelerated > 0 && maxError < 0.002 ? 0 : 1;
+        }
+
         const motion_planning::ProjectCdfQpRepairResult repairResult =
             repairService.repair(
                 document,
@@ -654,6 +766,7 @@ namespace
                 seedTrajectory,
                 repairOptions);
 
+        std::cout << "repair elapsed seconds: " << std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count() << "\n";
         std::cout << "CDF repair points: " << repairResult.plan.trajectory.points.size() << "\n";
         std::cout << "success: " << (repairResult.success ? "yes" : "no") << "\n";
         std::cout << "min phi: " << repairResult.statistics.initialMinimumPhi
@@ -665,6 +778,46 @@ namespace
             std::cout << diagnostic.code << ": " << diagnostic.message << "\n";
         }
 
+        if(repairResult.statistics.maximumCorrection > options.cdfMaxCorrection)
+            return fail("Repair exceeded the regression correction bound (possible periodic chart jump).");
+        if(!repairResult.plan.trajectory.empty()) {
+            const auto& points = repairResult.plan.trajectory.points;
+            auto sameConfiguration = [&](const auto& a, const auto& b) {
+                for(std::size_t j = 0; j < a.size(); ++j) {
+                    double delta = a[j] - b[j];
+                    if(verificationScene->jointBounds()[j].continuous) delta = std::remainder(delta, 2.0 * kPi);
+                    if(std::abs(delta) > 1.0e-9) return false;
+                }
+                return true;
+            };
+            if(!sameConfiguration(points.front().q, seedTrajectory.points.front().q) ||
+                !sameConfiguration(points.back().q, seedTrajectory.points.back().q))
+                return fail("APF/QP moved a fixed endpoint configuration.");
+            for(std::size_t i = 0; i + 1 < points.size(); ++i)
+                for(std::size_t j = 0; j < jointNames.size(); ++j)
+                    if(verificationScene->jointBounds()[j].continuous && std::abs(points[i + 1].q[j] - points[i].q[j]) > kPi + 1.0e-9)
+                        return fail("Output has a continuous-joint wrap jump inconsistent with linear playback.");
+            int invalid = 0;
+            for(std::size_t i = 0; i + 1 < points.size(); ++i)
+                if(!linearMotionValid(points[i].q, points[i + 1].q)) ++invalid;
+            std::cout << "independent validation (" << options.verificationStep << " rad), invalid segments: " << invalid << std::endl;
+            if(invalid != 0) return fail("Independent fine-step collision verification failed.");
+            if(!options.cdfOutput.empty()) {
+                std::ofstream output(options.cdfOutput);
+                output << "# APF + CDF/QP joint trajectory\n# Time unit: seconds\n# Joint angle unit: degrees\n";
+                output << "time_s";
+                for(std::size_t j = 0; j < jointNames.size(); ++j) output << "\tJ" << j + 1 << "_deg";
+                output << '\n' << std::fixed << std::setprecision(9);
+                for(const auto& point : points) {
+                    output << point.time;
+                    const auto joints = maybeMapIrb4600JointSigns(document, robotId, point.q);
+                    for(double q : joints) output << '\t' << q * 180.0 / kPi;
+                    output << '\n';
+                }
+                output.close();
+                if(!output) return fail("Cannot write verified joint trajectory.");
+            }
+        }
         return repairResult.success ? 0 : 1;
     }
 }

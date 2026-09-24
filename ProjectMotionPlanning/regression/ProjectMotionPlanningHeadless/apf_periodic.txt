@@ -1,0 +1,5 @@
+# Time unit: seconds
+# Joint angle unit: degrees
+time_s J1_deg J2_deg J3_deg J4_deg J5_deg J6_deg
+0 97.243644 1.357645 33.928882 -82.107737 103.176335 155.784852
+1 97.243644 1.357645 33.928882 -82.107737 103.176335 515.484852

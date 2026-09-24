@@ -3,6 +3,7 @@
 #include <MotionPlanningCore/MotionPlanning.h>
 
 #include <filesystem>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -35,13 +36,17 @@ namespace motion_planning
         double smoothWeight = 0.12;
         double seedTrackingWeight = 0.55;
         double repairGain = 0.12;
-        int segmentIntermediateSamples = 2;
-        int maxIterations = 8;
+        int segmentIntermediateSamples = 1;
+        int maxIterations = 1;
         int postSmoothingIterations = 3;
-        double postSmoothingStep = 0.25;
+        double postSmoothingStep = 0.50;
         double postSmoothingSeedWeight = 0.10;
         bool keepEndpoints = true;
+        // Optimization knots are independent of the fine collision sampling.
+        double optimizationMaxJointStep = 0.04;
         double validationMaxJointStep = 0.02;
+        // Optional synchronous observation; the callback must not mutate the scene.
+        std::function<void(const std::string&)> progress;
     };
 
     struct ProjectCdfQpRepairStatistics

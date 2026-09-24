@@ -57,3 +57,36 @@ if(BuildTests)
         WORKING_DIRECTORY $<TARGET_FILE_DIR:${EXAMPLE_TARGET_NAME}>
     )
 endif()
+
+if(BuildTests)
+    add_executable(ProjectMotionPlanning-ApfTests ApfLocalPlannerTests.cpp)
+    target_link_libraries(ProjectMotionPlanning-ApfTests PRIVATE ${PACKAGE_NAME}::ProjectMotionPlanning)
+    target_compile_features(ProjectMotionPlanning-ApfTests PRIVATE cxx_std_17)
+    set_target_properties(ProjectMotionPlanning-ApfTests PROPERTIES FOLDER "Regression/SMRobotMotionPlanning")
+    copy_runtime_dlls(ProjectMotionPlanning-ApfTests)
+    add_test(NAME ProjectMotionPlanningApf COMMAND $<TARGET_FILE:ProjectMotionPlanning-ApfTests>)
+    set_tests_properties(ProjectMotionPlanningApf PROPERTIES
+        LABELS "SMRobotMotionPlanning;ProjectMotionPlanning;Regression"
+        WORKING_DIRECTORY $<TARGET_FILE_DIR:ProjectMotionPlanning-ApfTests>)
+endif()
+
+if(BuildTests)
+    add_test(NAME ProjectMotionPlanningApfPeriodic
+        COMMAND $<TARGET_FILE:ProjectMotionPlanning-Headless>
+            --project ${CMAKE_SOURCE_DIR}/config/projects/ABB4600-burnner.sys.json
+            --cdf-file ${CMAKE_CURRENT_SOURCE_DIR}/apf_periodic.txt --cdf-iterations 1)
+    set_tests_properties(ProjectMotionPlanningApfPeriodic PROPERTIES
+        LABELS "SMRobotMotionPlanning;ProjectMotionPlanning;Regression"
+        WORKING_DIRECTORY $<TARGET_FILE_DIR:ProjectMotionPlanning-Headless>)
+endif()
+
+if(BuildTests)
+    add_test(NAME ProjectMotionPlanningApfWrap
+        COMMAND $<TARGET_FILE:ProjectMotionPlanning-Headless>
+            --project ${CMAKE_SOURCE_DIR}/config/projects/ABB4600-burnner.sys.json
+            --cdf-file ${CMAKE_CURRENT_SOURCE_DIR}/apf_wrap_boundary.txt
+            --cdf-max-correction 0.05 --verification-step 0.001)
+    set_tests_properties(ProjectMotionPlanningApfWrap PROPERTIES
+        LABELS "SMRobotMotionPlanning;ProjectMotionPlanning;Regression"
+        WORKING_DIRECTORY $<TARGET_FILE_DIR:ProjectMotionPlanning-Headless>)
+endif()
