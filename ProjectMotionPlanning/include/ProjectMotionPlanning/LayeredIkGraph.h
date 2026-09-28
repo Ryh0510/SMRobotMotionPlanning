@@ -37,5 +37,12 @@ namespace motion_planning
         // Exact Top-M over the supplied candidate sets, not over undiscovered IK roots.
         static LayeredIkGraphResult filter(const CartesianMultiIkResult& ik,
             const LayeredIkGraphOptions& options = {});
+
+        // Independently solve Top-K for EVERY candidate in the first layer.
+        // options.maxPaths is K per start. Paths are ordered by start index, then
+        // cost within that start; selections retain original candidate indices.
+        // Failure/cancellation returns no partial groups. No collision checks.
+        static LayeredIkGraphResult filterByStart(const CartesianMultiIkResult& ik,
+            const LayeredIkGraphOptions& options = {});
     };
 }

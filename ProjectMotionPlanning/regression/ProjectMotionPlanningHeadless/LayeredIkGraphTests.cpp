@@ -74,6 +74,34 @@ int main()
         }
         check(valid, "Top-M matches exhaustive enumeration, sorted costs and distinct complete sequences");
     }
+    for(std::size_t k : {std::size_t(1), std::size_t(7), std::size_t(30)}) {
+        options.maxPaths = k;
+        const auto grouped = ProjectLayeredIkGraph::filterByStart(ik, options);
+        bool valid = grouped.success;
+        std::size_t offset = 0;
+        for(std::size_t start = 0; start < ik.layers[0].candidates.size(); ++start) {
+            std::vector<LayeredIkPath> expected;
+            for(const auto& path : brute) { if(path.selections.front() == start) { expected.push_back(path); } }
+            const auto count = std::min(k, expected.size());
+            std::set<std::vector<std::size_t>> seen;
+            for(std::size_t j = 0; valid && j < count; ++j, ++offset) {
+                valid &= offset < grouped.paths.size();
+                if(!valid) { break; }
+                const auto& actual = grouped.paths[offset];
+                valid &= actual.selections.front() == start && actual.selections.size() == ik.layers.size();
+                valid &= seen.insert(actual.selections).second && std::abs(actual.cost - expected[j].cost) < 1.0e-10;
+                valid &= std::abs(actual.cost - cost(ik, actual.selections, options.jointWeights)) < 1.0e-10;
+            }
+        }
+        check(valid && offset == grouped.paths.size(), "Per-start Top-K matches exhaustive conditional ranking and original indices");
+    }
+    const auto eight = fixture({{{0},{10},{20},{30},{40},{50},{60},{70}}, {{0},{0.1},{0.2}}, {{0},{0.1}}});
+    LayeredIkGraphOptions byStart; byStart.maxPaths = 1;
+    const auto allStarts = ProjectLayeredIkGraph::filterByStart(eight, byStart);
+    const auto globalOne = ProjectLayeredIkGraph::filter(eight, byStart);
+    bool coversAll = allStarts.success && allStarts.paths.size() == 8 && globalOne.paths.size() == 1;
+    for(std::size_t i = 0; coversAll && i < 8; ++i) { coversAll &= allStarts.paths[i].selections.front() == i; }
+    check(coversAll, "K=1 covers all eight starts even when global Top-1 covers only one");
     options.jointWeights = {0,0}; options.maxPaths = 30;
     const auto tied = ProjectLayeredIkGraph::filter(ik, options);
     const auto repeat = ProjectLayeredIkGraph::filter(ik, options);
@@ -84,12 +112,26 @@ int main()
             tied.paths[i].selections == repeat.paths[i].selections;
     }
     check(deterministic, "Zero-weight ties retain every combination with deterministic ordering");
+    const auto tiedGroups = ProjectLayeredIkGraph::filterByStart(ik, options);
+    std::size_t groupOffset = 0;
+    bool tieOrder = tiedGroups.success;
+    for(std::size_t start = 0; start < ik.layers[0].candidates.size(); ++start) {
+        for(const auto& path : tied.paths) {
+            if(path.selections.front() != start) { continue; }
+            tieOrder &= groupOffset < tiedGroups.paths.size() && path.selections == tiedGroups.paths[groupOffset].selections;
+            ++groupOffset;
+        }
+    }
+    check(tieOrder && groupOffset == tiedGroups.paths.size(), "Conditional tie ordering agrees with global ranking");
     const auto turns = fixture({{{0.0}}, {{6.283185307179586}, {0.2}}});
     options.jointWeights = {1}; options.maxPaths = 2;
     const auto turnResult = ProjectLayeredIkGraph::filter(turns, options);
     check(turnResult.success && turnResult.paths[0].selections[1] == 1 &&
         std::abs(turnResult.paths[1].cost - 39.47841760435743) < 1.0e-10,
         "Full-turn displacement is not wrapped to zero or pruned");
+    const auto turnGroups = ProjectLayeredIkGraph::filterByStart(turns, options);
+    check(turnGroups.success && turnGroups.paths.size() == turnResult.paths.size() &&
+        turnGroups.paths[1].cost == turnResult.paths[1].cost, "Conditional ranking retains actual full-turn displacements");
     StoredMotionPlan selected; std::string error;
     check(ProjectTrajectoryInverseKinematics::selectMultiIkTrajectory(turns, turnResult.paths[1].selections, selected, error) &&
         selected.trajectory.points[1].q[0] == 6.283185307179586 && selected.trajectory.points[1].time == 1,
@@ -99,7 +141,14 @@ int main()
     const auto oneLayer = ProjectLayeredIkGraph::filter(single, options);
     check(oneLayer.success && oneLayer.paths.size() == 3 && oneLayer.paths.back().cost == 0,
         "One layer has one zero-cost path per candidate without node costs");
+    const auto oneLayerGroups = ProjectLayeredIkGraph::filterByStart(single, options);
+    check(oneLayerGroups.success && oneLayerGroups.paths.size() == 3 && oneLayerGroups.paths[2].selections[0] == 2,
+        "One-layer fixed-start search returns one path per start despite K=20");
+    auto smallBudget = options; smallBudget.maxStoredPrefixes = 2;
+    const auto outputLimited = ProjectLayeredIkGraph::filterByStart(single, smallBudget);
+    check(!outputLimited.success && outputLimited.paths.empty(), "Combined fixed-start output is bounded and no partial groups escape");
     auto invalid = turns; invalid.layers[1].candidates.clear();
+    check(!ProjectLayeredIkGraph::filterByStart(invalid, options).success, "Conditional ranking rejects empty intermediate layers");
     check(!ProjectLayeredIkGraph::filter(invalid, options).success, "Empty layers cannot be skipped");
     invalid = turns; invalid.cancelled = true;
     check(!ProjectLayeredIkGraph::filter(invalid, options).success, "Incomplete IK cannot be filtered");
@@ -117,5 +166,11 @@ int main()
     options.progress = [&](std::size_t, std::size_t) { stop = true; };
     const auto cancelled = ProjectLayeredIkGraph::filter(turns, options);
     check(cancelled.cancelled && !cancelled.success && cancelled.paths.empty(), "In-flight cancellation never publishes partial Top-M");
+    stop = false;
+    options.jointWeights = {2, 0.3};
+    options.progress = [&](std::size_t done, std::size_t total) { if(done > ik.layers.size()) { stop = true; } };
+    const auto cancelledGroups = ProjectLayeredIkGraph::filterByStart(ik, options);
+    check(cancelledGroups.cancelled && !cancelledGroups.success && cancelledGroups.paths.empty(),
+        "Cancellation after a completed start discards all partial groups");
     return failures ? 1 : 0;
 }

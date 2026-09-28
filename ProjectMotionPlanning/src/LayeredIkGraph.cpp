@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <limits>
 #include <queue>
+#include <optional>
 #include <sstream>
 #include <tuple>
 
@@ -32,8 +33,8 @@ namespace motion_planning
         using Heap = std::priority_queue<Entry, std::vector<Entry>, std::greater<Entry>>;
     }
 
-    LayeredIkGraphResult ProjectLayeredIkGraph::filter(const CartesianMultiIkResult& ik,
-        const LayeredIkGraphOptions& options)
+    static LayeredIkGraphResult filterImpl(const CartesianMultiIkResult& ik,
+        const LayeredIkGraphOptions& options, std::optional<std::size_t> fixedStart)
     {
         LayeredIkGraphResult result;
         const auto fail = [&](const std::string& message) {
@@ -50,6 +51,9 @@ namespace motion_planning
         }
         if(options.maxPaths == 0 || options.maxPaths > 1000 || options.maxStoredPrefixes == 0) {
             return fail("Top-M must be between 1 and 1000 and the prefix budget must be positive.");
+        }
+        if(fixedStart && *fixedStart >= ik.layers.front().candidates.size()) {
+            return fail("Invalid fixed start candidate.");
         }
         auto weights = options.jointWeights;
         if(weights.empty()) { weights.assign(dimension, 1.0); }
@@ -76,16 +80,19 @@ namespace motion_planning
                 }
             }
             const std::size_t perNode = std::min(options.maxPaths, previousPathCount);
-            if(layer.candidates.size() > (options.maxStoredPrefixes - required) / perNode) {
+            const auto activeNodes = i == 0 && fixedStart ? std::size_t(1) : layer.candidates.size();
+            if(activeNodes > (options.maxStoredPrefixes - required) / perNode) {
                 return fail("Exact Top-M prefix budget exceeded. Reduce M or the multi-IK search range.");
             }
-            const auto entries = layer.candidates.size() * perNode;
+            const auto entries = activeNodes * perNode;
             required += entries;
             previousPathCount = std::min(options.maxPaths, entries);
         }
         std::vector<Layer> prefixes(count);
         prefixes[0].resize(ik.layers[0].candidates.size());
-        for(auto& node : prefixes[0]) { node.push_back({}); }
+        for(std::size_t j = 0; j < prefixes[0].size(); ++j) {
+            if(!fixedStart || j == *fixedStart) { prefixes[0][j].push_back({}); }
+        }
         if(options.progress) { options.progress(1, count); }
         for(std::size_t i = 1; i < count; ++i) {
             const auto& previous = prefixes[i - 1];
@@ -99,6 +106,7 @@ namespace motion_planning
                 // A k-way merge obtains the exact M best prefixes for this node.
                 for(std::size_t j = 0; j < previous.size(); ++j) {
                     if(cancelled()) { return cancel(); }
+                    if(previous[j].empty()) { continue; }
                     const auto& from = ik.layers[i - 1].candidates[j].joints;
                     const auto& to = ik.layers[i].candidates[k].joints;
                     double cost = 0.0;
@@ -129,7 +137,9 @@ namespace motion_planning
         }
         Heap finals;
         const auto& last = prefixes.back();
-        for(std::size_t j = 0; j < last.size(); ++j) { finals.push({last[j][0].cost, j, 0}); }
+        for(std::size_t j = 0; j < last.size(); ++j) {
+            if(!last[j].empty()) { finals.push({last[j][0].cost, j, 0}); }
+        }
         while(!finals.empty() && result.paths.size() < options.maxPaths) {
             if(cancelled()) { return cancel(); }
             const auto entry = finals.top(); finals.pop();
@@ -157,4 +167,58 @@ namespace motion_planning
         result.message = message.str();
         return result;
     }
+
+    LayeredIkGraphResult ProjectLayeredIkGraph::filter(const CartesianMultiIkResult& ik,
+        const LayeredIkGraphOptions& options)
+    {
+        return filterImpl(ik, options, std::nullopt);
+    }
+
+    LayeredIkGraphResult ProjectLayeredIkGraph::filterByStart(const CartesianMultiIkResult& ik,
+        const LayeredIkGraphOptions& options)
+    {
+        LayeredIkGraphResult result;
+        // Reuse normal validation for empty/incomplete input and cancellation.
+        if(ik.layers.empty() || ik.layers.front().candidates.empty()) {
+            return filterImpl(ik, options, std::nullopt);
+        }
+        const auto starts = ik.layers.front().candidates.size();
+        const auto layers = ik.layers.size();
+        if(starts > std::numeric_limits<std::size_t>::max() / layers) {
+            result.message = "Fixed-start graph size overflow."; return result;
+        }
+        std::size_t storedSelections = 0;
+        for(std::size_t start = 0; start < starts; ++start) {
+            auto localOptions = options;
+            localOptions.progress = [&, start](std::size_t done, std::size_t) {
+                if(options.progress) { options.progress(start * layers + done, starts * layers); }
+            };
+            auto group = filterImpl(ik, localOptions, start);
+            if(!group.success) {
+                group.message = "Start #" + std::to_string(start + 1) + ": " + group.message;
+                return group;
+            }
+            // Also bound retained output, rather than accumulating unbounded groups.
+            if(group.paths.size() > (options.maxStoredPrefixes - storedSelections) / layers) {
+                result.paths.clear();
+                result.message = "Fixed-start output budget exceeded. Reduce per-start K.";
+                return result;
+            }
+            storedSelections += group.paths.size() * layers;
+            for(auto& path : group.paths) { result.paths.push_back(std::move(path)); }
+        }
+        if(options.cancelled && options.cancelled()) {
+            result.paths.clear(); result.cancelled = true;
+            result.message = "Fixed-start graph search cancelled."; return result;
+        }
+        result.success = true;
+        result.message = "Top-" + std::to_string(options.maxPaths) + " per start, " +
+            std::to_string(starts) + " starts, " + std::to_string(result.paths.size()) +
+            " complete paths. No collision checks or dynamic limits.";
+        if(std::any_of(ik.layers.begin(), ik.layers.end(), [](const auto& layer) { return layer.truncated; })) {
+            result.message += " Input IK enumeration was truncated.";
+        }
+        return result;
+    }
+
 }
