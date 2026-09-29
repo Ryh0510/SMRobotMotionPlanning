@@ -4,6 +4,7 @@
 #include "ApfLocalPlanner.h"
 #include "PathRefinement.h"
 #include "CdfDistanceField.h"
+#include "CdfQueryBatch.h"
 #include <SimulationProject/ProjectDocument.h>
 #include <osqp.h>
 
@@ -400,36 +401,18 @@ namespace motion_planning
             std::size_t endIndex = 0;
         };
 
-        template<typename ValidationRequest>
         std::vector<InvalidSegmentRun> collectInvalidSegmentRuns(
-            ProjectPlanningSceneSnapshot& scene,
+            detail::CdfQueryBatch& queries,
             const std::vector<std::vector<double>>& path,
-            const ValidationRequest& validation)
+            const MotionValidationOptions& validation)
         {
+            const auto states = queries.motions(path, validation);
             std::vector<InvalidSegmentRun> runs;
-            std::size_t index = 0;
-            while(index + 1 < path.size()) {
-                const StateValidationResult segmentValidation =
-                    scene.validateMotion(path[index], path[index + 1], validation);
-                if(segmentValidation.valid) {
-                    ++index;
-                    continue;
-                }
-
-                InvalidSegmentRun run;
-                run.beginSegment = index;
-                run.endSegment = index;
-                while(run.endSegment + 1 < path.size() - 1) {
-                    const std::size_t nextIndex = run.endSegment + 1;
-                    const StateValidationResult nextValidation =
-                        scene.validateMotion(path[nextIndex], path[nextIndex + 1], validation);
-                    if(nextValidation.valid) {
-                        break;
-                    }
-                    run.endSegment = nextIndex;
-                }
-                runs.push_back(run);
-                index = run.endSegment + 1;
+            for(std::size_t i = 0; i < states.size(); ++i) {
+                if(states[i].valid) continue;
+                const std::size_t begin = i;
+                while(i + 1 < states.size() && !states[i + 1].valid) ++i;
+                runs.push_back({begin, i});
             }
             return runs;
         }
@@ -825,6 +808,7 @@ namespace motion_planning
 
         bool repairCollisionRunsWithApf(
             ProjectPlanningSceneSnapshot& scene,
+            detail::CdfQueryBatch& queries,
             const std::vector<JointBound>& bounds,
             const MotionValidationOptions& validation,
             const ProjectCdfQpRepairOptions& options,
@@ -833,7 +817,7 @@ namespace motion_planning
             std::vector<std::vector<double>>* path)
         {
             if(path == nullptr || path->size() < 2 || statistics == nullptr) return false;
-            const auto runs = collectInvalidSegmentRuns(scene, *path, validation);
+            const auto runs = collectInvalidSegmentRuns(queries, *path, validation);
             if(options.progress) options.progress("APF collision intervals: " + std::to_string(runs.size()));
             bool changedAny = false;
             for(const auto& run : runs) {
@@ -858,6 +842,7 @@ namespace motion_planning
                 // Expand to nearby safe anchors when the initial anchors are too
                 // close to contact or there are too few samples for a detour.
                 for(int expansion = 0; expansion < 3 && !repaired; ++expansion) {
+                    if(options.progress) options.progress("APF anchor expansion " + std::to_string(expansion + 1) + " / 3");
                     const std::size_t padding = expansion == 0 ? 2 : (expansion == 1 ? 12 : 40);
                     std::size_t begin = left > padding ? left - padding : 0;
                     std::size_t end = std::min(path->size() - 1, right + padding);
@@ -880,12 +865,24 @@ namespace motion_planning
                         }
                     }
                     detail::ApfOracle oracle;
+                    oracle.progress = [&](int attempt, int iteration) {
+                        if(options.progress) options.progress("APF field " + std::to_string(attempt)
+                            + ", iteration " + std::to_string(iteration) + " / 600");
+                    };
                     oracle.distance = [&](const auto& q) {
-                        const auto sample = evaluateSignedPhi(scene, q, 0.0, options.distanceThreshold, *statistics);
+                        const auto sample = queries.distances({q}, 0.0, options.distanceThreshold, *statistics).front();
                         return sample.valid ? sample.rawDistance : std::numeric_limits<double>::quiet_NaN();
                     };
+                    oracle.distances = [&](const auto& points) {
+                        const auto samples = queries.distances(points, 0.0, options.distanceThreshold, *statistics);
+                        std::vector<double> values;
+                        values.reserve(samples.size());
+                        for(const auto& sample : samples) values.push_back(sample.valid ? sample.rawDistance :
+                            std::numeric_limits<double>::quiet_NaN());
+                        return values;
+                    };
                     oracle.motionValid = [&](const auto& a, const auto& b) {
-                        return scene.validateMotion(a, b, validation).valid;
+                        return queries.pathValid({a, b}, validation);
                     };
                     detail::ApfPath coarse;
                     if(!detail::planApfPath(reference, lower, upper, oracle,
@@ -895,13 +892,7 @@ namespace motion_planning
                     if(replacement.size() != reference.size()) continue;
                     replacement.front() = (*path)[begin];
                     replacement.back() = (*path)[end];
-                    bool valid = true;
-                    for(std::size_t i = 0; i + 1 < replacement.size(); ++i)
-                        if(!scene.validateMotion(replacement[i], replacement[i + 1], validation).valid) {
-                            valid = false;
-                            break;
-                        }
-                    if(!valid) continue;
+                    if(!queries.pathValid(replacement, validation)) continue;
                     // Anchors are unchanged, so the two external seams are unchanged.
                     std::copy(replacement.begin(), replacement.end(), path->begin() + begin);
                     repaired = changedAny = true;
@@ -1450,7 +1441,7 @@ namespace motion_planning
 
         template<typename ValidationRequest>
         bool runCdfQpRepairIterations(
-            ProjectPlanningSceneSnapshot& scene,
+            detail::CdfQueryBatch& queries,
             const std::vector<std::vector<double>>& startPath,
             const std::vector<std::vector<double>>& seedPath,
             const std::vector<JointBound>& bounds,
@@ -1469,27 +1460,16 @@ namespace motion_planning
 
             std::vector<std::vector<double>> path = startPath;
             auto countInvalidSegments = [&](const std::vector<std::vector<double>>& candidate) {
-                int invalidCount = 0;
-                for(std::size_t index = 0; index + 1 < candidate.size(); ++index) {
-                    const StateValidationResult segmentValidation =
-                        scene.validateMotion(candidate[index], candidate[index + 1], validation);
-                    if(!segmentValidation.valid) {
-                        ++invalidCount;
-                    }
-                }
-                return invalidCount;
+                const auto states = queries.motions(candidate, validation);
+                return static_cast<int>(std::count_if(states.begin(), states.end(),
+                    [](const auto& state) { return !state.valid; }));
             };
 
             auto evaluatePathMinimum = [&](const std::vector<std::vector<double>>& candidate) {
                 double minimumPhi = std::numeric_limits<double>::max();
-                for(const std::vector<double>& q : candidate) {
-                    const SignedDistanceSample sample =
-                        evaluateSignedPhi(
-                            scene,
-                            q,
-                            options.safetyMargin,
-                            options.distanceThreshold,
-                            *statistics);
+                const auto samples = queries.distances(candidate, options.safetyMargin,
+                    options.distanceThreshold, *statistics);
+                for(const auto& sample : samples) {
                     if(!sample.valid) {
                         addDiagnostic(diagnostics, "cdf_distance_failed", sample.message);
                         return -std::numeric_limits<double>::max();
@@ -1526,27 +1506,18 @@ namespace motion_planning
             const int maxIterations = std::max(1, options.maxIterations);
 
             for(int iteration = 0; iteration < maxIterations; ++iteration) {
-                std::vector<CdfLinearization> linearizations;
-                linearizations.reserve(path.size());
-
+                if(options.progress) options.progress("Local CDF/QP iteration " + std::to_string(iteration + 1));
+                auto linearizations = queries.linearizations(path, options.safetyMargin,
+                    options.distanceThreshold, options.finiteDifferenceStep, *statistics);
                 double currentPhi = std::numeric_limits<double>::max();
                 bool allSamplesValid = true;
-                for(const std::vector<double>& q : path) {
-                    CdfLinearization linearization = linearizeSignedPhi(
-                        scene,
-                        q,
-                        bounds,
-                        options.safetyMargin,
-                        options.distanceThreshold,
-                        options.finiteDifferenceStep,
-                        *statistics);
+                for(const auto& linearization : linearizations) {
                     if(!linearization.sample.valid) {
                         addDiagnostic(diagnostics, "cdf_linearization_failed", linearization.sample.message);
                         allSamplesValid = false;
                         break;
                     }
                     currentPhi = std::min(currentPhi, linearization.sample.phi);
-                    linearizations.push_back(std::move(linearization));
                 }
                 if(!allSamplesValid) {
                     return false;
@@ -1578,7 +1549,7 @@ namespace motion_planning
                 const int currentInvalidSegments = countInvalidSegments(path);
                 std::vector<std::vector<double>> candidatePath = qpResult.path;
                 if(options.progress) options.progress("Validating QP candidate clearance and motion");
-            double candidatePhi = evaluatePathMinimum(candidatePath);
+                double candidatePhi = evaluatePathMinimum(candidatePath);
                 int candidateInvalidSegments = countInvalidSegments(candidatePath);
 
                 if(candidateInvalidSegments == 0 &&
@@ -1766,6 +1737,9 @@ namespace motion_planning
             return result;
         }
 
+        detail::CdfQueryBatch queries(*scene, planningDocument, projectBaseOrParent(projectBasePath), request, options.queryWorkers);
+        if(options.progress) options.progress("CDF query workers: " + std::to_string(queries.workerCount()));
+
         const std::vector<robottrajectory::TimedJointPoint> denseSeedTrajectory =
             densifyTrajectory(
                 seedTrajectory,
@@ -1786,14 +1760,8 @@ namespace motion_planning
 
         auto evaluatePathMinimum = [&](const std::vector<std::vector<double>>& candidate) {
             double minimumPhi = std::numeric_limits<double>::max();
-            for(const std::vector<double>& q : candidate) {
-                const SignedDistanceSample sample =
-                    evaluateSignedPhi(
-                        *scene,
-                        q,
-                        options.safetyMargin,
-                        options.distanceThreshold,
-                        result.statistics);
+            const auto samples = queries.distances(candidate, options.safetyMargin, options.distanceThreshold, result.statistics);
+            for(const auto& sample : samples) {
                 if(!sample.valid) {
                     addDiagnostic(&result.diagnostics, "cdf_distance_failed", sample.message);
                     return -std::numeric_limits<double>::max();
@@ -1804,15 +1772,8 @@ namespace motion_planning
         };
 
         auto countInvalidSegments = [&](const std::vector<std::vector<double>>& candidate) {
-            int invalidCount = 0;
-            for(std::size_t index = 0; index + 1 < candidate.size(); ++index) {
-                const StateValidationResult validation =
-                    scene->validateMotion(candidate[index], candidate[index + 1], request.validation);
-                if(!validation.valid) {
-                    ++invalidCount;
-                }
-            }
-            return invalidCount;
+            const auto results = queries.motions(candidate, request.validation);
+            return static_cast<int>(std::count_if(results.begin(), results.end(), [](const auto& value) { return !value.valid; }));
         };
 
         auto blendPath = [&](const std::vector<std::vector<double>>& from,
@@ -1848,9 +1809,11 @@ namespace motion_planning
         const int maxIterations = std::max(1, options.maxIterations);
         std::vector<std::vector<double>> seedPath = path;
 
+        if(options.progress) options.progress("Scanning initial path motion collisions");
         if(countInvalidSegments(path) != 0) {
             const bool apfRepaired = repairCollisionRunsWithApf(
                 *scene,
+                queries,
                 scene->jointBounds(),
                 request.validation,
                 options,
@@ -1866,6 +1829,7 @@ namespace motion_planning
             }
         }
 
+        if(options.progress) options.progress("Verifying APF full path");
         result.statistics.invalidSegmentCount = countInvalidSegments(path);
         if(result.statistics.invalidSegmentCount != 0) {
             result.statistics.finalMinimumPhi = evaluatePathMinimum(path);
@@ -1901,6 +1865,7 @@ namespace motion_planning
         smoothingOracle.motionValid = [&](const auto& a, const auto& b) {
             return scene->validateMotion(a, b, request.validation).valid;
         };
+        smoothingOracle.pathValid = [&](const auto& candidate) { return queries.pathValid(candidate, request.validation); };
         path = unwrapContinuousPath(path, scene->jointBounds());
         if(options.postSmoothingIterations > 0) {
             if(options.progress) options.progress("Smoothing APF seed with collision-validated windows");
@@ -1920,30 +1885,17 @@ namespace motion_planning
         // final output retain their existing collision acceptance checks.
         for(int iteration = 0; iteration < maxIterations; ++iteration) {
             if(options.progress) options.progress("CDF/QP iteration " + std::to_string(iteration + 1));
-            std::vector<CdfLinearization> linearizations;
-            linearizations.reserve(path.size());
-
+            if(options.progress) options.progress("CDF gradients 0 / " + std::to_string(path.size()));
+            auto linearizations = queries.linearizations(path, options.safetyMargin, options.distanceThreshold,
+                options.finiteDifferenceStep, result.statistics);
             double minimumPhi = std::numeric_limits<double>::max();
             bool allSamplesValid = true;
-            for(const std::vector<double>& q : path) {
-                if(options.progress && linearizations.size() % 500 == 0)
-                    options.progress("CDF gradients " + std::to_string(linearizations.size())
-                        + " / " + std::to_string(path.size()));
-                CdfLinearization linearization = linearizeSignedPhi(
-                    *scene,
-                    q,
-                    scene->jointBounds(),
-                    options.safetyMargin,
-                    options.distanceThreshold,
-                    options.finiteDifferenceStep,
-                    result.statistics);
+            for(const auto& linearization : linearizations) {
                 if(!linearization.sample.valid) {
                     addDiagnostic(&result.diagnostics, "cdf_linearization_failed", linearization.sample.message);
-                    allSamplesValid = false;
-                    break;
+                    allSamplesValid = false; break;
                 }
                 minimumPhi = std::min(minimumPhi, linearization.sample.phi);
-                linearizations.push_back(std::move(linearization));
             }
             if(!allSamplesValid) {
                 return result;
@@ -1979,10 +1931,10 @@ namespace motion_planning
             std::vector<std::vector<double>> candidatePath = qpResult.path;
             if(options.progress) options.progress("Validating QP candidate clearance and motion");
             double candidatePhi = evaluatePathMinimum(candidatePath);
-            int candidateInvalidSegments = countInvalidSegments(candidatePath);
-
-            if(candidateInvalidSegments == 0 &&
-                (currentInvalidSegments > 0 || candidatePhi >= currentPhi - 1.0e-9))
+            // A failed clearance predicate already rejects this candidate. Keep
+            // the same acceptance rule, but avoid an irrelevant full motion scan.
+            if((currentInvalidSegments > 0 || candidatePhi >= currentPhi - 1.0e-9) &&
+                countInvalidSegments(candidatePath) == 0)
             {
                 path = std::move(candidatePath);
                 result.statistics.finalMinimumPhi = candidatePhi;
@@ -1992,9 +1944,8 @@ namespace motion_planning
                     if(options.progress) options.progress("QP line search " + std::to_string(backtrack + 1) + " / 5");
                     std::vector<std::vector<double>> candidate = blendPath(path, qpResult.path, alpha);
                     const double blendedPhi = evaluatePathMinimum(candidate);
-                    const int blendedInvalidSegments = countInvalidSegments(candidate);
-                    if(blendedInvalidSegments == 0 &&
-                        (currentInvalidSegments > 0 || blendedPhi >= currentPhi - 1.0e-9))
+                    if((currentInvalidSegments > 0 || blendedPhi >= currentPhi - 1.0e-9) &&
+                        countInvalidSegments(candidate) == 0)
                     {
                         path = std::move(candidate);
                         result.statistics.finalMinimumPhi = blendedPhi;
@@ -2118,6 +2069,7 @@ namespace motion_planning
                         // local smoother after the complete window is collision-free.
                         const bool apfWindowChanged = repairCollisionRunsWithApf(
                             *scene,
+                            queries,
                             scene->jointBounds(),
                             localValidation,
                             localOptions,
@@ -2133,7 +2085,7 @@ namespace motion_planning
 
                         std::vector<std::vector<double>> repairedWindow;
                         const bool windowSolved = runCdfQpRepairIterations(
-                            *scene,
+                            queries,
                             windowPath,
                             windowSeed,
                             scene->jointBounds(),
@@ -2189,7 +2141,7 @@ namespace motion_planning
             };
 
             const std::vector<InvalidSegmentRun> initialRuns =
-                collectInvalidSegmentRuns(*scene, path, localValidation);
+                collectInvalidSegmentRuns(queries, path, localValidation);
             if(initialRuns.empty()) {
                 return true;
             }
@@ -2206,7 +2158,7 @@ namespace motion_planning
             repairWindowSet(primaryWindows, 4, "primary", &failedWindows);
 
             std::vector<InvalidSegmentRun> remainingRuns =
-                collectInvalidSegmentRuns(*scene, path, localValidation);
+                collectInvalidSegmentRuns(queries, path, localValidation);
             if(remainingRuns.empty()) {
                 return true;
             }
@@ -2221,7 +2173,7 @@ namespace motion_planning
             sortWindowsByRisk(secondaryWindows);
             repairWindowSet(secondaryWindows, 8, "secondary", &failedWindows);
 
-            remainingRuns = collectInvalidSegmentRuns(*scene, path, localValidation);
+            remainingRuns = collectInvalidSegmentRuns(queries, path, localValidation);
             if(!remainingRuns.empty()) {
                 ProjectCdfQpRepairOptions tertiaryOptions = localOptions;
                 tertiaryOptions.trustRegion = std::max(0.0015, std::min(localOptions.trustRegion, 0.004));
@@ -2243,7 +2195,7 @@ namespace motion_planning
                 sortWindowsByRisk(tertiaryWindows);
                 repairWindowSet(tertiaryWindows, 10, "tertiary", &failedWindows);
                 localOptions = savedLocalOptions;
-                remainingRuns = collectInvalidSegmentRuns(*scene, path, localValidation);
+                remainingRuns = collectInvalidSegmentRuns(queries, path, localValidation);
             }
 
             if(!remainingRuns.empty()) {
@@ -2314,15 +2266,17 @@ namespace motion_planning
         path = unwrapContinuousPath(path, scene->jointBounds());
         if(options.progress) options.progress("Final full-path collision verification");
         result.statistics.invalidSegmentCount = 0;
+        // Fresh final validation: bypass the cache and retain every original sample.
+        const auto finalValidation = queries.motions(path, request.validation, false);
         for(std::size_t index = 0; index + 1 < path.size(); ++index) {
-            const StateValidationResult validation =
-                scene->validateMotion(path[index], path[index + 1], request.validation);
+            const StateValidationResult& validation = finalValidation[index];
             if(!validation.valid) {
                 ++result.statistics.invalidSegmentCount;
                 addDiagnostic(&result.diagnostics, "cdf_repaired_segment_invalid", segmentFailureMessage(index, validation));
             }
         }
 
+        addDiagnostic(&result.diagnostics, "cdf_query_performance", queries.summary());
         if(result.statistics.invalidSegmentCount != 0) {
             addDiagnostic(&result.diagnostics, "cdf_final_path_rejected",
                 "Final collision verification failed; no trajectory was published.");

@@ -118,8 +118,11 @@ namespace motion_planning::detail
                 for(std::size_t i = begin; i < end; ++i) oldLength += distance((*path)[i], (*path)[i + 1]);
                 if(!(after + 1.0e-12 < before) || jointPathLength(candidate) > oldLength + 1.0e-10) continue;
                 bool valid = true;
-                for(std::size_t i = 1; i < candidate.size(); ++i)
-                    if(!oracle.motionValid(candidate[i - 1], candidate[i])) { valid = false; break; }
+                if(oracle.pathValid) { valid = oracle.pathValid(candidate); }
+                else {
+                    for(std::size_t i = 1; i < candidate.size(); ++i)
+                        if(!oracle.motionValid(candidate[i - 1], candidate[i])) { valid = false; break; }
+                }
                 if(!valid) continue;
                 std::copy(candidate.begin(), candidate.end(), path->begin() + begin);
                 changed = true;

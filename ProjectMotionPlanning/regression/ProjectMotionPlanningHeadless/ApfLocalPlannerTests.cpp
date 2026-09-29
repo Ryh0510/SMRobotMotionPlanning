@@ -30,6 +30,17 @@ int main()
     for(std::size_t i = 0; i + 1 < path.size(); ++i)
         if(!oracle.motionValid(path[i], path[i + 1])) return 3;
     if(!planApfPath(reference, lower, upper, oracle, 0.02, &repeat) || repeat != path) return 4;
+    ApfOracle batched = oracle;
+    std::size_t batchCalls = 0;
+    batched.distances = [&](const ApfPath& points) {
+        ++batchCalls;
+        std::vector<double> values;
+        for(const auto& q : points) values.push_back(oracle.distance(q));
+        return values;
+    };
+    if(!planApfPath(reference, lower, upper, batched, 0.02, &repeat) || repeat != path || batchCalls == 0) return 15;
+    batched.distances = [](const ApfPath&) { return std::vector<double>{}; };
+    if(planApfPath(reference, lower, upper, batched, 0.02, &repeat) || !repeat.empty()) return 16;
     const double originalLength = jointPathLength(path);
     shortcutApfPath(&path, oracle);
     if(path.front() != reference.front() || path.back() != reference.back() ||

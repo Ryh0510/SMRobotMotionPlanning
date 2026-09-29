@@ -1,3 +1,4 @@
+#include "../../src/CdfQueryBatch.h"
 #include <ProjectMotionPlanning/ProjectMotionPlanning.h>
 #include "../../src/CdfDistanceField.h"
 #include <ProjectMotionPlanning/CdfJointAngleImport.h>
@@ -43,9 +44,11 @@ namespace
         bool cdfRepair = false;
         bool cdfInspect = false;
         bool cdfGradientCheck = false;
+        bool cdfQueryCheck = false;
         bool cdfGuiDefaults = false;
         double verificationStep = 0.005;
         int cdfIterations = 1;
+        int cdfWorkers = 0;
         double cdfMaxCorrection = std::numeric_limits<double>::infinity();
         bool linearInput = false;
         std::filesystem::path cdfOutput;
@@ -73,6 +76,10 @@ namespace
                 std::istringstream value(argv[++index]);
                 if(!(value >> options.cdfIterations) || !value.eof() || options.cdfIterations < 1) return false;
             }
+            else if (argument == "--cdf-workers" && index + 1 < argc) {
+                std::istringstream value(argv[++index]);
+                if(!(value >> options.cdfWorkers) || !value.eof() || options.cdfWorkers < 0 || options.cdfWorkers > 8) return false;
+            }
             else if (argument == "--cdf-max-correction" && index + 1 < argc) {
                 std::istringstream value(argv[++index]);
                 if(!(value >> options.cdfMaxCorrection) || !value.eof() ||
@@ -85,6 +92,8 @@ namespace
             }
             else if (argument == "--cdf-gui-defaults")
                 options.cdfGuiDefaults = true;
+            else if (argument == "--cdf-query-check")
+                options.cdfQueryCheck = true;
             else if (argument == "--cdf-gradient-check")
                 options.cdfGradientCheck = true;
             else if (argument == "--cdf-inspect")
@@ -638,6 +647,7 @@ namespace
 
         motion_planning::ProjectCdfQpRepairOptions repairOptions;
         repairOptions.maxIterations = options.cdfIterations;
+        repairOptions.queryWorkers = options.cdfWorkers;
         if(options.cdfGuiDefaults) {
             repairOptions.trustRegion = 0.02;
             repairOptions.seedCorridor = 0.10;
@@ -724,6 +734,75 @@ namespace
                   << "; start valid: " << verificationScene->validateState(seedTrajectory.points.front().q).valid
                   << "; goal valid: " << verificationScene->validateState(seedTrajectory.points.back().q).valid << std::endl;
         if(options.cdfInspect) return initialInvalidSegments == 0 ? 0 : 1;
+        if(options.cdfQueryCheck) {
+            using motion_planning::detail::CdfQueryBatch;
+            CdfQueryBatch serial(*verificationScene, document, projectBase, verificationRequest, 1, false);
+            auto parallelScene = motion_planning::ProjectPlanningSceneBuilder::build(document, projectBase, verificationRequest, &errorMessage);
+            if(!parallelScene) return fail(errorMessage);
+            CdfQueryBatch parallel(*parallelScene, document, projectBase, verificationRequest, 4);
+            std::vector<std::vector<double>> path;
+            for(std::size_t i = 0; i < 48; ++i) {
+                auto q = seedTrajectory.points[i % seedTrajectory.points.size()].q;
+                q[0] += 0.0001 * static_cast<double>(i / seedTrajectory.points.size());
+                path.push_back(q);
+            }
+            motion_planning::ProjectCdfQpRepairStatistics aStats, bStats;
+            const auto a = serial.distances(path, repairOptions.safetyMargin, repairOptions.distanceThreshold, aStats);
+            const auto b = parallel.distances(path, repairOptions.safetyMargin, repairOptions.distanceThreshold, bStats);
+            for(std::size_t i = 0; i < path.size(); ++i) {
+                if(a[i].valid != b[i].valid || a[i].inCollision != b[i].inCollision ||
+                    std::abs(a[i].phi - b[i].phi) > 1.0e-10) return fail("Parallel distance differs from serial exact query.");
+            }
+            const int before = bStats.collisionQueries;
+            const auto cached = parallel.distances(path, repairOptions.safetyMargin, repairOptions.distanceThreshold, bStats);
+            if(bStats.collisionQueries != before) return fail("Repeated exact distance was not cached.");
+            for(std::size_t i = 0; i < path.size(); ++i) {
+                if(cached[i].phi != b[i].phi) return fail("Cached distance changed.");
+            }
+            auto shifted = path; shifted[7][1] += 1.0e-8;
+            parallel.distances(shifted, repairOptions.safetyMargin, repairOptions.distanceThreshold, bStats);
+            if(bStats.collisionQueries == before) return fail("Cache incorrectly quantized changed joint values.");
+            const int afterState = bStats.collisionQueries;
+            parallel.distances(path, repairOptions.safetyMargin * 2, repairOptions.distanceThreshold, bStats);
+            if(bStats.collisionQueries == afterState) return fail("Distance cache ignored safety margin.");
+            const int afterMargin = bStats.collisionQueries;
+            parallel.distances(path, repairOptions.safetyMargin, repairOptions.distanceThreshold * 0.5, bStats);
+            if(bStats.collisionQueries == afterMargin) return fail("Distance cache ignored horizon.");
+            const auto ag = serial.linearizations(path, repairOptions.safetyMargin, repairOptions.distanceThreshold,
+                repairOptions.finiteDifferenceStep, aStats);
+            const auto bg = parallel.linearizations(path, repairOptions.safetyMargin, repairOptions.distanceThreshold,
+                repairOptions.finiteDifferenceStep, bStats);
+            double gradientError = 0;
+            for(std::size_t i = 0; i < path.size(); ++i) {
+                for(std::size_t j = 0; j < path[i].size(); ++j) {
+                    gradientError = std::max(gradientError, std::abs(ag[i].gradient[j] - bg[i].gradient[j]));
+                }
+            }
+            if(gradientError > 1.0e-7) return fail("Parallel nearest-feature gradients differ from serial.");
+            const auto am = serial.motions(path, verificationRequest.validation);
+            const auto bm = parallel.motions(path, verificationRequest.validation);
+            const auto cm = parallel.motions(path, verificationRequest.validation);
+            const auto fresh = parallel.motions(path, verificationRequest.validation, false);
+            bool allValid = true;
+            for(std::size_t i = 0; i < am.size(); ++i) {
+                if(am[i].valid != bm[i].valid || am[i].diagnosticCode != bm[i].diagnosticCode ||
+                    am[i].message != bm[i].message || bm[i].valid != cm[i].valid || cm[i].valid != fresh[i].valid)
+                    return fail("Parallel/cached/fresh motion checks disagree.");
+                allValid &= am[i].valid;
+            }
+            if(parallel.pathValid(path, verificationRequest.validation) != allValid)
+                return fail("Parallel smoothing-window acceptance differs from per-edge validation.");
+            auto fine = verificationRequest.validation; fine.maxJointStep *= 0.5;
+            const auto fineSerial = serial.motions(path, fine), fineParallel = parallel.motions(path, fine);
+            for(std::size_t i = 0; i < fineSerial.size(); ++i) {
+                if(fineSerial[i].valid != fineParallel[i].valid) return fail("Motion cache ignored sampling step.");
+            }
+            auto invalid = path; invalid[5][0] = std::numeric_limits<double>::quiet_NaN();
+            if(parallel.pathValid(invalid, verificationRequest.validation)) return fail("Invalid state passed batch validation.");
+            std::cout << "Serial/parallel/exact-cache query equivalence passed; max gradient error=" << gradientError
+                      << "; " << parallel.summary() << std::endl;
+            return 0;
+        }
         if(options.cdfGradientCheck) {
             double maxError = 0.0;
             int checked = 0, accelerated = 0;

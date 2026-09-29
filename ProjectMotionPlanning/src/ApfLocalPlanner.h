@@ -13,7 +13,12 @@ namespace motion_planning::detail
     struct ApfOracle
     {
         std::function<double(const ApfState&)> distance;
+        // Optional equivalent distance observations in input order (e.g. finite differences).
+        std::function<std::vector<double>(const ApfPath&)> distances;
+        std::function<void(int, int)> progress;
         std::function<bool(const ApfState&, const ApfState&)> motionValid;
+        // Optional equivalent batch check for a complete smoothing window.
+        std::function<bool(const ApfPath&)> pathValid;
     };
 
     bool planApfPath(const ApfPath& reference, const ApfState& lower,

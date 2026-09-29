@@ -45,6 +45,9 @@ namespace motion_planning
         // Optimization knots are independent of the fine collision sampling.
         double optimizationMaxJointStep = 0.04;
         double validationMaxJointStep = 0.02;
+        // Execution only: 0 = auto (up to 4 isolated query scenes), 1 = serial.
+        // Does not change sample spacing, QP tolerances or optimization settings.
+        int queryWorkers = 0;
         // Optional synchronous observation; the callback must not mutate the scene.
         std::function<void(const std::string&)> progress;
     };

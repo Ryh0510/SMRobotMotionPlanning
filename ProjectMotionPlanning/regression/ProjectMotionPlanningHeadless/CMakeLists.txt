@@ -102,3 +102,13 @@ if(BuildTests)
         LABELS "SMRobotMotionPlanning;ProjectMotionPlanning;Regression"
         WORKING_DIRECTORY $<TARGET_FILE_DIR:IkGraphTests>)
 endif()
+
+if(BuildTests)
+    add_test(NAME ProjectMotionPlanningCdfQueries
+        COMMAND $<TARGET_FILE:ProjectMotionPlanning-Headless>
+            --project ${CMAKE_SOURCE_DIR}/config/projects/ABB4600-burnner.sys.json
+            --cdf-file ${CMAKE_CURRENT_SOURCE_DIR}/apf_periodic.txt --cdf-query-check --verification-step 0.001)
+    set_tests_properties(ProjectMotionPlanningCdfQueries PROPERTIES
+        LABELS "SMRobotMotionPlanning;ProjectMotionPlanning;Regression"
+        WORKING_DIRECTORY $<TARGET_FILE_DIR:ProjectMotionPlanning-Headless>)
+endif()

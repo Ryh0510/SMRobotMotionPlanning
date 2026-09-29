@@ -63,6 +63,7 @@ namespace motion_planning::detail
             double bestGoalDistance = norm(difference(goal, q));
             int stagnant = 0;
             for(int iteration = 0; iteration < 600; ++iteration) {
+                if(oracle.progress && iteration % 100 == 0) oracle.progress(attempt + 1, iteration);
                 ApfState attraction = difference(goal, q);
                 const double goalDistanceNow = norm(attraction);
                 if(iteration % 6 == 0 || goalDistanceNow < 0.06) {
@@ -79,11 +80,23 @@ namespace motion_planning::detail
                 ApfState gradient(dimension, 0.0);
                 if(distance < influence) {
                     constexpr double epsilon = 0.001;
+                    ApfPath probes;
+                    probes.reserve(2 * dimension);
                     for(std::size_t j = 0; j < dimension; ++j) {
                         ApfState plus = q, minus = q;
                         plus[j] = std::min(upper[j], q[j] + epsilon);
                         minus[j] = std::max(lower[j], q[j] - epsilon);
-                        const double dp = oracle.distance(plus), dm = oracle.distance(minus);
+                        probes.push_back(std::move(plus));
+                        probes.push_back(std::move(minus));
+                    }
+                    std::vector<double> distances;
+                    if(oracle.distances) { distances = oracle.distances(probes); }
+                    else { for(const auto& probe : probes) distances.push_back(oracle.distance(probe)); }
+                    if(distances.size() != probes.size()) return false;
+                    for(std::size_t j = 0; j < dimension; ++j) {
+                        const auto& plus = probes[2 * j];
+                        const auto& minus = probes[2 * j + 1];
+                        const double dp = distances[2 * j], dm = distances[2 * j + 1];
                         // Mesh penetration depths need not form a differentiable
                         // signed field. Use free-space differences at its boundary.
                         if(std::isfinite(dp) && std::isfinite(dm) && dp >= 0.0 && dm >= 0.0 && plus[j] > minus[j])
