@@ -59,6 +59,19 @@ namespace motion_planning
         std::size_t solvedPointCount() const;
     };
 
+    // Geometric branch signs, independent of candidate order and joint turns.
+    // Zero denotes a branch boundary; unavailable models remain unclassified.
+    struct CartesianIkConfiguration
+    {
+        bool available = false;
+        int shoulder = 0;
+        int elbow = 0;
+        int wrist = 0;
+        int stableId() const;
+    };
+
+    using CartesianIkClassifier = std::function<CartesianIkConfiguration(const std::vector<double>&)>;
+
     // All angles are in the stored IK convention, in radians. Bounds are finite
     // search windows intersected with known model limits; turn values are retained.
     struct CartesianMultiIkOptions
@@ -74,6 +87,7 @@ namespace motion_planning
         double duplicateTolerance = 1.0e-4;
         std::function<bool()> cancelled;
         std::function<void(std::size_t, std::size_t)> progress;
+        CartesianIkClassifier classifyConfiguration;
     };
 
     struct CartesianIkCandidate
@@ -82,6 +96,7 @@ namespace motion_planning
         std::vector<int> turns;
         double positionError = 0.0;
         double orientationError = 0.0;
+        CartesianIkConfiguration configuration;
     };
 
     struct CartesianIkLayer
@@ -105,6 +120,15 @@ namespace motion_planning
     class ProjectTrajectoryInverseKinematics
     {
     public:
+        // Private actual-model FK snapshot, no tool/base or nominal-DH assumptions.
+        // The callback consumes stored IK angles; not safe for concurrent invocation.
+        // Caller opts in only for the ABB4600 six-axis serial arm family.
+        static CartesianIkClassifier createIrb4600ConfigurationClassifier(
+            const simulation_project::ProjectDocument& document,
+            const std::filesystem::path& basePath, const std::string& robotId,
+            const std::vector<std::string>& names, bool mapStoredJointSigns,
+            std::string& error);
+
         // Numerical multi-start enumeration, not a proof of exhaustive analytic IK.
         static CartesianMultiIkResult solveAllCartesianControlPoints(
             const StoredMotionPlan& plan, const CartesianMultiIkOptions& options);

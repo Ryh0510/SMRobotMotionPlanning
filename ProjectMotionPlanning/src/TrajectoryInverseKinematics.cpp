@@ -6,7 +6,9 @@
 #include <Eigen/Dense>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <memory>
 #include <limits>
 #include <sstream>
 #include <utility>
@@ -609,6 +611,73 @@ namespace motion_planning
         return true;
     }
 
+    int CartesianIkConfiguration::stableId() const
+    {
+        if(!available || std::abs(shoulder) != 1 || std::abs(elbow) != 1 || std::abs(wrist) != 1) { return 0; }
+        return 1 + (shoulder < 0 ? 4 : 0) + (elbow < 0 ? 2 : 0) + (wrist < 0 ? 1 : 0);
+    }
+
+    CartesianIkClassifier ProjectTrajectoryInverseKinematics::createIrb4600ConfigurationClassifier(
+        const simulation_project::ProjectDocument& document, const std::filesystem::path& basePath,
+        const std::string& robotId, const std::vector<std::string>& names, bool mapStoredJointSigns,
+        std::string& error)
+    {
+        if(names.size() != 6) { error = "Configuration classification requires six serial joints."; return {}; }
+        auto runtime = std::make_shared<simulation_runtime::ProjectSimulationRuntime>();
+        const auto loaded = runtime->loadProject(document, basePath);
+        if(!loaded.success) { error = loaded.message; return {}; }
+        const auto* item = runtime->robot(robotId);
+        if(!item || !item->instance) { error = "Configuration robot snapshot is unavailable."; return {}; }
+        std::array<robot::RobotJoint, 6> joints;
+        for(std::size_t j = 0; j < joints.size(); ++j) {
+            const auto it = std::find_if(item->model.joints.begin(), item->model.joints.end(),
+                [&](const auto& joint) { return joint.name == names[j]; });
+            if(it == item->model.joints.end() || it->type != robot::JointType::Revolute ||
+                it->isLoop || it->dofIndex < 0 || !it->axis_local.allFinite() || it->axis_local.norm() < 1.0e-8 ||
+                (j > 0 && it->parent != joints[j - 1].child)) {
+                error = "Unsupported shoulder/elbow/wrist joint chain: " + names[j]; return {};
+            }
+            joints[j] = *it;
+        }
+        error.clear();
+        return [runtime, robotId, joints, mapStoredJointSigns](const std::vector<double>& stored) {
+            CartesianIkConfiguration result;
+            if(stored.size() != 6 || !std::all_of(stored.begin(), stored.end(),
+                [](double q) { return std::isfinite(q); })) { return result; }
+            const auto values = mapStoredJointSigns ? irb4600RobotSystemJointValues(stored) : stored;
+            const auto* robot = runtime->robot(robotId);
+            for(std::size_t j = 0; j < joints.size(); ++j) {
+                robot->instance->setJoint(joints[j].dofIndex, values[j]);
+            }
+            robot->instance->update();
+            std::array<Eigen::Vector3d, 6> p, a;
+            for(std::size_t j = 0; j < joints.size(); ++j) {
+                const Eigen::Isometry3d frame = robot->instance->getLinkTransform(joints[j].parent) * joints[j].T_parent_joint;
+                p[j] = frame.translation();
+                a[j] = (frame.linear() * joints[j].axis_local).normalized();
+                if(!p[j].allFinite() || !a[j].allFinite()) { return result; }
+            }
+            // ABB CAD axes are slightly nonideal: classify actual geometry, not
+            // signs of q2/q3/q5 or the legacy ideal-DH offsets. J5 is the wrist centre.
+            Eigen::Vector3d radial = a[1].cross(a[0]);
+            const Eigen::Vector3d upper = p[2] - p[1], forearm = p[4] - p[2];
+            if(radial.norm() < 0.5 || std::abs(a[1].dot(a[2])) < 0.99 ||
+                upper.norm() < 1.0e-6 || forearm.norm() < 1.0e-6) { return result; }
+            radial.normalize();
+            const double outward = radial.dot(p[1] - p[0]);
+            if(std::abs(outward) < 1.0e-6) { return result; }
+            if(outward < 0) { radial = -radial; }
+            const auto sign = [](double value, double tolerance) {
+                return value > tolerance ? 1 : value < -tolerance ? -1 : 0;
+            };
+            result.available = true;
+            result.shoulder = sign(radial.dot(p[4] - p[0]), 1.0e-5);
+            result.elbow = sign(a[1].dot(upper.normalized().cross(forearm.normalized())), 1.0e-5);
+            result.wrist = sign(a[3].cross(a[5]).dot(a[4]), 1.0e-5);
+            return result;
+        };
+    }
+
     CartesianMultiIkResult ProjectTrajectoryInverseKinematics::solveAllCartesianControlPoints(
         const StoredMotionPlan& plan, const CartesianMultiIkOptions& options)
     {
@@ -702,12 +771,18 @@ namespace motion_planning
                             error.tail<3>().norm() > options.orientationTolerance) { return; }
                         if(layer.candidates.size() >= options.maxCandidatesPerPoint) { layer.truncated = true; return; }
                         layer.candidates.push_back({lifted, turns, error.head<3>().norm(), error.tail<3>().norm()});
+                        if(options.classifyConfiguration) {
+                            layer.candidates.back().configuration = options.classifyConfiguration(lifted);
+                        }
                     };
                     expand(0);
                     if(layer.truncated) { break; }
                 }
                 previousRoots = std::move(roots);
                 std::sort(layer.candidates.begin(), layer.candidates.end(), [](const auto& a, const auto& b) {
+                    const int aid = a.configuration.stableId(), bid = b.configuration.stableId();
+                    if(aid != bid) { return (aid == 0 ? 9 : aid) < (bid == 0 ? 9 : bid); }
+                    if(aid != 0 && a.turns != b.turns) { return a.turns < b.turns; }
                     return a.joints < b.joints;
                 });
                 layer.message = layer.candidates.empty() ? "No valid root found within search budget/range." :
