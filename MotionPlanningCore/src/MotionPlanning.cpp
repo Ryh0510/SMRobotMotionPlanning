@@ -5,11 +5,70 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <exception>
 #include <utility>
 
 namespace motion_planning
 {
+    bool JointPlaybackTimeline::reset(const robottrajectory::JointTrajectory& trajectory,
+        double duration, bool uniformJointSpeed)
+    {
+        m_times.clear();
+        const auto& points = trajectory.points;
+        if(points.empty() || points.front().q.empty() || !std::isfinite(duration) || duration <= 0.0) {
+            return false;
+        }
+        bool sourceTimesValid = true;
+        for(std::size_t i = 0; i < points.size(); ++i) {
+            if(points[i].q.size() != points.front().q.size() || !std::isfinite(points[i].time) ||
+                !std::all_of(points[i].q.begin(), points[i].q.end(), [](double q) { return std::isfinite(q); })) {
+                return false;
+            }
+            if(i > 0 && points[i].time <= points[i - 1].time) { sourceTimesValid = false; }
+        }
+        m_times.resize(points.size(), 0.0);
+        for(std::size_t i = 1; i < points.size(); ++i) {
+            if(!uniformJointSpeed && sourceTimesValid) {
+                m_times[i] = points[i].time - points.front().time;
+            } else {
+                double distance = 0.0;
+                for(std::size_t j = 0; j < points[i].q.size(); ++j) {
+                    distance = std::hypot(distance, points[i].q[j] - points[i - 1].q[j]);
+                }
+                m_times[i] = m_times[i - 1] + distance;
+            }
+            if(!std::isfinite(m_times[i])) { m_times.clear(); return false; }
+        }
+        const double total = m_times.back();
+        for(std::size_t i = 1; i < m_times.size(); ++i) {
+            m_times[i] = total > 1e-12 ? (m_times[i] / total) * duration
+                : duration * static_cast<double>(i) / static_cast<double>(m_times.size() - 1);
+        }
+        return true;
+    }
+
+    double JointPlaybackTimeline::pointTime(std::size_t index) const
+    {
+        return m_times.at(index);
+    }
+
+    std::vector<double> JointPlaybackTimeline::sample(
+        const robottrajectory::JointTrajectory& trajectory, double time) const
+    {
+        if(m_times.empty() || trajectory.points.size() != m_times.size()) { return {}; }
+        if(time <= 0.0) { return trajectory.points.front().q; }
+        const auto next = std::upper_bound(m_times.begin(), m_times.end(), time);
+        if(next == m_times.end()) { return trajectory.points.back().q; }
+        const auto index = static_cast<std::size_t>(next - m_times.begin());
+        const double alpha = (time - m_times[index - 1]) / (m_times[index] - m_times[index - 1]);
+        auto q = trajectory.points[index - 1].q;
+        for(std::size_t j = 0; j < q.size(); ++j) {
+            q[j] += alpha * (trajectory.points[index].q[j] - q[j]);
+        }
+        return q;
+    }
+
     namespace
     {
         using Json = nlohmann::json;

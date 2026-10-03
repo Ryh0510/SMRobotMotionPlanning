@@ -15,6 +15,19 @@ namespace simulation_project
 
 namespace motion_planning
 {
+    // Preview timing only. Samples stay on the original joint-space polyline;
+    // no angle wrapping, trajectory mutation or controller time parameterization.
+    class JointPlaybackTimeline
+    {
+    public:
+        bool reset(const robottrajectory::JointTrajectory& trajectory, double duration,
+            bool uniformJointSpeed);
+        double pointTime(std::size_t index) const;
+        std::vector<double> sample(const robottrajectory::JointTrajectory& trajectory, double time) const;
+    private:
+        std::vector<double> m_times;
+    };
+
     struct MotionPlanningConstraint
     {
         double duration = 5.0;
