@@ -167,6 +167,38 @@ int main()
     if(!projectApfPosition(projected,{0.5,0},{-1,-1,-1},{2,1,4},wrist,0.04) ||
         !followsApfGuide(projected,projected,{0.5,0},{0.5,0},wrist))return 34;
     if(projectApfPosition(projected,{0.5,0},{1,-1,-1},{-1,1,4},wrist,0.04))return 35;
+    // TCP shape restoration must undo the crossing of two returning strokes,
+    // preserve unwrapped turns, and never publish a collision-limited proposal.
+    ApfGuidance lanes;lanes.maxDeviation=0.10;
+    lanes.position=[](const auto& q){return ApfState{q[0],q[1],q[2]};};
+    ApfPath bowed;
+    for(int i=0;i<=200;++i) {
+        const double t=i/200.0,x=-0.2+0.4*t;
+        lanes.positions.push_back({x,0,0});
+        bowed.push_back({x,0.07*std::sin(3.14159265358979323846*t),0,6.4});
+    }
+    const auto bowedOriginal=bowed;
+    ApfOracle restore;
+    restore.distance=[](const auto& q){return std::hypot(q[0],q[1])-0.03;};
+    restore.distances=[&](const auto& p){std::vector<double> v;for(const auto& q:p)v.push_back(restore.distance(q));return v;};
+    restore.motionValid=[&](const auto& a,const auto& b){for(int k=0;k<=50;++k){auto q=a;
+        for(std::size_t j=0;j<q.size();++j)q[j]+=(b[j]-a[j])*k/50.0;if(restore.distance(q)<0)return false;}return true;};
+    restore.pathValid=[&](const auto& p,std::size_t begin){if(!followsApfPath(p,lanes,begin))return false;
+        for(std::size_t i=1;i<p.size();++i)if(!restore.motionValid(p[i-1],p[i]))return false;return true;};
+    if(!restoreApfTcpShape(&bowed,{-1,-1,-1,5},{1,1,1,8},restore,lanes) ||
+        bowed.front()!=bowedOriginal.front() || bowed.back()!=bowedOriginal.back() || !restore.pathValid(bowed,0))return 36;
+    double oldError=0,newError=0;
+    for(std::size_t i=0;i<bowed.size();++i){oldError+=std::abs(bowedOriginal[i][1]);newError+=std::abs(bowed[i][1]);if(bowed[i][3]!=6.4)return 37;}
+    if(newError>=oldError)return 38;
+    const auto safeBowed=bowed;
+    restore.motionsValid=[](const auto& p){return std::vector<bool>(p.size()-1,false);};
+    if(restoreApfTcpShape(&bowed,{-1,-1,-1,5},{1,1,1,8},restore,lanes) || bowed!=safeBowed)return 39;
+    restore.motionsValid={};restore.distance=[](const auto&){return 1.0;};
+    lanes.positions.clear();bowed.clear();
+    for(int i=0;i<=200;++i){const double t=(i<=100?i:200-i)/100.0,y=i<=100?0.0:0.04;
+        lanes.positions.push_back({t,y,0});bowed.push_back({t,y+(i<=100?1:-1)*0.06*std::sin(3.14159265358979323846*t),0,6.4});}
+    if(!restoreApfTcpShape(&bowed,{-1,-1,-1,5},{2,1,1,8},restore,lanes))return 40;
+    for(std::size_t i=5;i<95;++i)if(bowed[i][1]>=bowed[200-i][1])return 41;
     std::cout << "PASS APF: free path, obstacle, fixed anchors, deterministic escape, blocked corridor, invalid oracle, ordered zigzag, turn preservation, hard TCP corridor, nonlinear FK segment, time-aware smoothing\n";
     return 0;
 }

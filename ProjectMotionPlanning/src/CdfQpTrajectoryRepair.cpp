@@ -2016,6 +2016,35 @@ namespace motion_planning
                 if(!sample.valid || sample.phi < smoothingPhiFloor - 1.0e-9) return false;
             return queries.pathValid(candidate, request.validation);
         };
+        // Shape restoration uses the same detector/filters, at the final dense
+        // resolution. A closest-reference objective is separate from joint bend.
+        detail::ApfOracle shapeOracle=smoothingOracle;
+        auto shapeValidation=request.validation;
+        shapeValidation.maxJointStep=std::min(shapeValidation.maxJointStep,0.00025);
+        shapeOracle.distances=[&](const auto& states) {
+            const auto observations=queries.distances(states,0.0,options.distanceThreshold,result.statistics);
+            std::vector<double> values;for(const auto& v:observations)
+                values.push_back(v.valid?v.rawDistance:-std::numeric_limits<double>::infinity());
+            return values;
+        };
+        shapeOracle.motionsValid=[&](const auto& states) {
+            const auto observations=queries.motions(states,shapeValidation);
+            std::vector<bool> values;for(const auto& v:observations)values.push_back(v.valid);return values;
+        };
+        shapeOracle.pathValid=[&](const auto& candidate,std::size_t begin) {
+            return smoothingOracle.pathValid(candidate,begin) && queries.pathValid(candidate,shapeValidation);
+        };
+        shapeOracle.progress=[&](int pass,int total) {
+            if(options.progress)options.progress("TCP reference shape refinement " + std::to_string(pass+1) + " / " + std::to_string(total));
+        };
+        const auto refineShape=[&]() {
+            if(!constrainTcp || options.postSmoothingIterations<=0)return;
+            const bool restored=detail::refineApfTcpShape(&path,knotTimes,refinementLower,refinementUpper,
+                shapeOracle,tcpGuide,3,std::min(1.0,2.2*smoothingStep));
+            addDiagnostic(&result.diagnostics,restored?"tcp_shape_restored":"tcp_shape_preserved",
+                restored?"Restored ordered TCP scan shape with rounded reference corners and smooth collision-limited offsets; joint fairing stays within 0.201 mm of this TCP curve at ordered knots."
+                    :"No complete validated TCP shape restoration was found; retained the preceding path without relaxing collision or deviation limits.");
+        };
         path = unwrapContinuousPath(path, scene->jointBounds());
         if(options.postSmoothingIterations > 0) {
             if(options.progress) options.progress("Smoothing APF seed with collision-validated windows");
@@ -2029,6 +2058,7 @@ namespace motion_planning
                 << " -> " << detail::jointPathBending(path, knotTimes) << ".";
             addDiagnostic(&result.diagnostics, "apf_seed_smoothing", message.str());
         }
+        refineShape();
         captureStage("APF (refined, before QP)", path, evaluatePathMinimum(path), 0);
         seedPath = path;
 
@@ -2412,6 +2442,7 @@ namespace motion_planning
             }
         }
 
+        refineShape();
         result.statistics.finalMinimumPhi = evaluatePathMinimum(path);
         if(result.statistics.finalMinimumPhi <= -std::numeric_limits<double>::max() * 0.25) {
             return result;

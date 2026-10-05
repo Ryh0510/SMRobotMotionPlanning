@@ -19,6 +19,8 @@ namespace motion_planning::detail
         std::function<void(int, int)> progress;
         std::function<void(int, std::size_t, const ApfState&)> failedStation;
         std::function<bool(const ApfState&, const ApfState&)> motionValid;
+        // Equivalent batch motion checks, one result per raw adjacent segment.
+        std::function<std::vector<bool>(const ApfPath&)> motionsValid;
         // Optional actual-model projection, before cost and full path validation.
         std::function<bool(ApfState&, std::size_t)> project;
         // Optional equivalent batch check for a complete smoothing window.
