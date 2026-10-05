@@ -112,3 +112,15 @@ if(BuildTests)
         LABELS "SMRobotMotionPlanning;ProjectMotionPlanning;Regression"
         WORKING_DIRECTORY $<TARGET_FILE_DIR:ProjectMotionPlanning-Headless>)
 endif()
+
+if(BuildTests)
+    add_executable(ProjectMotionPlanning-TrajectoryQualityTests TrajectoryQualityTests.cpp)
+    target_link_libraries(ProjectMotionPlanning-TrajectoryQualityTests PRIVATE ${PACKAGE_NAME}::ProjectMotionPlanning)
+    target_compile_features(ProjectMotionPlanning-TrajectoryQualityTests PRIVATE cxx_std_17)
+    set_target_properties(ProjectMotionPlanning-TrajectoryQualityTests PROPERTIES FOLDER "Regression/SMRobotMotionPlanning")
+    copy_runtime_dlls(ProjectMotionPlanning-TrajectoryQualityTests)
+    add_test(NAME ProjectMotionPlanningTrajectoryQuality COMMAND $<TARGET_FILE:ProjectMotionPlanning-TrajectoryQualityTests>)
+    set_tests_properties(ProjectMotionPlanningTrajectoryQuality PROPERTIES
+        LABELS "SMRobotMotionPlanning;ProjectMotionPlanning;Regression"
+        WORKING_DIRECTORY $<TARGET_FILE_DIR:ProjectMotionPlanning-TrajectoryQualityTests>)
+endif()

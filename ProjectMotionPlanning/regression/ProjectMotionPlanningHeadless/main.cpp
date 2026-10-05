@@ -646,6 +646,8 @@ namespace
         }
 
         motion_planning::ProjectCdfQpRepairOptions repairOptions;
+        repairOptions.apfMaxTcpDeviation = 0.0;
+        std::cout << "Headless legacy mode: TCP corridor disabled (no calibrated TCP FK); use the viewer for the configured TCP shape constraint.\n";
         repairOptions.maxIterations = options.cdfIterations;
         repairOptions.queryWorkers = options.cdfWorkers;
         if(options.cdfGuiDefaults) {
@@ -847,6 +849,23 @@ namespace
 
         std::cout << "repair elapsed seconds: " << std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count() << "\n";
         std::cout << "CDF repair points: " << repairResult.plan.trajectory.points.size() << "\n";
+        for(const auto& stage : repairResult.stages) {
+            const auto& quality = stage.quality;
+            std::cout << "Stage " << stage.name << ": length=" << quality.jointLength << ", bending=" << quality.bendingCost
+                << ", cornerDeg=" << quality.maximumCornerRadians * 180.0 / kPi << ", duration=" << quality.duration
+                << ", velocity=" << quality.peakVelocity << ", acceleration=" << quality.peakAcceleration
+                << ", timeInvalid=" << quality.nonPositiveIntervals << ", velocityViolations=" << quality.velocityLimitViolations
+                << ", accelerationViolations=" << quality.accelerationLimitViolations << ", phi=" << stage.minimumPhi
+                << ", collisionInvalid=" << stage.invalidSegments << "\n";
+            if(!options.cdfOutput.empty()) {
+                const auto stageFile = options.cdfOutput.parent_path() / (options.cdfOutput.stem().string() + "-stage-" + std::to_string(&stage - repairResult.stages.data()) + ".txt");
+                std::ofstream file(stageFile); file << std::fixed << std::setprecision(9);
+                file << "time_s"; for(std::size_t j = 0; j < stage.plan.jointNames.size(); ++j) file << "\tJ" << j + 1 << "_deg"; file << "\n";
+                for(const auto& point : stage.plan.trajectory.points) {
+                    file << point.time; for(double q : maybeMapIrb4600JointSigns(document, robotId, point.q)) file << '\t' << q * 180.0 / kPi; file << '\n';
+                }
+            }
+        }
         std::cout << "success: " << (repairResult.success ? "yes" : "no") << "\n";
         std::cout << "min phi: " << repairResult.statistics.initialMinimumPhi
                   << " -> " << repairResult.statistics.finalMinimumPhi << "\n";

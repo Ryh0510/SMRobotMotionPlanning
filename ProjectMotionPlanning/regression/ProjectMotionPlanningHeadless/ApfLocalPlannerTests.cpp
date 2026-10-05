@@ -1,6 +1,9 @@
 #include "../../src/ApfLocalPlanner.h"
 #include "../../src/PathRefinement.h"
+#include <ProjectMotionPlanning/CdfQpTrajectoryRepair.h>
+#include <SimulationProject/ProjectDocument.h>
 
+#include <algorithm>
 #include <cmath>
 #include <iostream>
 #include <limits>
@@ -9,6 +12,12 @@ using namespace motion_planning::detail;
 
 int main()
 {
+    motion_planning::ProjectCdfQpTrajectoryRepairService service;
+    simulation_project::ProjectDocument document;
+    robottrajectory::JointTrajectory dummy;
+    const auto missing = service.repair(document, {}, "robot", {"joint"}, dummy);
+    if(missing.success || !missing.plan.trajectory.empty() || missing.diagnostics.empty() ||
+        missing.diagnostics.front().code != "apf_tcp_model_missing") return 26;
     ApfOracle oracle;
     oracle.distance = [](const ApfState& q) { return std::hypot(q[0], q[1]) - 0.3; };
     oracle.motionValid = [&](const ApfState& a, const ApfState& b) {
@@ -41,12 +50,6 @@ int main()
     if(!planApfPath(reference, lower, upper, batched, 0.02, &repeat) || repeat != path || batchCalls == 0) return 15;
     batched.distances = [](const ApfPath&) { return std::vector<double>{}; };
     if(planApfPath(reference, lower, upper, batched, 0.02, &repeat) || !repeat.empty()) return 16;
-    const double originalLength = jointPathLength(path);
-    shortcutApfPath(&path, oracle);
-    if(path.front() != reference.front() || path.back() != reference.back() ||
-        jointPathLength(path) > originalLength + 1.0e-10) return 9;
-    for(std::size_t i = 1; i < path.size(); ++i)
-        if(!oracle.motionValid(path[i - 1], path[i])) return 10;
     // Smooth a noisy arc around the obstacle. Every accepted edge must still
     // clear the circle, even though its endpoint chord intersects the circle.
     ApfPath arc;
@@ -77,7 +80,93 @@ int main()
     oracle.distance = [](const ApfState&) { return std::numeric_limits<double>::quiet_NaN(); };
     if(planApfPath(reference, lower, upper, oracle, 0.02, &path)) return 7;
     oracle.distance = [](const ApfState&) { return 1.0; };
-    if(!planApfPath(reference, lower, upper, oracle, 0.02, &path) || path.size() != 2) return 8;
-    std::cout << "PASS APF: free path, obstacle, fixed anchors, deterministic escape, blocked corridor, invalid oracle, validated shortcut, time-aware smoothing\n";
+    if(!planApfPath(reference, lower, upper, oracle, 0.02, &path) || path != reference) return 8;
+    // Free-space returning strokes must retain every original station and turn.
+    const ApfPath zigzag{{-1,0},{1,0},{1,0.2},{-1,0.2},{-1,0.4},{1,0.4}};
+    if(!planApfPath(zigzag, lower, upper, oracle, 0.02, &path) || path != zigzag) return 17;
+    const ApfPath turns{{6.2,0},{6.4,0},{6.6,0}};
+    if(!planApfPath(turns, {5.0,-1.0}, {8.0,1.0}, oracle, 0.02, &path) || path != turns) return 18;
+    ApfGuidance guide;
+    guide.position = [](const ApfState& q) { return q; };
+    guide.maxDeviation = 0.05;
+    // Endpoints alone cannot certify a nonlinear FK segment.
+    ApfGuidance nonlinear = guide;
+    nonlinear.position = [](const auto& q) { return ApfState{q[0], 0.1 * std::sin(3.14159265358979323846 * q[0])}; };
+    if(followsApfGuide({0,0}, {1,0}, {0,0}, {1,0}, nonlinear)) return 19;
+    nonlinear.position = [](const auto&) { return ApfState{std::numeric_limits<double>::quiet_NaN(),0}; };
+    if(followsApfGuide({0,0}, {1,0}, {0,0}, {1,0}, nonlinear)) return 20;
+    ApfPath scan;
+    for(int i=0; i<=100; ++i) scan.push_back({-0.1+0.002*i, 0.0});
+    guide.positions = scan;
+    oracle.distance = [](const auto& q) { return std::hypot(q[0],q[1]) - 0.025; };
+    if(!planApfPath(scan, {-0.2,-0.2}, {0.2,0.2}, oracle, 0.005, &path, &guide) ||
+        path.size() != scan.size() || !followsApfPath(path, guide)) {
+        std::cerr << "Failed feasible 50 mm ordered detour\n"; return 21;
+    }
+    for(std::size_t i=1;i<path.size();++i) if(!oracle.motionValid(path[i-1],path[i])) return 22;
+    bool anticipates=false;
+    for(std::size_t i=1;i+1<path.size();++i)
+        if(scan[i][0]<-0.035 && std::abs(path[i][1])>0.003)anticipates=true;
+    if(!anticipates){std::cerr<<"Detour starts too close to contact\n";return 28;}
+    const auto shaped = path;
+    if(!planApfPath(scan, {-0.2,-0.2}, {0.2,0.2}, oracle, 0.005, &repeat, &guide) || shaped != repeat) return 23;
+    std::reverse(scan.begin(),scan.end()); guide.positions=scan;
+    if(!planApfPath(scan, {-0.2,-0.2}, {0.2,0.2}, oracle, 0.005, &repeat, &guide) ||
+        repeat.front()!=scan.front() || repeat.back()!=scan.back() || !followsApfPath(repeat,guide)) return 27;
+    std::reverse(scan.begin(),scan.end()); guide.positions=scan;
+    guide.maxDeviation = 0.015;
+    if(planApfPath(scan, {-0.2,-0.2}, {0.2,0.2}, oracle, 0.005, &path, &guide) || !path.empty()) return 24;
+    // Smoothing window keeps its absolute station correspondence, even on
+    // returning strokes. Wrong whole-path nearest-point association is forbidden.
+    ApfOracle shapeSmoothing = oracle;
+    shapeSmoothing.pathValid = [&](const auto& candidate, std::size_t begin) {
+        guide.maxDeviation = 0.05;
+        if(!followsApfPath(candidate, guide, begin)) return false;
+        for(std::size_t i=1;i<candidate.size();++i) if(!oracle.motionValid(candidate[i-1],candidate[i])) return false;
+        return true;
+    };
+    path = shaped; times.clear(); for(std::size_t i=0;i<path.size();++i) times.push_back(0.1*i);
+    smoothValidatedPath(&path, times, shapeSmoothing, 3, 0.5, 0.15);
+    if(!followsApfPath(path, guide)) return 25;
+    // Guided refinement can leave a noisy APF seed's tiny joint box, while
+    // preserving ordered stations, fixed anchors and every collision constraint.
+    path=shaped;const auto guidedBefore=path;
+    const double guidedBending=jointPathBending(path,times);
+    if(!smoothValidatedPath(&path,times,shapeSmoothing,3,1.0,0.00001,true) ||
+        jointPathBending(path,times)>=guidedBending || !followsApfPath(path,guide) ||
+        path.front()!=guidedBefore.front() || path.back()!=guidedBefore.back())return 30;
+    double movement=0;
+    for(std::size_t i=0;i<path.size();++i)for(std::size_t j=0;j<path[i].size();++j)
+        movement=std::max(movement,std::abs(path[i][j]-guidedBefore[i][j]));
+    if(movement<=0.00001)return 31;
+    const auto guidedPreserved=path;
+    auto rejectGuided=shapeSmoothing;
+    rejectGuided.pathValid=[](const auto&,std::size_t){return false;};
+    if(smoothValidatedPath(&path,times,rejectGuided,3,1.0,0.00001,true) || path!=guidedPreserved)return 32;
+    rejectGuided.pathValid={};
+    if(smoothValidatedPath(&path,times,rejectGuided,3,1.0,0.00001,true) || path!=guidedPreserved)return 33;
+    // A wrist transition has a large TCP arc in joint-linear interpolation.
+    // Correct its positional seed with actual FK, retaining endpoints and turns.
+    ApfGuidance wrist;
+    wrist.maxDeviation=0.05;
+    wrist.position=[](const auto& q){return ApfState{q[0]+0.2*std::sin(q[2]),q[1]+0.2*std::cos(q[2])};};
+    ApfPath wristReference;
+    for(int i=0;i<=50;++i) {
+        const double t=i/50.0;
+        wristReference.push_back({t,0,t*3.14159265358979323846});
+        wrist.positions.push_back({t,0.2-0.4*t});
+    }
+    ApfOracle wristOracle;
+    wristOracle.distance=[](const auto&){return 1.0;};
+    wristOracle.motionValid=[](const auto&,const auto&){return true;};
+    if(followsApfPath(wristReference,wrist) ||
+        !planApfPath(wristReference,{-1,-1,-1},{2,1,4},wristOracle,0.005,&path,&wrist) ||
+        path.front()!=wristReference.front() || path.back()!=wristReference.back() ||
+        !followsApfPath(path,wrist)){std::cerr<<"Nonlinear wrist seed projection failed\n";return 29;}
+    auto projected=ApfState{0.5,0.2,1.5};
+    if(!projectApfPosition(projected,{0.5,0},{-1,-1,-1},{2,1,4},wrist,0.04) ||
+        !followsApfGuide(projected,projected,{0.5,0},{0.5,0},wrist))return 34;
+    if(projectApfPosition(projected,{0.5,0},{1,-1,-1},{-1,1,4},wrist,0.04))return 35;
+    std::cout << "PASS APF: free path, obstacle, fixed anchors, deterministic escape, blocked corridor, invalid oracle, ordered zigzag, turn preservation, hard TCP corridor, nonlinear FK segment, time-aware smoothing\n";
     return 0;
 }
