@@ -124,3 +124,28 @@ if(BuildTests)
         LABELS "SMRobotMotionPlanning;ProjectMotionPlanning;Regression"
         WORKING_DIRECTORY $<TARGET_FILE_DIR:ProjectMotionPlanning-TrajectoryQualityTests>)
 endif()
+
+if(BuildTests)
+    add_executable(ProjectMotionPlanning-RapidExportTests RapidExportTests.cpp)
+    target_link_libraries(ProjectMotionPlanning-RapidExportTests PRIVATE ${PACKAGE_NAME}::ProjectMotionPlanning)
+    target_compile_features(ProjectMotionPlanning-RapidExportTests PRIVATE cxx_std_17)
+    set_target_properties(ProjectMotionPlanning-RapidExportTests PROPERTIES FOLDER "Regression/SMRobotMotionPlanning")
+    copy_runtime_dlls(ProjectMotionPlanning-RapidExportTests)
+    add_test(NAME ProjectMotionPlanningRapidExport COMMAND $<TARGET_FILE:ProjectMotionPlanning-RapidExportTests>
+        ${CMAKE_SOURCE_DIR}/config/projects/ABB4600-burnner.sys.json)
+    set_tests_properties(ProjectMotionPlanningRapidExport PROPERTIES
+        LABELS "SMRobotMotionPlanning;ProjectMotionPlanning;Regression"
+        ENVIRONMENT "SMROBOT_DATA_ROOT=${CMAKE_SOURCE_DIR}/data"
+        WORKING_DIRECTORY $<TARGET_FILE_DIR:ProjectMotionPlanning-RapidExportTests>)
+endif()
+
+if(BuildTests)
+    add_executable(ProjectMotionPlanning-ProcessPoseImportTests ProcessPoseImportTests.cpp)
+    target_link_libraries(ProjectMotionPlanning-ProcessPoseImportTests PRIVATE ${PACKAGE_NAME}::ProjectMotionPlanning)
+    target_compile_features(ProjectMotionPlanning-ProcessPoseImportTests PRIVATE cxx_std_17)
+    set_target_properties(ProjectMotionPlanning-ProcessPoseImportTests PROPERTIES FOLDER "Regression/SMRobotMotionPlanning")
+    copy_runtime_dlls(ProjectMotionPlanning-ProcessPoseImportTests)
+    add_test(NAME ProjectMotionPlanningProcessPoseImport COMMAND $<TARGET_FILE:ProjectMotionPlanning-ProcessPoseImportTests>)
+    set_tests_properties(ProjectMotionPlanningProcessPoseImport PROPERTIES
+        WORKING_DIRECTORY $<TARGET_FILE_DIR:ProjectMotionPlanning-ProcessPoseImportTests>)
+endif()

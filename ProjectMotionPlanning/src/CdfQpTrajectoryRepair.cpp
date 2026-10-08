@@ -872,8 +872,10 @@ namespace motion_planning
                         localGuide.positions.assign(guidance->positions.begin()+begin, guidance->positions.begin()+end+1);
                     }
                     detail::ApfPath replacement;
+                    // Use the configured clearance; the old 5 mm floor silently
+                    // overrode margins below it. APF influence radius is separate.
                     if(!detail::planApfPath(reference, lower, upper, oracle,
-                        std::max(0.005, options.safetyMargin + options.targetClearance), &replacement,
+                        std::max(0.0, options.safetyMargin + options.targetClearance), &replacement,
                         guidance ? &localGuide : nullptr)) continue;
                     if(replacement.size() != reference.size() ||
                         (guidance && !detail::followsApfPath(replacement, localGuide)) ||
@@ -1724,7 +1726,12 @@ namespace motion_planning
         request.start = seedTrajectory.points.front().q;
         request.goal = seedTrajectory.points.back().q;
         request.collisionDetectorIds = { detectorId };
-        request.validation.maxJointStep = std::min(options.validationMaxJointStep, 0.001);
+        // Every accepted APF, QP and smoothing segment must use the same
+        // resolution as the final gate. A coarser earlier check can miss thin
+        // contacts and leave shape restoration with an invalid fallback path.
+        request.validation.maxJointStep = std::min(options.validationMaxJointStep, 0.00025);
+        if(options.progress) options.progress("Collision validation step (all stages): "
+            + std::to_string(request.validation.maxJointStep) + " rad");
 
         std::string sceneError;
         std::unique_ptr<ProjectPlanningSceneSnapshot> scene =
@@ -2011,16 +2018,14 @@ namespace motion_planning
             // must not discard valid smoothing improvements elsewhere.
             const double horizon=std::min(options.distanceThreshold,
                 std::max(0.001,smoothingPhiFloor+options.safetyMargin+1e-5));
-            const auto samples = queries.distances(candidate, options.safetyMargin, horizon, result.statistics);
-            for(const auto& sample : samples)
-                if(!sample.valid || sample.phi < smoothingPhiFloor - 1.0e-9) return false;
+            if(!queries.clearanceValid(candidate, options.safetyMargin, horizon,
+                smoothingPhiFloor - 1.0e-9, result.statistics)) return false;
             return queries.pathValid(candidate, request.validation);
         };
         // Shape restoration uses the same detector/filters, at the final dense
         // resolution. A closest-reference objective is separate from joint bend.
         detail::ApfOracle shapeOracle=smoothingOracle;
-        auto shapeValidation=request.validation;
-        shapeValidation.maxJointStep=std::min(shapeValidation.maxJointStep,0.00025);
+        const auto& shapeValidation=request.validation;
         shapeOracle.distances=[&](const auto& states) {
             const auto observations=queries.distances(states,0.0,options.distanceThreshold,result.statistics);
             std::vector<double> values;for(const auto& v:observations)
@@ -2455,9 +2460,7 @@ namespace motion_planning
         if(options.progress) options.progress("Final full-path collision verification");
         result.statistics.invalidSegmentCount = 0;
         // Fresh final validation: bypass the cache and retain every original sample.
-        auto finalValidationOptions = request.validation;
-        finalValidationOptions.maxJointStep = std::min(finalValidationOptions.maxJointStep, 0.00025);
-        const auto finalValidation = queries.motions(path, finalValidationOptions, false);
+        const auto finalValidation = queries.motions(path, request.validation, false);
         for(std::size_t index = 0; index + 1 < path.size(); ++index) {
             const StateValidationResult& validation = finalValidation[index];
             if(!validation.valid) {

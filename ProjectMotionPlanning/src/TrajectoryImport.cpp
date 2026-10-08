@@ -608,11 +608,12 @@ namespace motion_planning
                     hasPendingTime = true;
                     continue;
                 }
-                if(values.size() < 4) {
+                if(values.size() != 4) {
                     matrixRow = 0;
                     matrix = Eigen::Matrix4d::Identity();
                     hasPendingTime = false;
-                    continue;
+                    trajectory.points.clear();
+                    return false;
                 }
                 for(int column = 0; column < 4; ++column) {
                     matrix(matrixRow, column) = values[static_cast<std::size_t>(column)];
@@ -630,6 +631,38 @@ namespace motion_planning
                 }
             }
 
+            if(matrixRow != 0) { trajectory.points.clear(); }
+            return !trajectory.points.empty();
+        }
+
+        // xyz(mm), qw qx qy qz, speed(mm/s), acceleration, time(s), type, standoff(mm).
+        // Do not let malformed process rows fall through into a joint/matrix reader.
+        bool parseProcessPoseRows(const std::vector<std::string>& lines,
+            const TrajectoryImportOptions& options, robottrajectory::CartesianTrajectory& trajectory,
+            std::string& error)
+        {
+            trajectory = robottrajectory::CartesianTrajectory();
+            const double scale = normalizedCartesianPositionScale(options);
+            for(std::size_t row = 0; row < lines.size(); ++row) {
+                if(isCommentOrEmpty(lines[row])) { continue; }
+                const auto tokens = splitTokens(lines[row]);
+                const auto values = numericValues(lines[row]);
+                const bool numeric = tokens.size() == 12 && allTokensNumeric(tokens);
+                const double norm = numeric ? Eigen::Vector4d(values[3], values[4], values[5], values[6]).norm() : 0.0;
+                if(!numeric || !std::isfinite(norm) || norm < 1.0e-12 ||
+                    values[7] < 0.0 || values[9] < 0.0 || values[10] < 0.0 ||
+                    std::floor(values[10]) != values[10] || values[11] < 0.0 ||
+                    (!trajectory.points.empty() && values[9] < trajectory.points.back().time)) {
+                    error = "Invalid 12-column Cartesian point at line " + std::to_string(row + 1) +
+                        ": expected xyz, nonzero quaternion [w,x,y,z], speed, acceleration, "
+                        "nondecreasing time, integer point type and standoff.";
+                    trajectory.points.clear();
+                    return false;
+                }
+                appendCartesianPoint(trajectory, values[9], makePoseFromPositionQuaternion(
+                    values[0], values[1], values[2], values[3], values[4], values[5], values[6]), scale);
+                trajectory.points.back().linearSpeed = values[7] * scale;
+            }
             return !trajectory.points.empty();
         }
 
@@ -648,17 +681,6 @@ namespace motion_planning
                     const double time = values[7] == 50.0
                         ? static_cast<double>(trajectory.points.size())
                         : values[7];
-                    appendCartesianPoint(
-                        trajectory,
-                        time,
-                        makePoseFromPositionQuaternion(
-                            values[0], values[1], values[2],
-                            values[3], values[4], values[5], values[6]),
-                        positionScale);
-                } else if(values.size() >= 12) {
-                    const double time = values[9] == 0.0
-                        ? static_cast<double>(trajectory.points.size())
-                        : values[9];
                     appendCartesianPoint(
                         trajectory,
                         time,
@@ -1192,6 +1214,19 @@ namespace motion_planning
 
         const bool selectedJointShape =
             matchesSelectedJointShape(firstNumericRowColumnCount(lines), options);
+        const auto firstRow = std::find_if(lines.begin(), lines.end(),
+            [](const std::string& line) { return !isCommentOrEmpty(line); });
+        if(!selectedJointShape && firstRow != lines.end() && splitTokens(*firstRow).size() == 12) {
+            if(!parseProcessPoseRows(lines, options, cartesianTrajectory, errorMessage)) {
+                return failure("process_pose_parse_failed", errorMessage);
+            }
+            auto result = importCartesianFile(path, options, std::move(cartesianTrajectory));
+            addWarning(result, "process_pose_columns",
+                "Imported xyz (mm), quaternion [w,x,y,z], speed (mm/s) and time (s). "
+                "Acceleration, point type and spray standoff columns are recognized but are not "
+                "execution settings in the Basic Planning Cartesian trajectory.");
+            return result;
+        }
         if(!selectedJointShape && parseCartesianText(lines, options, cartesianTrajectory)) {
             return importCartesianFile(path, options, std::move(cartesianTrajectory));
         }

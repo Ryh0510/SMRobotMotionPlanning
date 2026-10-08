@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
-#include <future>
 #include <sstream>
 #include <thread>
 
@@ -55,29 +54,79 @@ namespace motion_planning::detail
         }
     }
 
+    CdfQueryBatch::~CdfQueryBatch()
+    {
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_stopping = true;
+        }
+        m_jobReady.notify_all();
+        for(auto& thread : m_threads) { thread.join(); }
+    }
+
+    void CdfQueryBatch::runBatch(std::size_t worker)
+    {
+        try {
+            for(std::size_t i = m_next.fetch_add(1); i < m_count; i = m_next.fetch_add(1)) {
+                m_work(worker, i);
+            }
+        } catch(...) {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if(!m_error) { m_error = std::current_exception(); }
+        }
+    }
+
+    void CdfQueryBatch::workerLoop(std::size_t worker)
+    {
+        std::size_t seenGeneration = 0;
+        std::unique_lock<std::mutex> lock(m_mutex);
+        for(;;) {
+            m_jobReady.wait(lock, [&]() { return m_stopping || m_generation != seenGeneration; });
+            if(m_stopping) { return; }
+            seenGeneration = m_generation;
+            const bool active = worker < m_activeWorkers;
+            lock.unlock();
+            if(active) { runBatch(worker); }
+            lock.lock();
+            if(--m_remaining == 0) { m_jobDone.notify_one(); }
+        }
+    }
+
     void CdfQueryBatch::parallelFor(std::size_t count,
         const std::function<void(std::size_t, std::size_t)>& work)
     {
         if(count == 0) { return; }
         const std::size_t workers = std::min(m_scenes.size(), std::max<std::size_t>(1, count / 2));
-        // Mesh query cost varies strongly with pose. Claim work dynamically so
-        // one difficult contiguous chunk cannot leave the other scenes idle.
-        std::atomic<std::size_t> next{0};
-        const auto run = [&](std::size_t worker) {
-            for(std::size_t i = next.fetch_add(1); i < count; i = next.fetch_add(1)) {
-                work(worker, i);
-            }
-        };
-        // Futures join before returning (also on exceptions); callers never race an
-        // APF update against a background query. Small batches stay serial.
-        std::vector<std::future<void>> futures;
-        futures.reserve(workers - 1);
-        for(std::size_t worker = 1; worker < workers; ++worker) {
-            try { futures.push_back(std::async(std::launch::async, run, worker)); }
-            catch(const std::system_error&) { run(worker); }
+        if(workers == 1) {
+            for(std::size_t i = 0; i < count; ++i) { work(0, i); }
+            return;
         }
-        run(0);
-        for(auto& future : futures) { future.get(); }
+        // Start once, on the first parallel batch. Subsequent short APF/smoothing
+        // windows do not create and destroy OS threads thousands of times.
+        if(!m_poolStarted) {
+            m_threads.reserve(m_scenes.size() - 1);
+            m_poolStarted = true;
+            for(std::size_t worker = 1; worker < m_scenes.size(); ++worker) {
+                try { m_threads.emplace_back([this, worker]() { workerLoop(worker); }); }
+                catch(const std::system_error&) { break; }
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_work = work;
+            m_count = count;
+            m_next.store(0);
+            m_activeWorkers = std::min(workers, m_threads.size() + 1);
+            m_remaining = m_threads.size();
+            m_error = nullptr;
+            ++m_generation;
+        }
+        m_jobReady.notify_all();
+        runBatch(0);
+        std::unique_lock<std::mutex> lock(m_mutex);
+        m_jobDone.wait(lock, [&]() { return m_remaining == 0; });
+        m_work = {};
+        if(m_error) { std::rethrow_exception(m_error); }
     }
 
     void CdfQueryBatch::rememberDistance(const std::vector<double>& key, const SignedDistanceSample& sample)
@@ -110,6 +159,39 @@ namespace motion_planning::detail
         for(auto i : missing) { rememberDistance(distanceKey(path[i], margin, horizon), values[i]); }
         for(const auto& counter : counters) { statistics.collisionQueries += counter.collisionQueries; }
         m_distanceSeconds += secondsSince(started); return values;
+    }
+
+    bool CdfQueryBatch::clearanceValid(const std::vector<std::vector<double>>& path,
+        double margin, double horizon, double minimumPhi, ProjectCdfQpRepairStatistics& statistics)
+    {
+        // A smoothing window is accepted only if EVERY sample passes. Once a
+        // sample rejects it, the remaining distances cannot change that decision.
+        // Keep distances() for callers that need all values/minima and final QA.
+        const auto started = Clock::now();
+        std::vector<SignedDistanceSample> values(path.size());
+        std::vector<std::size_t> missing;
+        for(std::size_t i = 0; i < path.size(); ++i) {
+            const auto found = m_distances.find(distanceKey(path[i], margin, horizon));
+            if(m_cacheEnabled && found != m_distances.end()) {
+                ++m_distanceHits;
+                if(!found->second.valid || found->second.phi < minimumPhi) {
+                    m_distanceSeconds += secondsSince(started);
+                    return false;
+                }
+            } else { missing.push_back(i); }
+        }
+        std::atomic<bool> accepted{true};
+        std::vector<ProjectCdfQpRepairStatistics> counters(m_scenes.size());
+        parallelFor(missing.size(), [&](std::size_t worker, std::size_t offset) {
+            if(!accepted.load()) { return; }
+            const auto i = missing[offset];
+            values[i] = evaluateSignedPhi(*m_scenes[worker], path[i], margin, horizon, counters[worker]);
+            if(!values[i].valid || values[i].phi < minimumPhi) { accepted.store(false); }
+        });
+        for(auto i : missing) { rememberDistance(distanceKey(path[i], margin, horizon), values[i]); }
+        for(const auto& counter : counters) { statistics.collisionQueries += counter.collisionQueries; }
+        m_distanceSeconds += secondsSince(started);
+        return accepted.load();
     }
 
     std::vector<CdfLinearization> CdfQueryBatch::linearizations(const std::vector<std::vector<double>>& path,

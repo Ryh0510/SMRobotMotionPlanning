@@ -801,6 +801,38 @@ namespace
             }
             auto invalid = path; invalid[5][0] = std::numeric_limits<double>::quiet_NaN();
             if(parallel.pathValid(invalid, verificationRequest.validation)) return fail("Invalid state passed batch validation.");
+            for(double threshold : {a.front().phi - 1.0e-6, a.front().phi, a.front().phi + 1.0e-6}) {
+                bool expected = true;
+                for(const auto& sample : a) { expected &= sample.valid && !(sample.phi < threshold); }
+                if(parallel.clearanceValid(path, repairOptions.safetyMargin, repairOptions.distanceThreshold,
+                    threshold, bStats) != expected || serial.clearanceValid(path, repairOptions.safetyMargin,
+                        repairOptions.distanceThreshold, threshold, aStats) != expected)
+                    return fail("Early distance rejection differs from all-sample predicate.");
+            }
+            if(parallel.clearanceValid(invalid, repairOptions.safetyMargin, repairOptions.distanceThreshold,
+                -1.0e100, bStats)) return fail("Invalid state passed early clearance validation.");
+            if(!parallel.clearanceValid(path, repairOptions.safetyMargin, repairOptions.distanceThreshold,
+                -1.0e100, bStats)) return fail("Rejected batch contaminated subsequent acceptance.");
+            // Repeated short batches exercise thread reuse, serial/parallel size
+            // changes, failed-window early exit and synchronous result visibility.
+            CdfQueryBatch persistent(*parallelScene, document, projectBase, verificationRequest, 4, false);
+            for(int round = 0; round < 24; ++round) {
+                const std::size_t count = static_cast<std::size_t>(round % 12);
+                std::vector<std::vector<double>> shortPath(count, path.front());
+                const auto actual = persistent.distances(shortPath, repairOptions.safetyMargin,
+                    repairOptions.distanceThreshold, bStats);
+                for(std::size_t i = 0; i < count; ++i) {
+                    if(actual[i].valid != a.front().valid || actual[i].phi != a.front().phi ||
+                        actual[i].inCollision != a.front().inCollision) return fail("Reused query worker changed a result.");
+                }
+                if(count > 4 && round % 2 == 0) { shortPath[3][0] = std::numeric_limits<double>::quiet_NaN(); }
+                bool expected = true;
+                for(const auto& edge : serial.motions(shortPath, verificationRequest.validation, false)) {
+                    expected &= edge.valid;
+                }
+                if(persistent.pathValid(shortPath, verificationRequest.validation) != expected)
+                    return fail("Reused worker failed window barrier/early-exit check.");
+            }
             std::cout << "Serial/parallel/exact-cache query equivalence passed; max gradient error=" << gradientError
                       << "; " << parallel.summary() << std::endl;
             return 0;
