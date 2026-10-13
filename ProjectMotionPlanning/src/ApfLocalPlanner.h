@@ -33,6 +33,7 @@ namespace motion_planning::detail
         std::function<ApfState(const ApfState&)> position;
         ApfPath positions;
         double maxDeviation = 0.10;
+        std::function<bool(const ApfState&, const ApfState&)> stateAdmissible;
     };
 
     // Validates correspondence along the whole joint-linear segment, not just

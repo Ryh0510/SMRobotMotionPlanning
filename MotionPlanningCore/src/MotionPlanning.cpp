@@ -346,6 +346,34 @@ namespace motion_planning
         return result;
     }
 
+    bool MotionPlanningProjectStore::removePlan(
+        simulation_project::ProjectDocument& document,
+        const std::string& planId, std::string* errorMessage)
+    {
+        auto* extension = findExtension(document);
+        try {
+            if(extension && !planId.empty()) {
+                Json payload = Json::parse(extension->serializedPayload);
+                if(payload.contains("plans") && payload["plans"].is_array()) {
+                    auto& plans = payload["plans"];
+                    const auto before = plans.size();
+                    plans.erase(std::remove_if(plans.begin(), plans.end(), [&](const Json& plan) {
+                        return plan.value("id", std::string()) == planId;
+                    }), plans.end());
+                    if(plans.size() != before) {
+                        extension->serializedPayload = payload.dump();
+                        return true;
+                    }
+                }
+            }
+        } catch(const std::exception& error) {
+            if(errorMessage) { *errorMessage = error.what(); }
+            return false;
+        }
+        if(errorMessage) { *errorMessage = "Motion plan not found: " + planId; }
+        return false;
+    }
+
     bool MotionPlanningProjectStore::upsertPlan(
         simulation_project::ProjectDocument& document,
         const StoredMotionPlan& plan,

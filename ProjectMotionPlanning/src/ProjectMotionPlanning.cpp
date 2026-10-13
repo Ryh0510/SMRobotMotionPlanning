@@ -286,6 +286,60 @@ namespace motion_planning
         return m_impl->detectorIds;
     }
 
+    PlanningSceneDistanceSample ProjectPlanningSceneSnapshot::nearestDistance(
+        const std::vector<double>& jointValues)
+    {
+        PlanningSceneDistanceSample sample;
+        if(!setState(jointValues, &sample.message)) { return sample; }
+        double minimum = std::numeric_limits<double>::infinity();
+        bool failed = false;
+        for(const auto& id : collisionDetectorIds()) {
+            auto& runtime = collisionRuntime();
+            const auto& detectors = runtime.detectors();
+            const auto detector = std::find_if(detectors.begin(), detectors.end(),
+                [&](const auto& value) { return value.id == id; });
+            auto fail = [&](const std::string& message) {
+                failed = true;
+                sample.message += id + ": " + message + "; ";
+            };
+            if(detector == detectors.end() || !detector->valid || !detector->enabled) {
+                fail("detector unavailable");
+                continue;
+            }
+            const auto checked = runtime.checkDetector(id);
+            const auto* result = runtime.resultOf(id);
+            if(!checked.success || !result) { fail("collision query failed"); continue; }
+            double distance = 0.0;
+            if(result->inCollision()) {
+                sample.inCollision = true;
+            } else {
+                auto options = detector->options;
+                options.enableDistance = true;
+                options.enableNearestPoints = true;
+                options.distanceThreshold = std::numeric_limits<double>::max();
+                collision::CollisionResult nearest;
+                auto& scene = const_cast<collision::CollisionScene&>(runtime.scene());
+                scene.distance(options, nearest);
+                distance = nearest.minDistance;
+                if(nearest.status != collision::CollisionStatus::Success ||
+                    !std::isfinite(distance) || distance < 0.0 ||
+                    distance >= std::numeric_limits<double>::max() * 0.25) {
+                    fail("no valid nearest distance / empty pair set");
+                    continue;
+                }
+            }
+            if(distance < minimum) { minimum = distance; sample.detectorId = id; }
+        }
+        sample.valid = !failed && std::isfinite(minimum);
+        if(sample.valid) {
+            sample.distanceMeters = minimum;
+            sample.message = sample.inCollision ? "collision" : "ok";
+        } else if(sample.message.empty()) {
+            sample.message = "No collision detector with a valid distance.";
+        }
+        return sample;
+    }
+
     bool ProjectPlanningSceneSnapshot::setState(
         const std::vector<double>& jointValues,
         std::string* errorMessage)

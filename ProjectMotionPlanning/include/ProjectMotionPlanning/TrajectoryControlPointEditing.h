@@ -17,6 +17,14 @@ enum class CartesianControlPointInsertLocation
 class ProjectTrajectoryControlPointEditor
 {
 public:
+    // World-frame rotation about the origin: fixed X, then Y, then Z; translation last.
+    static bool transformCartesianTrajectory(StoredMotionPlan& plan,
+        const Eigen::Vector3d& translationMm, const Eigen::Vector3d& rotationDegrees,
+        std::string* errorMessage = nullptr);
+    // Four matrix rows (translation in mm), timestamp in seconds, blank separator.
+    static bool serializeCartesianMatrices(const StoredMotionPlan& plan,
+        std::string& text, std::string* errorMessage = nullptr);
+
     static bool makeInsertedCartesianControlPoint(
         const StoredMotionPlan& plan,
         std::size_t pointIndex,

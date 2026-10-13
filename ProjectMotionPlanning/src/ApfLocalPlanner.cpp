@@ -114,6 +114,7 @@ namespace motion_planning::detail
             for(std::size_t j = 0; j < target.size(); ++j) target[j] += t * (guideTo[j] - guideFrom[j]);
             const auto p = guidance.position(q);
             if(!finite(p, target.size()) || norm(difference(p, target)) > guidance.maxDeviation + 1e-9) return false;
+            if(guidance.stateAdmissible && !guidance.stateAdmissible(q, target)) return false;
         }
         return true;
     }

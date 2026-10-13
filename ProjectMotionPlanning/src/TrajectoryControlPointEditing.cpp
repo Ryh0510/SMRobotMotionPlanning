@@ -3,6 +3,9 @@
 #include <algorithm>
 #include <cmath>
 #include <vector>
+#include <sstream>
+#include <iomanip>
+#include <locale>
 
 namespace motion_planning
 {
@@ -164,6 +167,63 @@ bool ProjectTrajectoryControlPointEditor::removeCartesianControlPoint(
 
     points.erase(points.begin() + static_cast<std::ptrdiff_t>(pointIndex));
     invalidateSolvedJointTrajectory(plan);
+    return true;
+}
+
+bool ProjectTrajectoryControlPointEditor::transformCartesianTrajectory(StoredMotionPlan& plan,
+    const Eigen::Vector3d& translationMm, const Eigen::Vector3d& rotationDegrees,
+    std::string* errorMessage)
+{
+    if(plan.cartesianControlPoints.empty() || !translationMm.allFinite() || !rotationDegrees.allFinite()) {
+        setError(errorMessage, "A nonempty Cartesian trajectory and finite transform are required.");
+        return false;
+    }
+    const Eigen::Vector3d radians = rotationDegrees * (3.14159265358979323846 / 180.0);
+    Eigen::Isometry3d transform = Eigen::Isometry3d::Identity();
+    transform.linear() = (Eigen::AngleAxisd(radians.z(), Eigen::Vector3d::UnitZ()) *
+        Eigen::AngleAxisd(radians.y(), Eigen::Vector3d::UnitY()) *
+        Eigen::AngleAxisd(radians.x(), Eigen::Vector3d::UnitX())).toRotationMatrix();
+    transform.translation() = translationMm * 0.001;
+    auto points = plan.cartesianControlPoints.points;
+    for(auto& point : points) {
+        point.tcpPose = transform * point.tcpPose;
+        if(!point.tcpPose.matrix().allFinite()) {
+            setError(errorMessage, "Trajectory contains a nonfinite pose.");
+            return false;
+        }
+    }
+    plan.cartesianControlPoints.points = std::move(points);
+    invalidateSolvedJointTrajectory(plan);
+    return true;
+}
+
+bool ProjectTrajectoryControlPointEditor::serializeCartesianMatrices(const StoredMotionPlan& plan,
+    std::string& text, std::string* errorMessage)
+{
+    if(plan.cartesianControlPoints.empty()) {
+        setError(errorMessage, "The selected trajectory has no Cartesian control points.");
+        return false;
+    }
+    std::ostringstream output;
+    output.imbue(std::locale::classic());
+    output << std::scientific << std::setprecision(16);
+    for(const auto& point : plan.cartesianControlPoints.points) {
+        if(!std::isfinite(point.time) || !point.tcpPose.matrix().allFinite()) {
+            setError(errorMessage, "Cannot export a nonfinite pose or timestamp.");
+            return false;
+        }
+        Eigen::Matrix4d matrix = point.tcpPose.matrix();
+        matrix.block<3, 1>(0, 3) *= 1000.0;
+        for(int row = 0; row < 4; ++row) {
+            for(int col = 0; col < 4; ++col) {
+                if(col) output << ' ';
+                output << matrix(row, col);
+            }
+            output << '\n';
+        }
+        output << point.time << "\n\n";
+    }
+    text = output.str();
     return true;
 }
 

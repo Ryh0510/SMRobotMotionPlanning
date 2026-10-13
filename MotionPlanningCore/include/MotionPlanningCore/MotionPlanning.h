@@ -185,6 +185,10 @@ namespace motion_planning
         static const char* extensionKey();
         static std::vector<StoredMotionPlan> plans(
             const simulation_project::ProjectDocument& document);
+        static bool removePlan(
+            simulation_project::ProjectDocument& document,
+            const std::string& planId,
+            std::string* errorMessage = nullptr);
         static bool upsertPlan(
             simulation_project::ProjectDocument& document,
             const StoredMotionPlan& plan,

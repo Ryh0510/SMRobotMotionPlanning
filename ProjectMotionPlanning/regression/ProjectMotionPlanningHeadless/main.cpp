@@ -45,6 +45,7 @@ namespace
         bool cdfInspect = false;
         bool cdfGradientCheck = false;
         bool cdfQueryCheck = false;
+        bool nearestDistanceCheck = false;
         bool cdfGuiDefaults = false;
         double verificationStep = 0.005;
         int cdfIterations = 1;
@@ -92,6 +93,8 @@ namespace
             }
             else if (argument == "--cdf-gui-defaults")
                 options.cdfGuiDefaults = true;
+            else if (argument == "--nearest-distance-check")
+                options.nearestDistanceCheck = true;
             else if (argument == "--cdf-query-check")
                 options.cdfQueryCheck = true;
             else if (argument == "--cdf-gradient-check")
@@ -714,6 +717,26 @@ namespace
         auto verificationScene = motion_planning::ProjectPlanningSceneBuilder::build(
             document, projectBase, verificationRequest, &errorMessage);
         if(!verificationScene) return fail(errorMessage);
+        if(options.nearestDistanceCheck) {
+            int collisions = 0;
+            for(const auto& point : seedTrajectory.points) {
+                const auto expected = verificationScene->validateState(point.q);
+                const auto sample = verificationScene->nearestDistance(point.q);
+                if(!sample.valid || sample.inCollision != (expected.diagnosticCode == "state_in_collision") ||
+                    (sample.inCollision && sample.distanceMeters != 0.0) ||
+                    (!sample.inCollision && sample.distanceMeters < 0.0)) return fail("Nearest distance disagrees with collision query: " + sample.message);
+                std::cout << "Nearest distance: time=" << point.time << " meters=" << sample.distanceMeters
+                    << " collision=" << sample.inCollision << " detector=" << sample.detectorId << std::endl;
+                collisions += sample.inCollision ? 1 : 0;
+            }
+            auto invalid = seedTrajectory.points.front().q;
+            invalid.front() = std::numeric_limits<double>::quiet_NaN();
+            const auto bad = verificationScene->nearestDistance(invalid);
+            if(bad.valid || !std::isnan(bad.distanceMeters)) return fail("Invalid state must be NaN, never zero distance.");
+            if(verificationScene->nearestDistance({}).valid) return fail("Reject wrong joint count.");
+            std::cout << "Nearest distance tests passed; points=" << seedTrajectory.points.size() << "; collisions=" << collisions << std::endl;
+            return 0;
+        }
         auto linearMotionValid = [&](const auto& a, const auto& b) {
             double maximumDelta = 0.0;
             for(std::size_t j = 0; j < a.size(); ++j) maximumDelta = std::max(maximumDelta, std::abs(b[j] - a[j]));
@@ -721,7 +744,15 @@ namespace
             for(std::size_t i = 0; i <= steps; ++i) {
                 auto q = a;
                 for(std::size_t j = 0; j < q.size(); ++j) q[j] += (b[j] - a[j]) * static_cast<double>(i) / steps;
-                if(!verificationScene->validateState(q).valid) return false;
+                const auto validation = verificationScene->validateState(q);
+                if(!validation.valid) {
+                    if(options.cdfInspect) {
+                        std::cout << "Invalid raw-linear sample " << i << "/" << steps
+                            << "; code=" << validation.diagnosticCode << "; " << validation.message
+                            << "; runtime radians=" << vectorText(q) << std::endl;
+                    }
+                    return false;
+                }
             }
             return true;
         };
@@ -730,7 +761,15 @@ namespace
             if(!(options.linearInput
                 ? linearMotionValid(seedTrajectory.points[i].q, seedTrajectory.points[i + 1].q)
                 : verificationScene->validateMotion(seedTrajectory.points[i].q,
-                    seedTrajectory.points[i + 1].q, verificationRequest.validation).valid)) ++initialInvalidSegments;
+                    seedTrajectory.points[i + 1].q, verificationRequest.validation).valid)) {
+                ++initialInvalidSegments;
+                if(options.cdfInspect) {
+                    std::cout << "Invalid original segment (1-based): " << i + 1
+                        << " -> " << i + 2 << "; time=" << std::setprecision(15)
+                        << seedTrajectory.points[i].time << " -> " << seedTrajectory.points[i + 1].time
+                        << std::endl;
+                }
+            }
         std::cout << "input points: " << seedTrajectory.points.size()
                   << "; invalid original segments: " << initialInvalidSegments
                   << "; start valid: " << verificationScene->validateState(seedTrajectory.points.front().q).valid

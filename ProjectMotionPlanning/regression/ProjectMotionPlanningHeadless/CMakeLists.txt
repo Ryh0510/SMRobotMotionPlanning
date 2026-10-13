@@ -140,6 +140,18 @@ if(BuildTests)
 endif()
 
 if(BuildTests)
+    add_executable(ProjectMotionPlanning-FanucExportTests FanucExportTests.cpp)
+    target_link_libraries(ProjectMotionPlanning-FanucExportTests PRIVATE ${PACKAGE_NAME}::ProjectMotionPlanning)
+    target_compile_features(ProjectMotionPlanning-FanucExportTests PRIVATE cxx_std_17)
+    set_target_properties(ProjectMotionPlanning-FanucExportTests PROPERTIES FOLDER "Regression/SMRobotMotionPlanning")
+    copy_runtime_dlls(ProjectMotionPlanning-FanucExportTests)
+    add_test(NAME ProjectMotionPlanningFanucExport COMMAND $<TARGET_FILE:ProjectMotionPlanning-FanucExportTests>)
+    set_tests_properties(ProjectMotionPlanningFanucExport PROPERTIES
+        LABELS "SMRobotMotionPlanning;ProjectMotionPlanning;Regression"
+        WORKING_DIRECTORY $<TARGET_FILE_DIR:ProjectMotionPlanning-FanucExportTests>)
+endif()
+
+if(BuildTests)
     add_executable(ProjectMotionPlanning-ProcessPoseImportTests ProcessPoseImportTests.cpp)
     target_link_libraries(ProjectMotionPlanning-ProcessPoseImportTests PRIVATE ${PACKAGE_NAME}::ProjectMotionPlanning)
     target_compile_features(ProjectMotionPlanning-ProcessPoseImportTests PRIVATE cxx_std_17)

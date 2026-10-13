@@ -57,6 +57,9 @@ namespace motion_planning
         double fallbackMaxAcceleration = 2.0943951023931953;
         // Actual world TCP snapshot; consumes runtime joint signs, worker-thread only.
         TrajectoryForwardKinematics worldForwardKinematics;
+        // Optional process constraint, evaluated with ordered reference TCP positions.
+        // Empty preserves the existing position-only planning behavior.
+        std::function<bool(const std::vector<double>&, const Eigen::Vector3d&)> tcpStateAdmissible;
         // Optimization knots are independent of the fine collision sampling.
         double optimizationMaxJointStep = 0.04;
         double validationMaxJointStep = 0.02;

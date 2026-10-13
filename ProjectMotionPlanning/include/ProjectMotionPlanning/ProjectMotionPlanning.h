@@ -8,6 +8,7 @@
 
 #include <filesystem>
 #include <memory>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -30,6 +31,15 @@ namespace motion_planning
         TrajectoryPostProcessOptions postProcess;
     };
 
+    struct PlanningSceneDistanceSample
+    {
+        bool valid = false;
+        bool inCollision = false;
+        double distanceMeters = std::numeric_limits<double>::quiet_NaN();
+        std::string detectorId;
+        std::string message;
+    };
+
     class ProjectPlanningSceneSnapshot final : public IPlanningScene
     {
     public:
@@ -50,6 +60,10 @@ namespace motion_planning
         const std::vector<std::string>& jointNames() const;
         const std::vector<JointBound>& jointBounds() const;
         const std::vector<std::string>& collisionDetectorIds() const;
+
+        // Nonnegative geometric separation; collision is zero, not penetration depth.
+        // Uses the snapshot's detector filters, without changing detector options.
+        PlanningSceneDistanceSample nearestDistance(const std::vector<double>& jointValues);
 
         bool setState(const std::vector<double>& jointValues, std::string* errorMessage = nullptr);
         Eigen::Isometry3d linkWorldTransform(const std::string& linkName) const;

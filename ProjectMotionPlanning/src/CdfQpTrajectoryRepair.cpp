@@ -1828,6 +1828,13 @@ namespace motion_planning
         path = unwrapContinuousPath(path, scene->jointBounds());
         detail::ApfGuidance tcpGuide;
         const bool constrainTcp = options.apfMaxTcpDeviation > 0.0;
+        if(options.tcpStateAdmissible && (!constrainTcp || !options.worldForwardKinematics)) {
+            addDiagnostic(&result.diagnostics, "tcp_constraint_invalid", "TCP process constraint requires actual FK and an enabled ordered TCP guide.");
+            return result;
+        }
+        if(options.tcpStateAdmissible) tcpGuide.stateAdmissible = [&](const auto& q, const auto& reference) {
+            return reference.size() == 3 && options.tcpStateAdmissible(q, Eigen::Vector3d(reference[0], reference[1], reference[2]));
+        };
         if(options.worldForwardKinematics) {
             tcpGuide.position = [&](const auto& q) -> detail::ApfState {
                 const auto pose = options.worldForwardKinematics(q);
@@ -1954,7 +1961,7 @@ namespace motion_planning
                 "TCP corridor " + std::to_string(options.apfMaxTcpDeviation * 1000.0)
                 + " mm relative to the ordered original control-point polyline; input shape violations="
                 + std::to_string(shapeInvalidSegments) + ", input motion collisions=" + std::to_string(initialInvalidSegments)
-                + ". Position only; no orientation constraint.");
+                + (options.tcpStateAdmissible ? ". TCP process admissibility is enforced along the ordered path." : ". Position only; no orientation constraint."));
         }
         captureStage(usedEquivalentSeed ? "Continuous IK seed (dense reference)" : "Input (dense reference)", path, result.statistics.initialMinimumPhi, initialInvalidSegments);
         if(initialInvalidSegments != 0 || !followsReference(path)) {

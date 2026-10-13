@@ -12,6 +12,18 @@ using namespace motion_planning::detail;
 
 int main()
 {
+    // Equal TCP positions can hide a reversed tool normal. The process gate
+    // must inspect intermediate joint states, rather than just safe endpoints.
+    ApfGuidance processGuide;
+    processGuide.maxDeviation=0.01;
+    processGuide.position=[](const auto& q){return ApfState{q[0],0,0};};
+    const ApfState processFrom{0,-1},processTo{1,1},guideFrom{0,0,0},guideTo{1,0,0};
+    if(!followsApfGuide(processFrom,processTo,guideFrom,guideTo,processGuide))return 42;
+    processGuide.stateAdmissible=[](const auto& q,const auto&){return q[1]*q[1]>.25;};
+    if(followsApfGuide(processFrom,processTo,guideFrom,guideTo,processGuide))return 43;
+    if(!followsApfGuide(processFrom,processFrom,guideFrom,guideFrom,processGuide))return 44;
+    processGuide.positions={guideFrom,guideTo};
+    if(followsApfPath({processFrom,processTo},processGuide))return 45;
     motion_planning::ProjectCdfQpTrajectoryRepairService service;
     simulation_project::ProjectDocument document;
     robottrajectory::JointTrajectory dummy;

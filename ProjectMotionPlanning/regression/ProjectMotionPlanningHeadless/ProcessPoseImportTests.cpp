@@ -1,4 +1,6 @@
 #include <ProjectMotionPlanning/TrajectoryImport.h>
+#include <ProjectMotionPlanning/TrajectoryControlPointEditing.h>
+#include <limits>
 #include <SimulationProject/ProjectDocument.h>
 
 #include <cmath>
@@ -14,12 +16,61 @@ namespace
         if(!ok) { throw std::runtime_error(message); }
     }
 
+    void verifyTransform(motion_planning::StoredMotionPlan plan,
+        const motion_planning::TrajectoryImportOptions& options)
+    {
+        using Editor = motion_planning::ProjectTrajectoryControlPointEditor;
+        const auto original = plan.cartesianControlPoints.points;
+        require(!original.empty(), "Transform fixture must have Cartesian points");
+        plan.trajectory.points.push_back(robottrajectory::TimedJointPoint{});
+        std::string error, text;
+        require(Editor::transformCartesianTrajectory(plan, {100, -200, 300}, {90, 90, 0}, &error), error);
+        require(plan.trajectory.empty(), "Rigid transform must invalidate old IK");
+        for(std::size_t i = 0; i < original.size(); ++i) {
+            const auto& a = original[i];
+            const auto& b = plan.cartesianControlPoints.points[i];
+            const auto& p = a.tcpPose.translation();
+            // Rx(90) then Ry(90) maps (x,y,z) to (y,-z,-x).
+            require((b.tcpPose.translation() - Eigen::Vector3d(p.y()+.1, -p.z()-.2, -p.x()+.3)).norm() < 1e-10,
+                "World origin, fixed axis order and millimeter conversion");
+            require(a.time == b.time && a.linearSpeed == b.linearSpeed && a.angularSpeed == b.angularSpeed,
+                "Transform retains timestamp and available process speeds");
+            require((original[0].tcpPose.inverse() * a.tcpPose).matrix().isApprox(
+                (plan.cartesianControlPoints.points[0].tcpPose.inverse() * b.tcpPose).matrix(), 1e-10),
+                "The entire path has a single rigid transform, including orientations");
+        }
+        require(Editor::serializeCartesianMatrices(plan, text, &error), error);
+        const auto path = std::filesystem::current_path() / "transformed_matrix_roundtrip.txt";
+        { std::ofstream out(path); out << text; }
+        const auto imported = motion_planning::ProjectTrajectoryImporter::importFile(path, options);
+        require(imported.success && imported.plan.cartesianControlPoints.points.size() == original.size(), "Matrix export round trip");
+        for(std::size_t i = 0; i < original.size(); ++i) {
+            require(imported.plan.cartesianControlPoints.points[i].tcpPose.matrix().isApprox(
+                plan.cartesianControlPoints.points[i].tcpPose.matrix(), 1e-10), "Export retains full transformed pose");
+            require(std::abs(imported.plan.cartesianControlPoints.points[i].time - original[i].time) < 1e-12, "Export retains timestamps");
+        }
+        std::filesystem::remove(path);
+        const auto before = plan.cartesianControlPoints.points[0].tcpPose.matrix().eval();
+        require(!Editor::transformCartesianTrajectory(plan, {0, 0, 0}, {0, 0, std::numeric_limits<double>::quiet_NaN()}, &error),
+            "Reject invalid transform");
+        require(before == plan.cartesianControlPoints.points[0].tcpPose.matrix(), "Invalid input cannot partially modify trajectory");
+        simulation_project::ProjectDocument document;
+        require(motion_planning::MotionPlanningProjectStore::upsertPlan(document, plan, &error), error);
+        auto other = plan; other.id += "_other";
+        require(motion_planning::MotionPlanningProjectStore::upsertPlan(document, other, &error), error);
+        require(motion_planning::MotionPlanningProjectStore::removePlan(document, plan.id, &error), error);
+        const auto retained = motion_planning::MotionPlanningProjectStore::plans(document);
+        require(retained.size() == 1 && retained[0].id == other.id, "Delete only selected trajectory");
+        require(!motion_planning::MotionPlanningProjectStore::removePlan(document, plan.id), "Missing delete fails");
+    }
+
     void verifyRows(const std::filesystem::path& path, const motion_planning::TrajectoryImportOptions& options)
     {
         const auto result = motion_planning::ProjectTrajectoryImporter::importFile(path, options);
         require(result.success, result.message());
         require(result.dataKind == motion_planning::TrajectoryImportDataKind::CartesianControlPoints &&
             result.plan.trajectory.empty(), "Process rows must not become matrices or joint angles");
+        verifyTransform(result.plan, options);
         std::ifstream file(path);
         std::string line;
         std::size_t index = 0;
@@ -83,6 +134,15 @@ int main(int argc, char** argv)
         require(result.success && result.plan.cartesianControlPoints.points.size() == 1 &&
             (result.plan.cartesianControlPoints.points[0].tcpPose.translation() - Eigen::Vector3d(.1,.2,.3)).norm() < 1e-12,
             "Retain raw 4x4 matrix support");
+        const std::string matrix = "1 0 0 100\n0 1 0 200\n0 0 1 300\n0 0 0 1\n";
+        for(const auto& layout : {matrix + "1.25\n\n" + matrix + "4.75\n", "1.25\n" + matrix + "4.75\n" + matrix}) {
+            write(layout);
+            result = motion_planning::ProjectTrajectoryImporter::importFile(path, options);
+            require(result.success && result.plan.cartesianControlPoints.points.size() == 2 &&
+                result.plan.cartesianControlPoints.points[0].time == 1.25 && result.plan.cartesianControlPoints.points[1].time == 4.75,
+                "Support postfix and prefix matrix timestamps without shifting points");
+            verifyTransform(result.plan, options);
+        }
         write("100 200 300 1 0 0 0 0\n100 200 300 1 0 0 0 0.2\n");
         result = motion_planning::ProjectTrajectoryImporter::importFile(path, options);
         require(result.success && result.plan.cartesianControlPoints.points.size() == 2, "Retain 8-column poses");
@@ -98,6 +158,12 @@ int main(int argc, char** argv)
         std::filesystem::remove(path);
         options.jointNames.resize(6);
         if(argc > 1) { verifyRows(std::filesystem::u8path(argv[1]), options); }
+        if(argc > 2) {
+            const auto matrix = motion_planning::ProjectTrajectoryImporter::importFile(std::filesystem::u8path(argv[2]), options);
+            require(matrix.success, matrix.message());
+            verifyTransform(matrix.plan, options);
+            std::cout << "Matrix transform verified for " << matrix.plan.cartesianControlPoints.points.size() << " poses.\n";
+        }
         std::cout << "Process pose import and legacy format regressions passed.\n";
         return 0;
     } catch(const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }

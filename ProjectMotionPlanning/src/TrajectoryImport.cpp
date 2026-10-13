@@ -592,6 +592,7 @@ namespace motion_planning
             int matrixRow = 0;
             double currentTime = 0.0;
             bool hasPendingTime = false;
+            bool layoutKnown = false, timeBeforeMatrix = false, lastMatrixHasTime = false;
             Eigen::Matrix4d matrix = Eigen::Matrix4d::Identity();
             const double positionScale = normalizedCartesianPositionScale(options);
 
@@ -603,9 +604,24 @@ namespace motion_planning
                 if(values.empty()) {
                     continue;
                 }
+                if(!layoutKnown) {
+                    timeBeforeMatrix = values.size() == 1;
+                    layoutKnown = true;
+                }
                 if(values.size() == 1 && matrixRow == 0) {
-                    currentTime = values.front();
-                    hasPendingTime = true;
+                    if(!std::isfinite(values.front()) || values.front() < 0.0 ||
+                        (timeBeforeMatrix ? hasPendingTime : (trajectory.points.empty() || lastMatrixHasTime))) {
+                        trajectory.points.clear();
+                        return false;
+                    }
+                    if(timeBeforeMatrix) {
+                        currentTime = values.front();
+                        hasPendingTime = true;
+                    } else {
+                        // 11111.txt stores each timestamp AFTER its four matrix rows.
+                        trajectory.points.back().time = values.front();
+                        lastMatrixHasTime = true;
+                    }
                     continue;
                 }
                 if(values.size() != 4) {
@@ -625,13 +641,14 @@ namespace motion_planning
                         : static_cast<double>(trajectory.points.size()) *
                             std::max(1.0e-6, options.defaultTimeStep);
                     appendCartesianPoint(trajectory, pointTime, makePose(matrix), positionScale);
+                    lastMatrixHasTime = false;
                     matrixRow = 0;
                     matrix = Eigen::Matrix4d::Identity();
                     hasPendingTime = false;
                 }
             }
 
-            if(matrixRow != 0) { trajectory.points.clear(); }
+            if(matrixRow != 0 || hasPendingTime) { trajectory.points.clear(); }
             return !trajectory.points.empty();
         }
 
