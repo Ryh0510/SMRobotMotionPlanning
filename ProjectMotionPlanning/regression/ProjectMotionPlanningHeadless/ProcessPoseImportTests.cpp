@@ -64,6 +64,59 @@ namespace
         require(!motion_planning::MotionPlanningProjectStore::removePlan(document, plan.id), "Missing delete fails");
     }
 
+    void verifyLocalRotations()
+    {
+        using Editor = motion_planning::ProjectTrajectoryControlPointEditor;
+        using Axis = motion_planning::CartesianLocalRotationAxis;
+        motion_planning::StoredMotionPlan source;
+        source.id = "local_rotation";
+        for(int i = 0; i < 3; ++i) {
+            robottrajectory::TimedCartesianPoint point;
+            point.time = .25 * i;
+            point.linearSpeed = .4 + .1 * i;
+            point.angularSpeed = .05 * i;
+            point.tcpPose.translation() = Eigen::Vector3d(1 + .1 * i, -.2, .6);
+            point.tcpPose.linear() = (Eigen::AngleAxisd(.4 + .1 * i, Eigen::Vector3d::UnitZ()) *
+                Eigen::AngleAxisd(.7, Eigen::Vector3d::UnitY()) * Eigen::AngleAxisd(-.2, Eigen::Vector3d::UnitX())).toRotationMatrix();
+            source.cartesianControlPoints.points.push_back(point);
+        }
+        source.trajectory.points.push_back(robottrajectory::TimedJointPoint{});
+        std::string error;
+        for(int axis = 0; axis < 3; ++axis) for(double degrees : {90.0, -90.0, 450.0}) {
+            auto result = source;
+            require(Editor::rotateCartesianTrajectoryLocalAxis(result, static_cast<Axis>(axis), degrees, &error), error);
+            require(result.trajectory.empty(), "Local rotation invalidates stale IK");
+            for(std::size_t i = 0; i < source.cartesianControlPoints.points.size(); ++i) {
+                const auto& a = source.cartesianControlPoints.points[i];
+                const auto& b = result.cartesianControlPoints.points[i];
+                const Eigen::Vector3d worldAxis = a.tcpPose.linear().col(axis);
+                // Independent geometric construction: rotate in world about the original local axis.
+                const Eigen::Matrix3d expected = Eigen::AngleAxisd(degrees * 3.14159265358979323846 / 180.0,
+                    worldAxis).toRotationMatrix() * a.tcpPose.linear();
+                require(b.tcpPose.linear().isApprox(expected, 1e-12), "Rotation must use each point's own axis");
+                require(b.tcpPose.translation() == a.tcpPose.translation(), "Local rotation preserves positions exactly");
+                require(b.tcpPose.linear().col(axis).isApprox(worldAxis, 1e-12), "Selected local axis stays fixed");
+                require(b.time == a.time && b.linearSpeed == a.linearSpeed && b.angularSpeed == a.angularSpeed,
+                    "Local rotation preserves timestamps and stored process speeds");
+            }
+            require(Editor::rotateCartesianTrajectoryLocalAxis(result, static_cast<Axis>(axis), -degrees, &error), error);
+            for(std::size_t i = 0; i < source.cartesianControlPoints.points.size(); ++i) {
+                require(result.cartesianControlPoints.points[i].tcpPose.matrix().isApprox(
+                    source.cartesianControlPoints.points[i].tcpPose.matrix(), 1e-12), "Inverse local rotation restores every pose");
+            }
+        }
+        auto invalid = source;
+        require(!Editor::rotateCartesianTrajectoryLocalAxis(invalid, Axis::Z, std::numeric_limits<double>::infinity(), &error),
+            "Reject nonfinite local angle");
+        require(!Editor::rotateCartesianTrajectoryLocalAxis(invalid, static_cast<Axis>(9), 90, &error), "Reject invalid axis");
+        invalid.cartesianControlPoints.points.back().tcpPose.linear()(0,0) = std::numeric_limits<double>::quiet_NaN();
+        const auto first = invalid.cartesianControlPoints.points.front().tcpPose.matrix().eval();
+        require(!Editor::rotateCartesianTrajectoryLocalAxis(invalid, Axis::X, 90, &error), "Reject late invalid pose");
+        require(invalid.cartesianControlPoints.points.front().tcpPose.matrix() == first && !invalid.trajectory.empty(),
+            "Failed local rotation leaves earlier poses and previous IK untouched");
+        std::cout << "Local XYZ rotations verified: position/axis invariants, signs, turns, metadata and atomic failure.\n";
+    }
+
     void verifyRows(const std::filesystem::path& path, const motion_planning::TrajectoryImportOptions& options)
     {
         const auto result = motion_planning::ProjectTrajectoryImporter::importFile(path, options);
@@ -110,6 +163,7 @@ namespace
 int main(int argc, char** argv)
 {
     try {
+        verifyLocalRotations();
         motion_planning::TrajectoryImportOptions options;
         options.robotId = "ABB4600_urdf";
         options.jointNames = {"Joint1", "Joint2", "Joint3", "Joint4", "Joint5", "Joint6"};

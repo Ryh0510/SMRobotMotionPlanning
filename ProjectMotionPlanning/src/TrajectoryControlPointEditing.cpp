@@ -197,6 +197,36 @@ bool ProjectTrajectoryControlPointEditor::transformCartesianTrajectory(StoredMot
     return true;
 }
 
+bool ProjectTrajectoryControlPointEditor::rotateCartesianTrajectoryLocalAxis(StoredMotionPlan& plan,
+    CartesianLocalRotationAxis axis, double angleDegrees, std::string* errorMessage)
+{
+    if(plan.cartesianControlPoints.empty() || !std::isfinite(angleDegrees)) {
+        setError(errorMessage, "A nonempty Cartesian trajectory and a finite rotation angle are required.");
+        return false;
+    }
+    Eigen::Vector3d direction;
+    switch(axis) {
+    case CartesianLocalRotationAxis::X: direction = Eigen::Vector3d::UnitX(); break;
+    case CartesianLocalRotationAxis::Y: direction = Eigen::Vector3d::UnitY(); break;
+    case CartesianLocalRotationAxis::Z: direction = Eigen::Vector3d::UnitZ(); break;
+    default: setError(errorMessage, "The local rotation axis must be X, Y or Z."); return false;
+    }
+    const Eigen::Matrix3d rotation = Eigen::AngleAxisd(
+        std::remainder(angleDegrees, 360.0) * (3.14159265358979323846 / 180.0), direction).toRotationMatrix();
+    auto points = plan.cartesianControlPoints.points;
+    for(auto& point : points) {
+        if(!point.tcpPose.matrix().allFinite()) {
+            setError(errorMessage, "Trajectory contains a nonfinite pose.");
+            return false;
+        }
+        // Right multiplication uses the point's own frame, not the world frame.
+        point.tcpPose.linear() = (point.tcpPose.linear() * rotation).eval();
+    }
+    plan.cartesianControlPoints.points = std::move(points);
+    invalidateSolvedJointTrajectory(plan);
+    return true;
+}
+
 bool ProjectTrajectoryControlPointEditor::serializeCartesianMatrices(const StoredMotionPlan& plan,
     std::string& text, std::string* errorMessage)
 {

@@ -14,12 +14,23 @@ enum class CartesianControlPointInsertLocation
     After
 };
 
+enum class CartesianLocalRotationAxis
+{
+    X,
+    Y,
+    Z
+};
+
 class ProjectTrajectoryControlPointEditor
 {
 public:
     // World-frame rotation about the origin: fixed X, then Y, then Z; translation last.
     static bool transformCartesianTrajectory(StoredMotionPlan& plan,
         const Eigen::Vector3d& translationMm, const Eigen::Vector3d& rotationDegrees,
+        std::string* errorMessage = nullptr);
+    // Each pose rotates about its own axis; positions and process metadata stay fixed.
+    static bool rotateCartesianTrajectoryLocalAxis(StoredMotionPlan& plan,
+        CartesianLocalRotationAxis axis, double angleDegrees,
         std::string* errorMessage = nullptr);
     // Four matrix rows (translation in mm), timestamp in seconds, blank separator.
     static bool serializeCartesianMatrices(const StoredMotionPlan& plan,
