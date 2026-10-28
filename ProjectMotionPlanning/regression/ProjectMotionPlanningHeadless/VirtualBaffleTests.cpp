@@ -9,6 +9,7 @@
 #include <random>
 #include <chrono>
 #include <iomanip>
+#include <limits>
 
 namespace {
 using V3=Eigen::Vector3d;
@@ -83,6 +84,24 @@ int main(){try{
     const auto display=b.displayTriangles(.3);require(!display.empty(),"display geometry");
     for(const auto& t:display){const V3 p=(t[0]+t[1]+t[2])/3;
         require(!(std::abs(p.x())<.09999&&std::abs(p.y())<.04999),"display preserves aperture");}
+    // Symmetric circular rims remain valid under correspondence selection.
+    ModelTrajPlan::ModelData circle;
+    constexpr int count=64;
+    auto& mesh=circle.mainModelData_;
+    for(int layer=0;layer<2;++layer)for(int i=0;i<count;++i){
+        const double angle=2*std::acos(-1.)*i/count;
+        mesh.m_vertices.insert(mesh.m_vertices.end(),{float(.1*std::cos(angle)),float(.1*std::sin(angle)),layer?.02f:-.02f});
+    }
+    for(unsigned i=0;i<count;++i){const unsigned j=(i+1)%count;
+        mesh.m_indices.insert(mesh.m_indices.end(),{i,j,j+count,i,j+count,i+count});}
+    const auto symmetric=ModelTrajPlan::buildVirtualBaffle(circle);
+    require(symmetric.enabled,symmetric.diagnostic.c_str());
+    require(std::abs(symmetric.normal.z())>.999 && symmetric.center.norm()<1e-6,"symmetric-rim plane remains valid");
+    VirtualBaffle aperture;aperture.enabled=true;aperture.contours={{{-1,-1},{1,-1},{1,1},{-1,1}}};
+    require(!aperture.apertureContains({1,0}) && !aperture.apertureContains({-1,0}),"aperture boundary contact is forbidden on both sides");
+    require(aperture.apertureContains({0,0}),"boundary rule preserves the aperture interior");
+    const double nan=std::numeric_limits<double>::quiet_NaN();
+    require(aperture.intersectsTriangle({V3(nan,0,0),V3::Zero(),V3::UnitX()}),"invalid collision input stays rejected");
     environmentRegression();
     std::cout<<"Virtual baffle geometry and collision checks passed\n";return 0;
 }catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}
