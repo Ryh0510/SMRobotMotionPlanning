@@ -9,6 +9,7 @@
 #include <array>
 #include <cmath>
 #include <memory>
+#include <map>
 #include <limits>
 #include <sstream>
 #include <utility>
@@ -234,7 +235,10 @@ namespace motion_planning
                     attempt.success = true; return attempt;
                 }
                 Eigen::Matrix<double, 6, 6> jacobian;
-                for(std::size_t column = 0; column < kIrb4600JointCount; ++column) {
+                if(options.worldJacobian) {
+                    jacobian=options.worldJacobian(attempt.joints);
+                    if(!jacobian.allFinite())return attempt;
+                } else for(std::size_t column = 0; column < kIrb4600JointCount; ++column) {
                     auto perturbed = attempt.joints;
                     perturbed[column] += probe;
                     const Eigen::Matrix4d pose = options.worldForwardKinematics(perturbed).matrix();
@@ -725,10 +729,68 @@ namespace motion_planning
             if(!std::isfinite(point.time) || !rigidTarget(point.tcpPose.matrix(), desired)) {
                 layer.message = "Invalid target pose/time.";
             } else {
-                std::vector<std::vector<double>> seeds = previousRoots;
-                if(solver.seedJoints.size() == 6 && std::all_of(solver.seedJoints.begin(), solver.seedJoints.end(),
+                bool reused = index < options.cachedCandidates.size() && !options.cachedCandidates[index].empty() &&
+                    options.cachedCandidates[index].size() <= 4096;
+                if(reused) {
+                    for(const auto& q : options.cachedCandidates[index]) {
+                        if(q.size()!=6) { reused=false; break; }
+                        for(std::size_t j=0;j<6;++j)
+                            if(!std::isfinite(q[j]) || q[j]<options.lower[j] || q[j]>options.upper[j]) reused=false;
+                        if(!reused) break;
+                        const auto error=rigidPoseError(solver.worldForwardKinematics(q).matrix().eval(),desired);
+                        if(!error.allFinite() || error.head<3>().norm()>options.positionTolerance ||
+                            error.tail<3>().norm()>options.orientationTolerance) { reused=false; break; }
+                        CartesianIkCandidate c; c.joints=q; c.positionError=error.head<3>().norm(); c.orientationError=error.tail<3>().norm();
+                        for(double angle:q) c.turns.push_back(static_cast<int>(std::floor((angle+kPi)/(2*kPi))));
+                        if(options.classifyConfiguration) c.configuration=options.classifyConfiguration(q);
+                        layer.candidates.push_back(std::move(c));
+                    }
+                }
+                if(reused) {
+                    previousRoots.clear();
+                    for(const auto& c:layer.candidates) {
+                        auto root=c.joints; for(auto& angle:root) angle=normalizeAngle(angle);
+                        previousRoots.push_back(std::move(root));
+                    }
+                    layer.message="Reused kinematic candidates; actual FK checked; collision validation pending.";
+                } else {
+                layer.candidates.clear();
+                bool continued = false;
+                std::vector<std::vector<double>> seeds;
+                // A failed preferred continuation is also the explicit fallback
+                // seed. Reuse that exact numerical attempt instead of solving it twice.
+                std::map<std::vector<double>,IkAttempt> attempts;
+                const auto solveSeed=[&](const std::vector<double>& seed){const auto found=attempts.find(seed);if(found!=attempts.end())return found->second;
+                    auto attempt=solveModelPose(desired,seed,solver,&options);attempts.emplace(seed,attempt);return attempt;};
+                if(index < options.preferredJoints.size() && options.preferredJoints[index].size()==6) {
+                    const auto& preferred=options.preferredJoints[index];
+                    bool valid=true;
+                    for(std::size_t j=0;j<6;++j)
+                        valid &= std::isfinite(preferred[j]) && preferred[j]>=options.lower[j] && preferred[j]<=options.upper[j];
+                    if(valid) {
+                        const auto local=solveSeed(preferred);
+                        if(local.success) {
+                            auto q=local.joints;
+                            bool within=true;
+                            for(std::size_t j=0;j<6;++j) {
+                                q[j]=preferred[j]+std::remainder(q[j]-preferred[j],2*kPi);
+                                within &= q[j]>=options.lower[j] && q[j]<=options.upper[j];
+                            }
+                            const auto error=rigidPoseError(solver.worldForwardKinematics(q).matrix().eval(),desired);
+                            if(within && error.allFinite() && error.head<3>().norm()<=options.positionTolerance &&
+                                error.tail<3>().norm()<=options.orientationTolerance) {
+                                CartesianIkCandidate c; c.joints=q; c.positionError=error.head<3>().norm(); c.orientationError=error.tail<3>().norm();
+                                for(double angle:q)c.turns.push_back(static_cast<int>(std::floor((angle+kPi)/(2*kPi))));
+                                if(options.classifyConfiguration)c.configuration=options.classifyConfiguration(q);
+                                layer.candidates.push_back(std::move(c));continued=true;
+                            }
+                        }
+                    }
+                }
+                if(!continued) seeds=previousRoots;
+                if(!continued && solver.seedJoints.size() == 6 && std::all_of(solver.seedJoints.begin(), solver.seedJoints.end(),
                     [](double value) { return std::isfinite(value); })) { seeds.push_back(solver.seedJoints); }
-                for(int n = 1; n <= options.seedCount; ++n) {
+                for(int n = 1; !continued && n <= options.seedCount; ++n) {
                     std::vector<double> seed(6);
                     for(int j = 0; j < 6; ++j) { seed[j] = -kPi + 2 * kPi * radicalInverse(n, primes[j]); }
                     seeds.push_back(std::move(seed));
@@ -736,7 +798,7 @@ namespace motion_planning
                 std::vector<std::vector<double>> roots;
                 for(const auto& seed : seeds) {
                     if(cancelled()) { result.cancelled = true; break; }
-                    const auto attempt = solveModelPose(desired, seed, solver, &options);
+                    const auto attempt = solveSeed(seed);
                     if(!attempt.success) { continue; }
                     auto root = attempt.joints;
                     for(auto& q : root) { q = normalizeAngle(q); }
@@ -778,20 +840,22 @@ namespace motion_planning
                     expand(0);
                     if(layer.truncated) { break; }
                 }
-                previousRoots = std::move(roots);
+                if(!continued) previousRoots = std::move(roots);
                 std::sort(layer.candidates.begin(), layer.candidates.end(), [](const auto& a, const auto& b) {
                     const int aid = a.configuration.stableId(), bid = b.configuration.stableId();
                     if(aid != bid) { return (aid == 0 ? 9 : aid) < (bid == 0 ? 9 : bid); }
                     if(aid != 0 && a.turns != b.turns) { return a.turns < b.turns; }
                     return a.joints < b.joints;
                 });
-                layer.message = layer.candidates.empty() ? "No valid root found within search budget/range." :
+                layer.message = continued ? "Continued previous joint solution; collision validation pending." : layer.candidates.empty() ? "No valid root found within search budget/range." :
                     (layer.truncated ? "Candidate budget reached; partial enumeration." : "Numerical candidates; completeness not guaranteed.");
+                }
             }
             if(result.cancelled || cancelled()) { result.cancelled = true; break; }
             if(!layer.candidates.empty()) { ++solved; }
             if(layer.truncated) { ++truncated; }
             total += layer.candidates.size();
+            if(options.layerReady) options.layerReady(layer);
             result.layers.push_back(std::move(layer));
             if(options.progress) { options.progress(index + 1, plan.cartesianControlPoints.points.size()); }
         }

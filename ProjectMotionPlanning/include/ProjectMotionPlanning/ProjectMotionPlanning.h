@@ -40,6 +40,12 @@ namespace motion_planning
         std::string message;
     };
 
+    struct PlanningSceneQueryCounts
+    {
+        std::size_t stateValidationRequests=0, collisionDetectorChecks=0, baffleChecks=0;
+        std::size_t nearestDistanceRequests=0, distanceDetectorQueries=0;
+    };
+
     class ProjectPlanningSceneSnapshot final : public IPlanningScene
     {
     public:
@@ -56,6 +62,10 @@ namespace motion_planning
             const std::vector<double>& to,
             const MotionValidationOptions& options) override;
 
+        void useConservativeMotionValidation(const collision::MotionQueryRequest& request,
+            const std::vector<std::string>& collisionFreeLinks);
+        void useSampledMotionValidation();
+
         const std::string& robotId() const;
         const std::vector<std::string>& jointNames() const;
         const std::vector<JointBound>& jointBounds() const;
@@ -69,6 +79,12 @@ namespace motion_planning
         Eigen::Isometry3d linkWorldTransform(const std::string& linkName) const;
         Eigen::Isometry3d attachmentWorldTransform(const std::string& attachmentId) const;
 
+        std::string virtualBaffleStatus() const;
+        bool validateVirtualBaffles(double clearance, std::string& reason) const;
+        double virtualBaffleSearchViolation(double clearance) const;
+        std::vector<double> virtualBaffleSearchViolations(const std::vector<std::vector<double>>&,double clearance,bool gpu);
+        std::string virtualBaffleSearchStatus() const;
+        PlanningSceneQueryCounts queryCounts() const;
         simulation_runtime::ProjectSimulationRuntime& simulationRuntime();
         const simulation_runtime::ProjectSimulationRuntime& simulationRuntime() const;
         simulation_runtime::ProjectCollisionRuntime& collisionRuntime();

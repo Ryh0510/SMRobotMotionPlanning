@@ -3,6 +3,7 @@
 #include "CdfDistanceField.h"
 
 #include <functional>
+#include <limits>
 #include <atomic>
 #include <condition_variable>
 #include <exception>
@@ -20,7 +21,7 @@ namespace motion_planning::detail
         CdfQueryBatch(ProjectPlanningSceneSnapshot& primary,
             const simulation_project::ProjectDocument& document,
             const std::filesystem::path& base, const ProjectPlanningRequest& request,
-            int requestedWorkers, bool cacheEnabled = true);
+            int requestedWorkers, bool cacheEnabled = true, std::function<bool()> cancelled = {});
         ~CdfQueryBatch();
 
         std::vector<SignedDistanceSample> distances(const std::vector<std::vector<double>>& path,
@@ -32,6 +33,12 @@ namespace motion_planning::detail
         std::vector<StateValidationResult> motions(const std::vector<std::vector<double>>& path,
             const MotionValidationOptions& options, bool useCache = true);
         bool pathValid(const std::vector<std::vector<double>>& path, const MotionValidationOptions& options);
+        // Exact independent state queries; every worker owns its mutable scene.
+        struct StateCheck {StateValidationResult validation; double penetration=std::numeric_limits<double>::quiet_NaN();};
+        std::vector<StateCheck> states(const std::vector<std::vector<double>>& values, double clearance);
+        // Callback must be pure kinematic work, with no mutable runtime/caller state.
+        void kinematics(std::size_t count, const std::function<void(std::size_t)>& work);
+        PlanningSceneQueryCounts additionalQueryCounts() const;
         std::string summary() const;
         std::size_t workerCount() const { return m_scenes.size(); }
 
@@ -46,6 +53,7 @@ namespace motion_planning::detail
         std::unordered_map<std::vector<double>, SignedDistanceSample, StateHash> m_distances;
         std::unordered_map<std::vector<double>, StateValidationResult, StateHash> m_motions;
         bool m_cacheEnabled = true;
+        std::function<bool()> m_cancelled;
         std::size_t m_distanceHits = 0, m_motionHits = 0;
         double m_distanceSeconds = 0, m_gradientSeconds = 0, m_motionSeconds = 0;
         // Each thread has exclusive access to the same private scene for the

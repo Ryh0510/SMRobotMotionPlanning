@@ -13,6 +13,10 @@ namespace motion_planning::detail
     // forbidden; a non-finite distance is an oracle failure, not free space.
     struct ApfOracle
     {
+        double stepSize = .02;
+        double influenceDistance = .08;
+        double repulsionGain = 2.5;
+        int iterationBudget = 1200;
         std::function<double(const ApfState&)> distance;
         // Optional equivalent distance observations in input order (e.g. finite differences).
         std::function<std::vector<double>(const ApfPath&)> distances;
@@ -34,6 +38,7 @@ namespace motion_planning::detail
         ApfPath positions;
         double maxDeviation = 0.10;
         std::function<bool(const ApfState&, const ApfState&)> stateAdmissible;
+        std::function<bool(ApfState&, std::size_t)> projectStation;
     };
 
     // Validates correspondence along the whole joint-linear segment, not just
@@ -47,7 +52,7 @@ namespace motion_planning::detail
     // A finite proposal only; the caller must validate the full motion afterwards.
     bool projectApfPosition(ApfState& q, const ApfState& target,
         const ApfState& lower, const ApfState& upper, const ApfGuidance& guidance,
-        double radius, int iterations = 12);
+        double radius, int iterations = 12, std::size_t station = 0);
 
     bool planApfPath(const ApfPath& reference, const ApfState& lower,
         const ApfState& upper, const ApfOracle& oracle, double clearance,

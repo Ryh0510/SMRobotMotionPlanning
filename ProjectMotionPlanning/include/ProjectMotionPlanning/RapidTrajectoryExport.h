@@ -38,5 +38,9 @@ namespace motion_planning
             const std::filesystem::path& basePath,
             const StoredMotionPlan& storedPlan,
             const RapidTrajectoryExportOptions& options);
+
+        // Direct world Cartesian poses in meters, without IK/FK or tool compensation.
+        // Shares the CDF template: MainModule, MoveL/v50/z10/tool0/wobj0.
+        static RapidTrajectoryExportResult generateCartesian(const StoredMotionPlan& plan);
     };
 }

@@ -56,6 +56,13 @@ namespace motion_planning
             return fail("Invalid fixed start candidate.");
         }
         auto weights = options.jointWeights;
+        if(!std::isfinite(options.maxJointDelta) || options.maxJointDelta < 0 ||
+            (!options.maxJointVelocities.empty() &&
+                (options.maxJointVelocities.size() != dimension ||
+                 !std::all_of(options.maxJointVelocities.begin(), options.maxJointVelocities.end(),
+                    [](double v) { return std::isfinite(v) && v > 0; })))) {
+            return fail("Invalid hard joint jump or velocity limits.");
+        }
         if(weights.empty()) { weights.assign(dimension, 1.0); }
         if(weights.size() != dimension || !std::all_of(weights.begin(), weights.end(),
             [](double w) { return std::isfinite(w) && w >= 0.0; })) {
@@ -89,9 +96,23 @@ namespace motion_planning
             previousPathCount = std::min(options.maxPaths, entries);
         }
         std::vector<Layer> prefixes(count);
+        std::vector<std::vector<bool>> allowed(count);
+        std::vector<std::vector<double>> nodeCosts(count);
+        for(std::size_t i = 0; i < count; ++i) {
+            if(!options.maxJointVelocities.empty() && i > 0 && ik.layers[i].time <= ik.layers[i-1].time) {
+                return fail("Velocity validation requires strictly increasing times.");
+            }
+            for(const auto& candidate : ik.layers[i].candidates) {
+                if(cancelled()) { return cancel(); }
+                allowed[i].push_back(!options.nodeAdmissible || options.nodeAdmissible(i, candidate));
+                const double nodeCost=allowed[i].back() && options.nodeCost?options.nodeCost(i,candidate):0.;
+                if(!std::isfinite(nodeCost) || nodeCost<0)return fail("Node costs must be finite and nonnegative.");
+                nodeCosts[i].push_back(nodeCost);
+            }
+        }
         prefixes[0].resize(ik.layers[0].candidates.size());
         for(std::size_t j = 0; j < prefixes[0].size(); ++j) {
-            if(!fixedStart || j == *fixedStart) { prefixes[0][j].push_back({}); }
+            if(allowed[0][j] && (!fixedStart || j == *fixedStart)) { Prefix p;p.cost=nodeCosts[0][j];prefixes[0][j].push_back(p); }
         }
         if(options.progress) { options.progress(1, count); }
         for(std::size_t i = 1; i < count; ++i) {
@@ -100,6 +121,7 @@ namespace motion_planning
             current.resize(ik.layers[i].candidates.size());
             for(std::size_t k = 0; k < current.size(); ++k) {
                 if(cancelled()) { return cancel(); }
+                if(!allowed[i][k]) { continue; }
                 std::vector<double> edges(previous.size());
                 Heap heap;
                 // Each predecessor provides a sorted list shifted by one edge cost.
@@ -109,7 +131,18 @@ namespace motion_planning
                     if(previous[j].empty()) { continue; }
                     const auto& from = ik.layers[i - 1].candidates[j].joints;
                     const auto& to = ik.layers[i].candidates[k].joints;
-                    double cost = 0.0;
+                    bool admissible = true;
+                    for(std::size_t r = 0; r < dimension; ++r) {
+                        const double delta = std::abs(to[r] - from[r]);
+                        if((options.maxJointDelta > 0 && delta > options.maxJointDelta) ||
+                            (!options.maxJointVelocities.empty() && delta >
+                             options.maxJointVelocities[r] * (ik.layers[i].time - ik.layers[i-1].time))) {
+                            admissible = false; break;
+                        }
+                    }
+                    if(!admissible || (options.edgeAdmissible && !options.edgeAdmissible(i - 1,
+                        ik.layers[i-1].candidates[j], ik.layers[i].candidates[k]))) { continue; }
+                    double cost = nodeCosts[i][k];
                     for(std::size_t r = 0; r < dimension; ++r) {
                         if(weights[r] == 0.0) { continue; }
                         const double delta = to[r] - from[r];
@@ -157,10 +190,11 @@ namespace motion_planning
             const auto next = entry.rank + 1;
             if(next < last[entry.node].size()) { finals.push({last[entry.node][next].cost, entry.node, next}); }
         }
+        if(result.paths.empty()) { return fail("No connected path satisfies the supplied constraints; this does not prove global infeasibility."); }
         result.success = true;
         std::ostringstream message;
         message << "Top-" << result.paths.size() << " / requested " << options.maxPaths << ", " << count
-            << " layers. Complete adjacent-layer connectivity; no collision checks or dynamic limits.";
+            << " layers. Ranked over supplied candidates and enabled node/edge constraints.";
         if(std::any_of(ik.layers.begin(), ik.layers.end(), [](const auto& layer) { return layer.truncated; })) {
             message << " Input IK enumeration was truncated.";
         }
@@ -214,7 +248,7 @@ namespace motion_planning
         result.success = true;
         result.message = "Top-" + std::to_string(options.maxPaths) + " per start, " +
             std::to_string(starts) + " starts, " + std::to_string(result.paths.size()) +
-            " complete paths. No collision checks or dynamic limits.";
+            " complete paths satisfying enabled node/edge constraints.";
         if(std::any_of(ik.layers.begin(), ik.layers.end(), [](const auto& layer) { return layer.truncated; })) {
             result.message += " Input IK enumeration was truncated.";
         }

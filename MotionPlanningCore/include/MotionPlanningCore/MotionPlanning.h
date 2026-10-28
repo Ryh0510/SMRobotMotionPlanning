@@ -3,6 +3,7 @@
 #include <RobotTrajectoryCore/RobotTrajectory.h>
 
 #include <atomic>
+#include <functional>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -91,6 +92,11 @@ namespace motion_planning
     struct MotionValidationOptions
     {
         double maxJointStep = 0.05;
+        // Default retains legacy shortest-arc planner behavior. Stored unwrapped
+        // trajectories must opt in so full revolutions are actually checked.
+        bool preserveJointTurns = false;
+        std::size_t maxSamples = 1000000;
+        std::function<bool()> cancelled;
     };
 
     struct TrajectoryPostProcessOptions
@@ -177,6 +183,9 @@ namespace motion_planning
         std::vector<std::string> jointNames;
         robottrajectory::JointTrajectory trajectory;
         robottrajectory::CartesianTrajectory cartesianControlPoints;
+        // Optional producer-owned process metadata. Kept opaque here to avoid
+        // coupling the planning core to a particular spray/workbench package.
+        std::string processMetadata;
     };
 
     class MotionPlanningProjectStore

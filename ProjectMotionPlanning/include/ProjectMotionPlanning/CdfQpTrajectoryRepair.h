@@ -17,9 +17,21 @@ namespace motion_planning
 {
     struct ProjectCdfQpRepairOptions
     {
+        // Explicit external workflow: APF stops before QP; CDF rejects unsafe input.
+        enum class Stage { Combined, ApfOnly, CdfOnly };
+        Stage stage = Stage::Combined;
+        bool densifyKnots = true;
+        double apfStepSize = .02;
+        double apfInfluenceDistance = .08;
+        double apfRepulsionGain = 2.5;
+        int apfIterationBudget = 1200;
         std::string detectorId = "cdf_abb4600_burnner_detector";
-        std::string obstacleId = "burnner";
-        std::string obstacleName = "burnner";
+        // Explicit generic mode uses existing selected detectors unchanged.
+        std::vector<std::string> detectorIds;
+        std::function<bool()> cancelled;
+        std::string obstacleId = "A";
+        std::string obstacleName = "A.STL";
+        // Legacy import metadata only; collision setup never creates scene entities.
         std::string obstacleRobotSourcePath = "data/drake_models/burnner/urdf/burnner.urdf";
         double obstacleX = 0.65;
         double obstacleY = 0.85;
@@ -60,6 +72,9 @@ namespace motion_planning
         // Optional process constraint, evaluated with ordered reference TCP positions.
         // Empty preserves the existing position-only planning behavior.
         std::function<bool(const std::vector<double>&, const Eigen::Vector3d&)> tcpStateAdmissible;
+        // Map a proposed orientation through its ordered surface anchor, then solve IK.
+        // The indices refer to the ORIGINAL seed edge and its interpolation fraction.
+        std::function<bool(std::vector<double>&, std::size_t, double)> surfaceProject;
         // Optimization knots are independent of the fine collision sampling.
         double optimizationMaxJointStep = 0.04;
         double validationMaxJointStep = 0.02;
@@ -68,6 +83,7 @@ namespace motion_planning
         int queryWorkers = 0;
         // Optional synchronous observation; the callback must not mutate the scene.
         std::function<void(const std::string&)> progress;
+        std::function<void(const std::vector<double>&)> previewState;
     };
 
     struct ProjectCdfQpRepairStatistics
@@ -101,10 +117,15 @@ namespace motion_planning
     struct ProjectCdfQpRepairResult
     {
         bool success = false;
+        bool cancelled = false;
         StoredMotionPlan plan;
         ProjectCdfQpRepairStatistics statistics;
         // Original knots of the actually selected (possibly equivalent-IK) seed.
         robottrajectory::JointTrajectory referenceSeedTrajectory;
+        // Immutable source process times, one per final joint knot after retiming.
+        std::vector<double> sourceReferenceTimes;
+        // Metres per original source control; immutable after GA selection.
+        std::vector<double> gaSelectedSprayDistances;
         std::vector<CdfTrajectoryStage> stages;
         std::vector<MotionPlanningDiagnostic> diagnostics;
     };
@@ -112,6 +133,10 @@ namespace motion_planning
     class ProjectCdfQpTrajectoryRepairService
     {
     public:
+        static bool collisionSetupConfigured(const simulation_project::ProjectDocument& document,
+            const std::string& robotId, const ProjectCdfQpRepairOptions& options);
+        static std::vector<std::string> distanceDetectorIds(
+            const simulation_project::ProjectDocument& document, const std::string& robotId);
         static bool ensureCollisionSetup(
             simulation_project::ProjectDocument& document,
             const std::string& robotId,

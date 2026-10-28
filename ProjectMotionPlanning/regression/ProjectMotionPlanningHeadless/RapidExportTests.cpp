@@ -87,6 +87,25 @@ int main(int argc, char** argv)
             require(Eigen::AngleAxisd(expected.linear().transpose() * actual.linear()).angle() < 1.0e-8,
                 "Quaternion wxyz orientation round trip");
         }
+        motion_planning::StoredMotionPlan cartesian;
+        for(std::size_t i = 0; i < result.pointCount; ++i) {
+            cartesian.cartesianControlPoints.points.emplace_back();
+            auto& point = cartesian.cartesianControlPoints.points.back();
+            point.time = plan.trajectory.points[i].time;
+            point.tcpPose = fk(motion_planning::ProjectTrajectoryInverseKinematics::irb4600RobotSystemJointValues(
+                plan.trajectory.points[i].q));
+        }
+        const auto direct = motion_planning::ProjectRapidTrajectoryExporter::generateCartesian(cartesian);
+        require(direct.success && direct.program == result.program, "Direct Cartesian export shares the exact CDF template without IK/FK");
+        auto invalidCartesian = cartesian;
+        invalidCartesian.cartesianControlPoints.points.back().tcpPose.linear()(0,0) += 0.1;
+        const auto badCartesian = motion_planning::ProjectRapidTrajectoryExporter::generateCartesian(invalidCartesian);
+        require(!badCartesian.success && badCartesian.program.empty(), "Reject invalid late Cartesian rotation atomically");
+        invalidCartesian = cartesian;
+        invalidCartesian.cartesianControlPoints.points.back().time = std::numeric_limits<double>::infinity();
+        require(!motion_planning::ProjectRapidTrajectoryExporter::generateCartesian(invalidCartesian).success, "Reject invalid Cartesian timestamp");
+        invalidCartesian.cartesianControlPoints.points.clear();
+        require(!motion_planning::ProjectRapidTrajectoryExporter::generateCartesian(invalidCartesian).success, "Reject empty Cartesian input");
         std::error_code ignored;
         std::filesystem::remove(output, ignored);
         auto invalid = plan;

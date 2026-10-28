@@ -109,6 +109,7 @@ if(BuildTests)
             --project ${CMAKE_SOURCE_DIR}/config/projects/ABB4600-burnner.sys.json
             --cdf-file ${CMAKE_CURRENT_SOURCE_DIR}/apf_periodic.txt --cdf-query-check --verification-step 0.001)
     set_tests_properties(ProjectMotionPlanningCdfQueries PROPERTIES
+        TIMEOUT 900
         LABELS "SMRobotMotionPlanning;ProjectMotionPlanning;Regression"
         WORKING_DIRECTORY $<TARGET_FILE_DIR:ProjectMotionPlanning-Headless>)
 endif()
@@ -135,7 +136,7 @@ if(BuildTests)
         ${CMAKE_SOURCE_DIR}/config/projects/ABB4600-burnner.sys.json)
     set_tests_properties(ProjectMotionPlanningRapidExport PROPERTIES
         LABELS "SMRobotMotionPlanning;ProjectMotionPlanning;Regression"
-        ENVIRONMENT "SMROBOT_DATA_ROOT=${CMAKE_SOURCE_DIR}/data"
+        ENVIRONMENT "SMROBOT_DATA_ROOT=${SMROBOT_DATA_ROOT}"
         WORKING_DIRECTORY $<TARGET_FILE_DIR:ProjectMotionPlanning-RapidExportTests>)
 endif()
 
@@ -160,4 +161,12 @@ if(BuildTests)
     add_test(NAME ProjectMotionPlanningProcessPoseImport COMMAND $<TARGET_FILE:ProjectMotionPlanning-ProcessPoseImportTests>)
     set_tests_properties(ProjectMotionPlanningProcessPoseImport PROPERTIES
         WORKING_DIRECTORY $<TARGET_FILE_DIR:ProjectMotionPlanning-ProcessPoseImportTests>)
+endif()
+
+if(BuildTests)
+    add_test(NAME GaApfCdfDetectorAndFailureGates COMMAND $<TARGET_FILE:GaApfCdfCheck>
+        ${CMAKE_SOURCE_DIR}/config/projects/ABB4600-Aburnner.sys.json unused
+        ${CMAKE_CURRENT_BINARY_DIR}/pipeline-checks-$<CONFIG>.json --checks)
+    set_tests_properties(GaApfCdfDetectorAndFailureGates PROPERTIES
+        WORKING_DIRECTORY $<TARGET_FILE_DIR:GaApfCdfCheck>)
 endif()

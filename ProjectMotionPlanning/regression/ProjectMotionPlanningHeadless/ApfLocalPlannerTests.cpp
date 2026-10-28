@@ -24,6 +24,20 @@ int main()
     if(!followsApfGuide(processFrom,processFrom,guideFrom,guideFrom,processGuide))return 44;
     processGuide.positions={guideFrom,guideTo};
     if(followsApfPath({processFrom,processTo},processGuide))return 45;
+    // Identical TCP guide positions must NOT select a surface anchor by nearest position.
+    ApfGuidance surfaceGuide;surfaceGuide.position=[](const auto& q){return ApfState{q[0],q[1],q[2]};};
+    surfaceGuide.positions={{0,0,0},{0,0,0}};
+    surfaceGuide.projectStation=[](auto& q,std::size_t station){
+        const double d=.1,normalX=std::sin(q[3]),normalZ=std::cos(q[3]);
+        q[0]=double(station)-d*normalX;q[1]=0;q[2]=-d*normalZ;return true;
+    };
+    ApfState mappedA{0,0,0,.5},mappedB=mappedA;
+    if(!projectApfPosition(mappedA,{0,0,0},{-2,-2,-2,-2},{2,2,2,2},surfaceGuide,1,12,0) ||
+        !projectApfPosition(mappedB,{0,0,0},{-2,-2,-2,-2},{2,2,2,2},surfaceGuide,1,12,1) ||
+        std::abs(mappedB[0]-mappedA[0]-1)>1e-12 || std::abs(mappedA[0]+.1*std::sin(.5))>1e-12 ||
+        std::abs(mappedA[2]+.1*std::cos(.5))>1e-12)return 46;
+    surfaceGuide.projectStation=[](auto&,std::size_t){return false;};
+    if(projectApfPosition(mappedA,{0,0,0},{-2,-2,-2,-2},{2,2,2,2},surfaceGuide,1))return 47;
     motion_planning::ProjectCdfQpTrajectoryRepairService service;
     simulation_project::ProjectDocument document;
     robottrajectory::JointTrajectory dummy;

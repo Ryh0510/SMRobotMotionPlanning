@@ -46,8 +46,9 @@ namespace motion_planning::detail
             return norm(residual);
         }
         bool projectPosition(ApfState& q, const ApfState& target, const ApfState& lower,
-            const ApfState& upper, const ApfGuidance& guidance, double radius, int iterations)
+            const ApfState& upper, const ApfGuidance& guidance, double radius, int iterations, std::size_t station)
         {
+            if(guidance.projectStation) return guidance.projectStation(q,station);
             for(int iteration=0;iteration<iterations;++iteration) {
                 const auto p=guidance.position(q);
                 if(!finite(p,target.size()))return false;
@@ -85,14 +86,14 @@ namespace motion_planning::detail
 
     bool projectApfPosition(ApfState& q, const ApfState& target,
         const ApfState& lower, const ApfState& upper, const ApfGuidance& guidance,
-        double radius, int iterations)
+        double radius, int iterations, std::size_t station)
     {
         if(!guidance.position || q.empty() || lower.size()!=q.size() || upper.size()!=q.size() ||
             !finite(q,q.size()) || target.empty() || !finite(target,target.size()) ||
             !std::isfinite(radius) || radius<0) return false;
         for(std::size_t j=0;j<q.size();++j)
             if(std::isnan(lower[j]) || std::isnan(upper[j]) || lower[j]>upper[j])return false;
-        return projectPosition(q,target,lower,upper,guidance,radius,iterations);
+        return projectPosition(q,target,lower,upper,guidance,radius,iterations,station);
     }
 
     bool followsApfGuide(const ApfState& from, const ApfState& to,
@@ -152,11 +153,13 @@ namespace motion_planning::detail
         // control-point segment. Project the attraction seed with the ACTUAL
         // TCP model before collision planning; keep both exact boundary anchors.
         if(guidance) for(std::size_t i=1;i+1<reference.size();++i)
-            if(!projectPosition(reference[i],guidance->positions[i],lower,upper,*guidance,0.001,60))return false;
+            if(!projectPosition(reference[i],guidance->positions[i],lower,upper,*guidance,0.001,60,i))return false;
         const auto metric = [&](const ApfState& q) { return guidance ? guidance->position(q) : q; };
         const auto metricReference = guidance ? guidance->positions : reference;
         const double tube = guidance ? guidance->maxDeviation : 0.45;
-        const double influence = std::max(0.08, 5.0 * clearance);
+        if(!std::isfinite(oracle.stepSize) || oracle.stepSize<=0 || !std::isfinite(oracle.influenceDistance) || oracle.influenceDistance<=0 ||
+            !std::isfinite(oracle.repulsionGain) || oracle.repulsionGain<=0 || oracle.iterationBudget<1)return false;
+        const double influence = std::max(oracle.influenceDistance, 5.0 * clearance);
         const double startDistance = oracle.distance(reference.front()), goalDistance = oracle.distance(reference.back());
         if(!std::isfinite(startDistance) || !std::isfinite(goalDistance) || startDistance < 0.0 || goalDistance < 0.0) return false;
         if(!finite(metric(reference.front()), metricReference.front().size()) ||
@@ -189,12 +192,12 @@ namespace motion_planning::detail
                 fieldReference[i][axis]=std::clamp(fieldReference[i][axis]+
                     (reverse?-0.55:0.55)*std::sin(3.14159265358979323846*t),lower[axis],upper[axis]);
                 if(guidance && !projectPosition(fieldReference[i],metricReference[i],lower,upper,*guidance,
-                    std::min(0.03,0.3*tube),60))return false;
+                    std::min(0.03,0.3*tube),60,i))return false;
             }
             ApfPath path{reference[index(0)]};
             bool failed = false;
             int totalIterations = 0, reportedIteration = -1;
-            const int budget = std::min(1200, std::max(300, static_cast<int>(reference.size()) * 4));
+            const int budget = std::min(oracle.iterationBudget, std::max(300, static_cast<int>(reference.size()) * 4));
             for(std::size_t station = 1; station < reference.size() && !failed; ++station) {
                 const auto& target = fieldReference[index(station)];
                 const auto& a = metricReference[index(station - 1)];
@@ -219,6 +222,7 @@ namespace motion_planning::detail
                         auto trial=state;
                         for(std::size_t j=0;j<dimension;++j)
                             trial[j]=std::clamp(state[j]+fieldReference[index(next)][j]-target[j],lower[j],upper[j]);
+                        if(guidance && guidance->projectStation && !guidance->projectStation(trial,index(next))) return -std::numeric_limits<double>::infinity();
                         states.push_back(std::move(trial));
                     }
                     std::vector<double> distances;
@@ -236,7 +240,7 @@ namespace motion_planning::detail
                     auto carried = target;
                     for(std::size_t j = 0; j < dimension; ++j)
                         carried[j] = std::clamp(target[j] + 0.85 * (publishedStart[j] - fieldReference[index(station-1)][j]), lower[j], upper[j]);
-                    if(norm(difference(carried, target)) > 1e-5 && forecast(carried) >= clearance && edgeValid(publishedStart, carried, a, b)) {
+                    if((!guidance || !guidance->projectStation || guidance->projectStation(carried,index(station))) && norm(difference(carried, target)) > 1e-5 && forecast(carried) >= clearance && edgeValid(publishedStart, carried, a, b)) {
                         path.push_back(std::move(carried)); continue;
                     }
                 }
@@ -267,8 +271,10 @@ namespace motion_planning::detail
                             const double t=span>1e-12?(at-lengths[edge-1])/span:0.0;
                             auto state=curve[edge-1];
                             for(std::size_t j=0;j<dimension;++j)state[j]+=t*(curve[edge][j]-state[j]);
+                            if(guidance && guidance->projectStation && !guidance->projectStation(state,index(begin+i))) { replacement.clear(); break; }
                             replacement.push_back(std::move(state));
                         }
+                        if(replacement.empty())continue;
                         replacement.push_back(end);
                         bool valid=true;
                         if(guidance)for(std::size_t i=1;i<replacement.size() && valid;++i)
@@ -309,7 +315,7 @@ namespace motion_planning::detail
                     }
                     // The final anchor is fixed. A local trial may shift the preceding
                     // station, but must validate BOTH adjacent reference intervals.
-                    if(station + 1 == reference.size() && path.size() >= 2 &&
+                    if((!guidance || !guidance->projectStation) && station + 1 == reference.size() && path.size() >= 2 &&
                         edgeValid(path[path.size()-2], q, metricReference[index(station-2)], a) &&
                         edgeValid(q, target, a, b)) {
                         path.back() = q; q = target; reached = true; break;
@@ -347,6 +353,7 @@ namespace motion_planning::detail
                             auto trial=probe;
                             for(std::size_t j=0;j<dimension;++j)
                                 trial[j]=std::clamp(probe[j]+fieldReference[index(next)][j]-target[j],lower[j],upper[j]);
+                            if(guidance && guidance->projectStation && !guidance->projectStation(trial,index(next))) return false;
                             previewProbes.push_back(std::move(trial));
                         }
                         std::vector<double> observed;
@@ -417,7 +424,7 @@ namespace motion_planning::detail
                         const double taskSuppression = 0.8 * std::pow(std::clamp(segmentDistance(position, a, b) / tube, 0.0, 1.0), 4);
                         for(std::size_t j = 0; j < dimension; ++j) escape[j] -= taskSuppression * taskComponent[j];
                     }
-                    const double repulsionWeight = 2.5 * std::clamp( 1.0 - potentialDistance / influence, 0.0, 2.0);
+                    const double repulsionWeight = oracle.repulsionGain * std::clamp( 1.0 - potentialDistance / influence, 0.0, 2.0);
                     for(std::size_t j = 0; j < dimension; ++j) force[j] += repulsionWeight * escape[j];
                     normalize(force);
                     if(dot(force, previousForce) > 0.0) {
@@ -426,11 +433,11 @@ namespace motion_planning::detail
                     }
                     previousForce = force;
                     bool advanced = false;
-                    for(double step = 0.02; step >= 0.000625; step *= 0.5) {
+                    for(double step = oracle.stepSize; step >= oracle.stepSize/32; step *= 0.5) {
                         auto candidate = q;
                         for(std::size_t j = 0; j < dimension; ++j) candidate[j] = std::clamp(q[j] + step * force[j], lower[j], upper[j]);
-                        if(guidance && norm(difference(metric(candidate),b))>tube &&
-                            !projectPosition(candidate,b,lower,upper,*guidance,0.9*tube,20))return false;
+                        if(guidance && (guidance->projectStation || norm(difference(metric(candidate),b))>tube) &&
+                            !projectPosition(candidate,b,lower,upper,*guidance,0.9*tube,20,index(station)))continue;
                         const auto p = metric(candidate);
                         if(!finite(p, b.size()) || segmentDistance(p, a, b) > tube || norm(difference(candidate,q)) < 1e-6) continue;
                         if(!oracle.motionValid(q, candidate)) continue;
@@ -454,7 +461,7 @@ namespace motion_planning::detail
                             }
                             auto stationPoint = q;
                             for(std::size_t j=0;j<dimension;++j) stationPoint[j] += hi*(candidate[j]-q[j]);
-                            if(norm(difference(metric(stationPoint),b)) <= tube && connectStation(stationPoint)) {
+                            if((!guidance || !guidance->projectStation || guidance->projectStation(stationPoint,index(station))) && norm(difference(metric(stationPoint),b)) <= tube && connectStation(stationPoint)) {
                                 q = std::move(stationPoint); reached=true; advanced=true; break;
                             }
                         }
@@ -466,7 +473,7 @@ namespace motion_planning::detail
                     if(!advanced && norm(gradient)>1e-8)for(double step=0.01;step>=0.00015625;step*=0.5) {
                         auto candidate=q;
                         for(std::size_t j=0;j<dimension;++j)candidate[j]=std::clamp(q[j]+step*gradient[j],lower[j],upper[j]);
-                        if(guidance && !projectPosition(candidate,b,lower,upper,*guidance,0.95*tube,20))return false;
+                        if(guidance && !projectPosition(candidate,b,lower,upper,*guidance,0.95*tube,20,index(station)))continue;
                         const auto p=metric(candidate);
                         if(!finite(p,b.size()) || segmentDistance(p,a,b)>tube || norm(difference(candidate,q))<1e-6)continue;
                         const double recovered=oracle.distance(candidate);

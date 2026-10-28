@@ -38,6 +38,8 @@ namespace motion_planning
         // convention. Includes the chosen TCP/flange transform; toolMode is then ignored.
         // Without it, the legacy nominal IRB4600 DH model remains available.
         std::function<Eigen::Isometry3d(const std::vector<double>&)> worldForwardKinematics;
+        // Optional geometric Jacobian at the same world TCP (linear rows, angular rows).
+        std::function<Eigen::Matrix<double,6,6>(const std::vector<double>&)> worldJacobian;
     };
 
     struct CartesianIkPointResult
@@ -74,6 +76,8 @@ namespace motion_planning
 
     // All angles are in the stored IK convention, in radians. Bounds are finite
     // search windows intersected with known model limits; turn values are retained.
+    struct CartesianIkLayer;
+
     struct CartesianMultiIkOptions
     {
         CartesianIkOptions model;
@@ -88,6 +92,11 @@ namespace motion_planning
         std::function<bool()> cancelled;
         std::function<void(std::size_t, std::size_t)> progress;
         CartesianIkClassifier classifyConfiguration;
+        std::function<void(const CartesianIkLayer&)> layerReady;
+        // Kinematic hints only: every reused root is checked against actual FK/bounds.
+        std::vector<std::vector<std::vector<double>>> cachedCandidates;
+        // Prior provisional chain: local continuation first, full search on failure.
+        std::vector<std::vector<double>> preferredJoints;
     };
 
     struct CartesianIkCandidate

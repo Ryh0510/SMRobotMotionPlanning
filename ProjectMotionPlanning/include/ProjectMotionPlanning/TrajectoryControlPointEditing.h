@@ -3,6 +3,7 @@
 #include <MotionPlanningCore/MotionPlanning.h>
 
 #include <cstddef>
+#include <functional>
 #include <string>
 
 namespace motion_planning
@@ -35,6 +36,12 @@ public:
     // Four matrix rows (translation in mm), timestamp in seconds, blank separator.
     static bool serializeCartesianMatrices(const StoredMotionPlan& plan,
         std::string& text, std::string* errorMessage = nullptr);
+
+    // Export every stored joint point through an independent actual-model TCP snapshot.
+    // FK consumes runtime radians and returns world TCP meters; recorded times are retained.
+    static bool serializeJointTcpMatrices(const StoredMotionPlan& plan,
+        const std::function<Eigen::Isometry3d(const std::vector<double>&)>& worldTcpForwardKinematics,
+        bool mapIrb4600StoredJointSigns, std::string& text, std::string* errorMessage = nullptr);
 
     static bool makeInsertedCartesianControlPoint(
         const StoredMotionPlan& plan,

@@ -58,6 +58,14 @@ namespace
 }
 int main()
 {
+    {
+        auto sample=fixture({{{0.},{1.}},{{0.},{1.}}});LayeredIkGraphOptions o;
+        o.nodeCost=[](std::size_t,const CartesianIkCandidate& c){return c.joints[0]<.5?10.:0.;};
+        const auto chosen=ProjectLayeredIkGraph::filter(sample,o);
+        check(chosen.success && chosen.paths.front().selections==std::vector<std::size_t>({1,1}),"Soft node costs select a robust branch over an equal-motion branch");
+        o.nodeCost=[](std::size_t,const CartesianIkCandidate&){return -1.;};
+        check(!ProjectLayeredIkGraph::filter(sample,o).success,"Invalid soft node costs cannot corrupt graph ranking");
+    }
     const auto ik = fixture({{{0,0},{2,1}}, {{1,0},{-1,3},{4,-2}}, {{0.5,2},{-2,-1}}, {{0,0},{3,4}}});
     LayeredIkGraphOptions options; options.jointWeights = {2.0, 0.3};
     const auto brute = enumerate(ik, options.jointWeights);
@@ -172,5 +180,21 @@ int main()
     const auto cancelledGroups = ProjectLayeredIkGraph::filterByStart(ik, options);
     check(cancelledGroups.cancelled && !cancelledGroups.success && cancelledGroups.paths.empty(),
         "Cancellation after a completed start discards all partial groups");
+    LayeredIkGraphOptions constrained;
+    constrained.maxJointDelta = 0.3;
+    auto constrainedPaths=ProjectLayeredIkGraph::filter(turns,constrained);
+    check(constrainedPaths.success && constrainedPaths.paths.size()==1 && constrainedPaths.paths[0].selections[1]==1,
+        "Hard jump limits remove a full turn without angle wrapping");
+    constrained.maxJointDelta=0;
+    constrained.maxJointVelocities={0.1};
+    check(!ProjectLayeredIkGraph::filter(turns,constrained).success,"Disconnected velocity graph is a failure, not empty success");
+    constrained.maxJointVelocities={1};
+    constrained.edgeAdmissible=[](std::size_t,const CartesianIkCandidate&,const CartesianIkCandidate&) { return false; };
+    check(!ProjectLayeredIkGraph::filter(turns,constrained).success,"Segment collision callback rejects endpoint-valid paths");
+    constrained.edgeAdmissible={};
+    constrained.nodeAdmissible=[](std::size_t,const CartesianIkCandidate& c) { return c.joints[0]>0; };
+    check(!ProjectLayeredIkGraph::filter(turns,constrained).success,"Rejected initial node cannot seed a path");
+    auto badTime=turns; badTime.layers[1].time=badTime.layers[0].time;
+    check(!ProjectLayeredIkGraph::filter(badTime,constrained).success,"Velocity constraints reject zero-duration segments");
     return failures ? 1 : 0;
 }

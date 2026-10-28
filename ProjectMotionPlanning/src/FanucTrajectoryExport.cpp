@@ -50,7 +50,12 @@ namespace motion_planning
             }
             if(previous) {
                 Eigen::Vector3d alternate(angles.x() + pi, pi - angles.y(), angles.z() + pi);
-                for(int j = 0; j < 3; ++j) alternate[j] = std::remainder(alternate[j], 2.0 * pi);
+                // Compare equivalent angle lifts near the preceding WPR. Comparing
+                // principal values first can select an artificial 180-degree flip.
+                for(int j = 0; j < 3; ++j) {
+                    angles[j] = (*previous)[j] + std::remainder(angles[j] - (*previous)[j], 2.0 * pi);
+                    alternate[j] = (*previous)[j] + std::remainder(alternate[j] - (*previous)[j], 2.0 * pi);
+                }
                 if((alternate - *previous).squaredNorm() < (angles - *previous).squaredNorm()) angles = alternate;
             }
             return angles;
@@ -62,46 +67,56 @@ namespace motion_planning
         }
     }
 
-    FanucTrajectoryExportResult ProjectFanucTrajectoryExporter::generate(
-        const StoredMotionPlan& plan, const FanucTrajectoryExportOptions& options)
+    static FanucTrajectoryExportResult generateProgram(
+        const StoredMotionPlan& plan, const FanucTrajectoryExportOptions& options, bool cartesian)
     {
         FanucTrajectoryExportResult result;
         try {
             if(!validProgramName(options.programName)) {
                 throw std::runtime_error("FANUC program name must be 1-8 uppercase ASCII letters/digits/underscores, starting with a letter.");
             }
-            if(plan.trajectory.empty() || plan.jointNames.size() != 6 ||
+            if(!cartesian && (plan.trajectory.empty() || plan.jointNames.size() != 6 ||
                 std::set<std::string>(plan.jointNames.begin(), plan.jointNames.end()).size() != 6 ||
                 std::any_of(plan.jointNames.begin(), plan.jointNames.end(), [](const auto& name) { return name.empty(); }) ||
-                !options.worldTcpForwardKinematics) {
+                !options.worldTcpForwardKinematics)) {
                 throw std::runtime_error("A complete six-axis joint trajectory and actual TCP kinematics are required.");
             }
+            const std::size_t count = cartesian ? plan.cartesianControlPoints.points.size() : plan.trajectory.points.size();
+            if(count == 0) throw std::runtime_error("A Cartesian trajectory is required.");
             std::ostringstream out;
             out.imbue(std::locale::classic());
             out << "/PROG  " << options.programName << "\r\n/ATTR\r\n"
                 << "OWNER\t\t= MNEDITOR;\r\nCOMMENT\t\t= \"Spray Trajectory\";\r\n"
                 << "PROG_SIZE\t= 0;\r\nVERSION\t\t= 0;\r\n"
-                << "LINE_COUNT\t= " << plan.trajectory.points.size() + 2 << ";\r\n"
+                << "LINE_COUNT\t= " << count + 2 << ";\r\n"
                 << "MEMORY_SIZE\t= 0;\r\nPROTECT\t\t= READ_WRITE;\r\n"
                 << "DEFAULT_GROUP\t= 1,*,*,*,*;\r\n/MN\r\n"
                 << "   1:  UFRAME_NUM=2 ;\r\n   2:  UTOOL_NUM=1 ;\r\n";
-            for(std::size_t i = 0; i < plan.trajectory.points.size(); ++i) {
+            for(std::size_t i = 0; i < count; ++i) {
                 out << "   " << i + 3 << ":  L P[" << i + 1 << "] 400mm/sec CNT100    ;\r\n";
             }
             out << "/POS\r\n" << std::fixed << std::setprecision(3);
             Eigen::Vector3d previous = Eigen::Vector3d::Zero();
-            for(std::size_t i = 0; i < plan.trajectory.points.size(); ++i) {
-                const auto& point = plan.trajectory.points[i];
-                if(point.q.size() != 6 || !std::isfinite(point.time) ||
-                    !std::all_of(point.q.begin(), point.q.end(), [](double value) { return std::isfinite(value); })) {
-                    throw std::runtime_error("Invalid joint trajectory data at point " + std::to_string(i + 1));
+            for(std::size_t i = 0; i < count; ++i) {
+                Eigen::Isometry3d tcp = Eigen::Isometry3d::Identity();
+                if(cartesian) {
+                    const auto& point = plan.cartesianControlPoints.points[i];
+                    if(!std::isfinite(point.time))
+                        throw std::runtime_error("Invalid Cartesian time at point " + std::to_string(i + 1));
+                    tcp = point.tcpPose;
+                } else {
+                    const auto& point = plan.trajectory.points[i];
+                    if(point.q.size() != 6 || !std::isfinite(point.time) ||
+                        !std::all_of(point.q.begin(), point.q.end(), [](double value) { return std::isfinite(value); })) {
+                        throw std::runtime_error("Invalid joint trajectory data at point " + std::to_string(i + 1));
+                    }
+                    // Preserve legal turns; only undo the existing stored ABB sign convention.
+                    const auto q = options.mapIrb4600StoredJointSigns
+                        ? ProjectTrajectoryInverseKinematics::irb4600RobotSystemJointValues(point.q) : point.q;
+                    tcp = options.worldTcpForwardKinematics(q);
                 }
-                // Preserve legal turns; only undo the existing stored ABB sign convention.
-                const auto q = options.mapIrb4600StoredJointSigns
-                    ? ProjectTrajectoryInverseKinematics::irb4600RobotSystemJointValues(point.q) : point.q;
-                const Eigen::Isometry3d tcp = options.worldTcpForwardKinematics(q);
                 if(!validPose(tcp)) {
-                    throw std::runtime_error("Invalid actual-model TCP pose at point " + std::to_string(i + 1));
+                    throw std::runtime_error("Invalid TCP pose at point " + std::to_string(i + 1));
                 }
                 const Eigen::Vector3d mm = tcp.translation() * 1000.0;
                 const auto angles = wprRadians(tcp.linear(), i ? &previous : nullptr);
@@ -116,11 +131,24 @@ namespace motion_planning
             }
             out << "/END\r\n";
             result.program = out.str();
-            result.pointCount = plan.trajectory.points.size();
+            result.pointCount = count;
             result.success = true;
         } catch(const std::exception& error) {
             result.error = error.what();
         }
         return result;
     }
+
+    FanucTrajectoryExportResult ProjectFanucTrajectoryExporter::generate(
+        const StoredMotionPlan& plan, const FanucTrajectoryExportOptions& options)
+    {
+        return generateProgram(plan, options, false);
+    }
+
+    FanucTrajectoryExportResult ProjectFanucTrajectoryExporter::generateCartesian(
+        const StoredMotionPlan& plan, const FanucTrajectoryExportOptions& options)
+    {
+        return generateProgram(plan, options, true);
+    }
+
 }

@@ -4,10 +4,13 @@ set(${TARGET_NAME}_RequiredLibsPublic
     SMRobotMotionPlanning::MotionPlanningCore
     SMRobotPlatform::SimulationProject
     SMRobotPlatform::SimulationRuntime
+    SMRobotSpray::SprayFreeformTrajPlan
+    nlohmann_json::nlohmann_json
     osqpstatic
 )
 
 set(${TARGET_NAME}_RequiredLibsPrivate
     nlohmann_json::nlohmann_json
+    SMRobotPlatform::AssetCore
     SMRobotMotionPlanning::MotionPlanningOmpl
 )

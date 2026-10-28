@@ -28,6 +28,9 @@ namespace motion_planning::detail
         std::vector<double> gradient;
     };
 
+    std::vector<double> proposeCdfQpPointStep(ProjectPlanningSceneSnapshot& scene,
+        const std::vector<double>& current, const std::vector<double>& seed,
+        const ProjectCdfQpRepairOptions& options);
     SignedDistanceSample evaluateSignedPhi(ProjectPlanningSceneSnapshot& scene,
         const std::vector<double>& q, double safetyMargin, double distanceThreshold,
         ProjectCdfQpRepairStatistics& statistics);

@@ -3,6 +3,8 @@ cmake_minimum_required(VERSION 3.20)
 message(STATUS "!!!!!!Package ${PACKAGE_NAME} configuration is set here!!!!!!")
 
 set(${PACKAGE_NAME}_PublicComponents
+    MotionPlanningIk
+    PostModel
     MotionPlanningCore
     MotionPlanningOmpl
     ProjectMotionPlanning
@@ -16,10 +18,10 @@ set(${PACKAGE_NAME}_Components
     ${${PACKAGE_NAME}_PublicComponents}
 )
 
+rs_begin_package_requirements(${PACKAGE_NAME})
 foreach(TARGET_NAME ${${PACKAGE_NAME}_Components})
     include(${PACKAGE_NAME}/${TARGET_NAME}/TargetConfigSetting)
-    list(APPEND ${PACKAGE_NAME}_RequiredLibsPublic ${${TARGET_NAME}_RequiredLibsPublic})
-    list(APPEND ${PACKAGE_NAME}_RequiredLibsPrivate ${${TARGET_NAME}_RequiredLibsPrivate})
+    rs_collect_component_requirements(${PACKAGE_NAME} ${TARGET_NAME})
     set(${PACKAGE_NAME}${TARGET_NAME}_RequiredLibsPublic ${${TARGET_NAME}_RequiredLibsPublic})
     set(${PACKAGE_NAME}${TARGET_NAME}_RequiredLibsPrivate ${${TARGET_NAME}_RequiredLibsPrivate})
 endforeach()

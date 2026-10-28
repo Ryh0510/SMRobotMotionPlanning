@@ -1,4 +1,5 @@
 #include <ProjectMotionPlanning/ProjectMotionPlanning.h>
+#include <ProjectMotionPlanning/VirtualBaffleEnvironment.h>
 
 #include <MotionPlanningOmpl/OmplMotionPlanner.h>
 #include <SimulationProject/ProjectDocument.h>
@@ -150,13 +151,19 @@ namespace motion_planning
     public:
         simulation_runtime::ProjectSimulationRuntime simulation;
         simulation_runtime::ProjectCollisionRuntime collision;
+        VirtualBaffleEnvironment baffles;
         std::string robotId;
         std::vector<std::string> jointNames;
         std::vector<JointBound> jointBounds;
         std::vector<std::string> detectorIds;
+        bool conservativeMotion = false;
+        collision::MotionQueryRequest motionRequest;
+        std::vector<std::string> collisionFreeLinks;
+        mutable PlanningSceneQueryCounts queries;
 
         StateValidationResult applyState(const std::vector<double>& jointValues, bool checkCollision)
         {
+            if(checkCollision)++queries.stateValidationRequests;
             if (jointValues.size() != jointNames.size())
                 return StateValidationResult::failure("state_size_mismatch", "Joint state size does not match the planning scene.");
 
@@ -185,8 +192,13 @@ namespace motion_planning
             if (!checkCollision)
                 return StateValidationResult::success();
 
+            std::string baffleReason;
+            ++queries.baffleChecks;
+            if(!baffles.validState(simulation,0,baffleReason))
+                return StateValidationResult::failure("virtual_baffle_collision",baffleReason);
             for (const std::string& detectorId : detectorIds)
             {
+                ++queries.collisionDetectorChecks;
                 const simulation_runtime::Result checkResult = collision.checkDetector(detectorId);
                 if (!checkResult.success)
                     return StateValidationResult::failure("collision_query_failed", checkResult.message);
@@ -221,6 +233,41 @@ namespace motion_planning
     {
         if (from.size() != m_impl->jointNames.size() || to.size() != from.size())
             return StateValidationResult::failure("motion_size_mismatch", "Motion endpoint sizes do not match the planning scene.");
+        if (m_impl->conservativeMotion)
+        {
+            if(std::any_of(m_impl->baffles.baffles().begin(), m_impl->baffles.baffles().end(),
+                [](const auto& b) { return b.geometry.enabled; }))
+                return StateValidationResult::failure("motion_baffle_uncertified", "Conservative SDK motion bounds do not include virtual baffles; use explicit sampled validation for this scene.");
+            const auto* robot = m_impl->simulation.robot(m_impl->robotId);
+            if (!robot || !robot->instance)
+                return StateValidationResult::failure("motion_robot_missing", "Planning robot is unavailable.");
+            auto fullFrom = robot->instance->getState().q;
+            auto fullTo = fullFrom;
+            for (std::size_t i=0;i<from.size();++i) {
+                const auto& bound=m_impl->jointBounds[i];
+                if (!std::isfinite(from[i]) || !std::isfinite(to[i]) ||
+                    (!bound.continuous && (std::min(from[i],to[i])<bound.lower || std::max(from[i],to[i])>bound.upper)))
+                    return StateValidationResult::failure("motion_out_of_bounds", "Invalid joint segment.");
+                const auto* joint=findJoint(robot->model,m_impl->jointNames[i]);
+                if (!joint || joint->dofIndex<0 || static_cast<std::size_t>(joint->dofIndex)>=fullFrom.size())
+                    return StateValidationResult::failure("motion_joint_mapping", "Invalid joint mapping.");
+                fullFrom[joint->dofIndex]=from[i];
+                fullTo[joint->dofIndex]=bound.continuous && !options.preserveJointTurns
+                    ? from[i]+shortestContinuousDelta(from[i],to[i]) : to[i];
+            }
+            auto motionRequest=m_impl->motionRequest;
+            const auto requestedCancel=motionRequest.cancelled;
+            motionRequest.cancelled=[requestedCancel,&options] { return (requestedCancel && requestedCancel()) || (options.cancelled && options.cancelled()); };
+            const auto results=m_impl->collision.queryRobotJointMotion(m_impl->simulation,m_impl->robotId,
+                fullFrom,fullTo,m_impl->detectorIds,m_impl->collisionFreeLinks,motionRequest);
+            if (results.empty()) return StateValidationResult::failure("motion_no_detectors", "No motion validation result.");
+            for (const auto& result:results) {
+                if (result.status!=collision::CollisionStatus::Success || result.verdict!=collision::MotionVerdict::Clear)
+                    return StateValidationResult::failure(
+                        result.verdict==collision::MotionVerdict::Collision?"motion_in_collision":"motion_indeterminate",result.message);
+            }
+            return StateValidationResult::success();
+        }
         if (!(options.maxJointStep > 0.0) || !std::isfinite(options.maxJointStep))
             return StateValidationResult::failure("invalid_motion_step", "Maximum joint validation step must be positive and finite.");
 
@@ -228,11 +275,16 @@ namespace motion_planning
         for (std::size_t index = 0; index < from.size(); ++index)
         {
             const JointBound& bound = m_impl->jointBounds[index];
-            const double delta = bound.continuous
+            if(!std::isfinite(from[index]) || !std::isfinite(to[index]))
+                return StateValidationResult::failure("non_finite_state", "Motion contains a non-finite endpoint.");
+            const double delta = bound.continuous && !options.preserveJointTurns
                 ? shortestContinuousDelta(from[index], to[index])
                 : to[index] - from[index];
             maximumDelta = std::max(maximumDelta, std::abs(delta));
         }
+        const double requiredSteps = std::max(1.0, std::ceil(maximumDelta / options.maxJointStep));
+        if(!std::isfinite(requiredSteps) || options.maxSamples < 2 || requiredSteps >= double(options.maxSamples))
+            return StateValidationResult::failure("motion_sample_budget", "Motion validation sample budget exceeded.");
         const std::size_t stepCount = std::max<std::size_t>(
             1,
             static_cast<std::size_t>(std::ceil(maximumDelta / options.maxJointStep)));
@@ -240,11 +292,13 @@ namespace motion_planning
         std::vector<double> sample(from.size(), 0.0);
         for (std::size_t step = 0; step <= stepCount; ++step)
         {
+            if(options.cancelled && options.cancelled())
+                return StateValidationResult::failure("cancelled", "Motion validation cancelled.");
             const double ratio = static_cast<double>(step) / static_cast<double>(stepCount);
             for (std::size_t index = 0; index < sample.size(); ++index)
             {
                 const JointBound& bound = m_impl->jointBounds[index];
-                const double delta = bound.continuous
+                const double delta = bound.continuous && !options.preserveJointTurns
                     ? shortestContinuousDelta(from[index], to[index])
                     : to[index] - from[index];
                 sample[index] = from[index] + delta * ratio;
@@ -264,6 +318,20 @@ namespace motion_planning
             }
         }
         return StateValidationResult::success();
+    }
+
+    void ProjectPlanningSceneSnapshot::useConservativeMotionValidation(
+        const collision::MotionQueryRequest& request,const std::vector<std::string>& collisionFreeLinks)
+    {
+        m_impl->motionRequest=request;
+        m_impl->motionRequest.mode=collision::MotionQueryMode::Conservative;
+        m_impl->collisionFreeLinks=collisionFreeLinks;
+        m_impl->conservativeMotion=true;
+    }
+
+    void ProjectPlanningSceneSnapshot::useSampledMotionValidation()
+    {
+        m_impl->conservativeMotion=false;
     }
 
     const std::string& ProjectPlanningSceneSnapshot::robotId() const
@@ -289,6 +357,7 @@ namespace motion_planning
     PlanningSceneDistanceSample ProjectPlanningSceneSnapshot::nearestDistance(
         const std::vector<double>& jointValues)
     {
+        ++m_impl->queries.nearestDistanceRequests;
         PlanningSceneDistanceSample sample;
         if(!setState(jointValues, &sample.message)) { return sample; }
         double minimum = std::numeric_limits<double>::infinity();
@@ -306,6 +375,7 @@ namespace motion_planning
                 fail("detector unavailable");
                 continue;
             }
+            ++m_impl->queries.collisionDetectorChecks;
             const auto checked = runtime.checkDetector(id);
             const auto* result = runtime.resultOf(id);
             if(!checked.success || !result) { fail("collision query failed"); continue; }
@@ -319,6 +389,7 @@ namespace motion_planning
                 options.distanceThreshold = std::numeric_limits<double>::max();
                 collision::CollisionResult nearest;
                 auto& scene = const_cast<collision::CollisionScene&>(runtime.scene());
+                ++m_impl->queries.distanceDetectorQueries;
                 scene.distance(options, nearest);
                 distance = nearest.minDistance;
                 if(nearest.status != collision::CollisionStatus::Success ||
@@ -361,6 +432,26 @@ namespace motion_planning
     {
         return m_impl->simulation.attachmentWorldTransform(attachmentId);
     }
+
+    std::string ProjectPlanningSceneSnapshot::virtualBaffleStatus() const
+    { return m_impl->baffles.status().dump(); }
+
+    PlanningSceneQueryCounts ProjectPlanningSceneSnapshot::queryCounts() const {return m_impl->queries;}
+
+    bool ProjectPlanningSceneSnapshot::validateVirtualBaffles(double clearance,std::string& reason) const
+    { ++m_impl->queries.baffleChecks;return m_impl->baffles.validState(m_impl->simulation,clearance,reason); }
+
+    double ProjectPlanningSceneSnapshot::virtualBaffleSearchViolation(double clearance) const
+    { return m_impl->baffles.searchViolation(m_impl->simulation,clearance); }
+
+    std::vector<double> ProjectPlanningSceneSnapshot::virtualBaffleSearchViolations(const std::vector<std::vector<double>>& joints,double clearance,bool gpu)
+    {
+        std::vector<VirtualBaffleEnvironment::SearchPose> poses;poses.reserve(joints.size());
+        for(const auto& q:joints)poses.push_back(setState(q)?m_impl->baffles.captureSearchPose(m_impl->simulation):VirtualBaffleEnvironment::SearchPose{});
+        return m_impl->baffles.searchViolationBatch(poses,clearance,gpu);
+    }
+    std::string ProjectPlanningSceneSnapshot::virtualBaffleSearchStatus() const
+    { return m_impl->baffles.gpuSearchStatus().dump(); }
 
     simulation_runtime::ProjectSimulationRuntime& ProjectPlanningSceneSnapshot::simulationRuntime()
     {
@@ -497,7 +588,18 @@ namespace motion_planning
             selectedDetectors.end());
         const simulation_runtime::CollisionDetectorBuildPlan buildPlan =
             simulation_runtime::ProjectCollisionDetectorBuilder::collectBuildPlan(selectedDetectorDocument);
-        if (!buildPlan.requiresRobot(request.robotId))
+        // A selected mounted tool moves with its owning robot even when no
+        // robot link is selected. Use resolved runtime ownership (also handles
+        // legacy/synthetic mounts); keep the user's exact detector selection.
+        const bool selectedOwnedAttachment = std::any_of(
+            impl->simulation.mountedAttachments().begin(),
+            impl->simulation.mountedAttachments().end(),
+            [&](const simulation_runtime::RuntimeMountedAttachment& attachment) {
+                return attachment.owner.valid && attachment.owner.robotId == request.robotId &&
+                    attachment.collision.enabled && buildPlan.requiresAttachment(
+                        attachment.documentId, attachment.name, attachment.kind);
+            });
+        if (!buildPlan.requiresRobot(request.robotId) && !selectedOwnedAttachment)
         {
             setError(errorMessage, "Selected project collision detectors do not include the planning robot: " + request.robotId);
             return nullptr;
@@ -518,6 +620,7 @@ namespace motion_planning
             }
         }
 
+        impl->baffles.build(impl->simulation);
         setError(errorMessage, std::string());
         return std::unique_ptr<ProjectPlanningSceneSnapshot>(
             new ProjectPlanningSceneSnapshot(std::move(impl)));

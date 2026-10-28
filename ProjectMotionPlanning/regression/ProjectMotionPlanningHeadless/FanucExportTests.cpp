@@ -81,6 +81,46 @@ int main()
             ++count;
         }
         require(count == result.pointCount, "Parse every POS record");
+        motion_planning::StoredMotionPlan cartesian;
+        for(const auto& point : plan.trajectory.points) {
+            auto q = point.q;
+            for(int j : {0, 3, 4, 5}) q[j] = -q[j];
+            cartesian.cartesianControlPoints.points.emplace_back();
+            auto& target = cartesian.cartesianControlPoints.points.back();
+            target.time = point.time; target.tcpPose = poseFor(q);
+        }
+        // The configured FK deliberately fails if called again. Direct Cartesian
+        // export must use only target poses, even if joint-related options are set.
+        const auto direct = motion_planning::ProjectFanucTrajectoryExporter::generateCartesian(cartesian, options);
+        require(direct.success && direct.program == result.program && evaluated == 1007,
+            "Cartesian path shares CDF WPR/template/poles and never calls FK");
+        motion_planning::StoredMotionPlan crossing;
+        for(int i=0;i<81;++i) {
+            robottrajectory::TimedCartesianPoint point;point.time=i*.1;
+            point.tcpPose=poseFor({0,0,0,(170+i*.25)*pi/180,.3,(170+i*.25)*pi/180});
+            crossing.cartesianControlPoints.points.push_back(point);
+        }
+        const auto continuous=motion_planning::ProjectFanucTrajectoryExporter::generateCartesian(crossing);
+        require(continuous.success,continuous.error);std::vector<double> previousAngles;
+        for(auto it=std::sregex_iterator(continuous.program.begin(),continuous.program.end(),position);it!=std::sregex_iterator();++it) {
+            std::vector<double> angles;for(int j=0;j<3;++j)angles.push_back(std::stod((*it)[j+5]));
+            if(!previousAngles.empty())for(int j=0;j<3;++j)require(std::abs(angles[j]-previousAngles[j])<1,"Artificial WPR flip across +/-180 degrees");
+            previousAngles=angles;
+        }
+        require(!previousAngles.empty(),"Continuous WPR test parsed no positions");
+        auto invalidCartesian = cartesian;
+        invalidCartesian.cartesianControlPoints.points.back().tcpPose.translation().x() = std::numeric_limits<double>::infinity();
+        const auto rejected = motion_planning::ProjectFanucTrajectoryExporter::generateCartesian(invalidCartesian, options);
+        require(!rejected.success && rejected.program.empty() && rejected.pointCount == 0, "Invalid final Cartesian point rejected atomically");
+        invalidCartesian = cartesian;
+        invalidCartesian.cartesianControlPoints.points.back().tcpPose.linear() *= -1;
+        require(!motion_planning::ProjectFanucTrajectoryExporter::generateCartesian(invalidCartesian, options).success,
+            "Reject reflected Cartesian orientation");
+        invalidCartesian = cartesian;
+        invalidCartesian.cartesianControlPoints.points.back().time = std::numeric_limits<double>::quiet_NaN();
+        require(!motion_planning::ProjectFanucTrajectoryExporter::generateCartesian(invalidCartesian, options).success, "Reject invalid Cartesian time");
+        invalidCartesian.cartesianControlPoints.points.clear();
+        require(!motion_planning::ProjectFanucTrajectoryExporter::generateCartesian(invalidCartesian, options).success, "Reject empty Cartesian path");
         options.mapIrb4600StoredJointSigns = false;
         options.worldTcpForwardKinematics = poseFor;
         const auto reject = [&](const auto& input, const auto& settings) {

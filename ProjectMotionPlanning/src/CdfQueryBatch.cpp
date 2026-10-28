@@ -1,10 +1,12 @@
 #include "CdfQueryBatch.h"
 
 #include <algorithm>
+#include <cmath>
 #include <atomic>
 #include <chrono>
 #include <sstream>
 #include <thread>
+#include <stdexcept>
 
 namespace motion_planning::detail
 {
@@ -17,9 +19,9 @@ namespace motion_planning::detail
             std::vector<double> key{margin, horizon};
             key.insert(key.end(), q.begin(), q.end()); return key;
         }
-        std::vector<double> motionKey(const std::vector<double>& a, const std::vector<double>& b, double step)
+        std::vector<double> motionKey(const std::vector<double>& a, const std::vector<double>& b, const MotionValidationOptions& options)
         {
-            std::vector<double> key{step, static_cast<double>(a.size())};
+            std::vector<double> key{options.maxJointStep,options.preserveJointTurns?1.:0.,static_cast<double>(options.maxSamples),static_cast<double>(a.size())};
             key.insert(key.end(), a.begin(), a.end()); key.insert(key.end(), b.begin(), b.end()); return key;
         }
         double secondsSince(Clock::time_point start)
@@ -37,8 +39,8 @@ namespace motion_planning::detail
 
     CdfQueryBatch::CdfQueryBatch(ProjectPlanningSceneSnapshot& primary,
         const simulation_project::ProjectDocument& document, const std::filesystem::path& base,
-        const ProjectPlanningRequest& request, int requestedWorkers, bool cacheEnabled)
-        : m_cacheEnabled(cacheEnabled)
+        const ProjectPlanningRequest& request, int requestedWorkers, bool cacheEnabled, std::function<bool()> cancelled)
+        : m_cacheEnabled(cacheEnabled), m_cancelled(std::move(cancelled))
     {
         m_scenes.push_back(&primary);
         const int hardware = static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
@@ -68,6 +70,7 @@ namespace motion_planning::detail
     {
         try {
             for(std::size_t i = m_next.fetch_add(1); i < m_count; i = m_next.fetch_add(1)) {
+                if(m_cancelled && m_cancelled()) throw std::runtime_error("Planning cancelled.");
                 m_work(worker, i);
             }
         } catch(...) {
@@ -96,9 +99,12 @@ namespace motion_planning::detail
         const std::function<void(std::size_t, std::size_t)>& work)
     {
         if(count == 0) { return; }
-        const std::size_t workers = std::min(m_scenes.size(), std::max<std::size_t>(1, count / 2));
+        const std::size_t workers = std::min(m_scenes.size(), std::max<std::size_t>(1, count));
         if(workers == 1) {
-            for(std::size_t i = 0; i < count; ++i) { work(0, i); }
+            for(std::size_t i = 0; i < count; ++i) {
+                if(m_cancelled && m_cancelled()) throw std::runtime_error("Planning cancelled.");
+                work(0, i);
+            }
             return;
         }
         // Start once, on the first parallel batch. Subsequent short APF/smoothing
@@ -127,6 +133,41 @@ namespace motion_planning::detail
         m_jobDone.wait(lock, [&]() { return m_remaining == 0; });
         m_work = {};
         if(m_error) { std::rethrow_exception(m_error); }
+    }
+
+    void CdfQueryBatch::kinematics(std::size_t count, const std::function<void(std::size_t)>& work)
+    {
+        parallelFor(count,[&](std::size_t,std::size_t i){work(i);});
+    }
+
+    std::vector<CdfQueryBatch::StateCheck> CdfQueryBatch::states(const std::vector<std::vector<double>>& values, double clearance)
+    {
+        std::vector<StateCheck> out(values.size());
+        parallelFor(values.size(),[&](std::size_t worker,std::size_t i){
+            auto& scene=*m_scenes[worker];auto& validation=out[i].validation;validation=scene.validateState(values[i]);
+            if(validation.diagnosticCode=="state_in_collision"){
+                double depth=0;
+                for(const auto& id:scene.collisionDetectorIds()){const auto* result=scene.collisionRuntime().resultOf(id);
+                    if(result && result->inCollision())for(const auto& c:result->contacts)if(std::isfinite(c.penetrationDepth))depth=std::max(depth,c.penetrationDepth);}
+                if(depth>0)out[i].penetration=depth;
+            }
+            if(!validation.valid || clearance<=0)return;
+            std::string error;
+            if(!scene.validateVirtualBaffles(clearance,error)){validation=StateValidationResult::failure("virtual_baffle_collision",error);return;}
+            const auto nearest=scene.nearestDistance(values[i]);
+            if(!nearest.valid || !std::isfinite(nearest.distanceMeters) || nearest.distanceMeters<clearance)
+                validation=StateValidationResult::failure("clearance_unavailable_or_too_small","Clearance query rejected the state.");
+        });
+        return out;
+    }
+
+    PlanningSceneQueryCounts CdfQueryBatch::additionalQueryCounts() const
+    {
+        PlanningSceneQueryCounts out;
+        for(std::size_t i=1;i<m_scenes.size();++i){const auto counts=m_scenes[i]->queryCounts();out.stateValidationRequests+=counts.stateValidationRequests;
+            out.collisionDetectorChecks+=counts.collisionDetectorChecks;out.baffleChecks+=counts.baffleChecks;
+            out.nearestDistanceRequests+=counts.nearestDistanceRequests;out.distanceDetectorQueries+=counts.distanceDetectorQueries;}
+        return out;
     }
 
     void CdfQueryBatch::rememberDistance(const std::vector<double>& key, const SignedDistanceSample& sample)
@@ -217,21 +258,27 @@ namespace motion_planning::detail
         const auto started = Clock::now();
         const auto count = path.empty() ? 0 : path.size() - 1;
         std::vector<StateValidationResult> values(count);
+        if(options.cancelled && options.cancelled()) {
+            std::fill(values.begin(),values.end(),StateValidationResult::failure("cancelled","Planning cancelled.")); return values;
+        }
         std::vector<std::size_t> missing;
+        // Raw unwrapped endpoints, turn policy, resolution and sample budget are
+        // all part of the key. No certificate crosses this immutable repair job.
+        const bool cacheThisRequest = useCache && m_cacheEnabled;
         for(std::size_t i = 0; i < count; ++i) {
-            const auto found = m_motions.find(motionKey(path[i], path[i + 1], options.maxJointStep));
-            if(useCache && m_cacheEnabled && found != m_motions.end()) { values[i] = found->second; ++m_motionHits; }
+            const auto found = m_motions.find(motionKey(path[i], path[i + 1], options));
+            if(cacheThisRequest && found != m_motions.end()) { values[i] = found->second; ++m_motionHits; }
             else { missing.push_back(i); }
         }
         parallelFor(missing.size(), [&](std::size_t worker, std::size_t offset) {
             const auto i = missing[offset];
             values[i] = m_scenes[worker]->validateMotion(path[i], path[i + 1], options);
         });
-        if(m_cacheEnabled && useCache) {
+        if(cacheThisRequest) {
             for(auto i : missing) {
                 if(m_motions.size() >= kCacheEntries) { m_motions.clear(); }
                 // Cache only reliable valid results, never a transient runtime failure.
-                if(values[i].valid) { m_motions[motionKey(path[i], path[i + 1], options.maxJointStep)] = values[i]; }
+                if(values[i].valid) { m_motions[motionKey(path[i], path[i + 1], options)] = values[i]; }
             }
         }
         m_motionSeconds += secondsSince(started); return values;
@@ -241,12 +288,13 @@ namespace motion_planning::detail
     {
         // Used for small smoothing windows: stop remaining work once any edge is
         // invalid, preserving acceptance while avoiding unnecessary mesh queries.
+        if((m_cancelled && m_cancelled()) || (options.cancelled && options.cancelled()))return false;
         const auto started = Clock::now();
         const auto count = path.empty() ? 0 : path.size() - 1;
         std::vector<StateValidationResult> values(count);
         std::vector<std::size_t> missing;
         for(std::size_t i = 0; i < count; ++i) {
-            const auto found = m_motions.find(motionKey(path[i], path[i + 1], options.maxJointStep));
+            const auto found = m_motions.find(motionKey(path[i], path[i + 1], options));
             if(m_cacheEnabled && found != m_motions.end()) { ++m_motionHits; }
             else { missing.push_back(i); }
         }
@@ -260,7 +308,7 @@ namespace motion_planning::detail
         if(m_cacheEnabled) {
             for(auto i : missing) {
                 if(m_motions.size() >= kCacheEntries) { m_motions.clear(); }
-                if(values[i].valid) { m_motions[motionKey(path[i], path[i + 1], options.maxJointStep)] = values[i]; }
+                if(values[i].valid) { m_motions[motionKey(path[i], path[i + 1], options)] = values[i]; }
             }
         }
         m_motionSeconds += secondsSince(started); return valid.load();

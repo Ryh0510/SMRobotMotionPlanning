@@ -45,13 +45,6 @@ namespace motion_planning
             }
         }
 
-        bool containsCaseSensitive(
-            const std::string& text,
-            const std::string& token)
-        {
-            return text.find(token) != std::string::npos;
-        }
-
         const simulation_project::RobotDesc* findRobot(
             const simulation_project::ProjectDocument& document,
             const std::string& robotId)
@@ -65,11 +58,16 @@ namespace motion_planning
             return it == document.robots.end() ? nullptr : &(*it);
         }
 
-        const simulation_project::RobotDesc* findBurnnerRobot(
+        const simulation_project::RobotDesc* findObstacleRobot(
             const simulation_project::ProjectDocument& document,
             const ProjectCdfQpRepairOptions& options,
             const std::string& planningRobotId)
         {
+            // An explicitly linked freeform workpiece takes priority over the
+            // legacy burnner demo robot, even when both are in the scene.
+            if(std::any_of(document.objects.begin(),document.objects.end(),[&](const auto& object) {
+                return object.id == options.obstacleId;
+            })) return nullptr;
             const auto exactIt = std::find_if(
                 document.robots.begin(),
                 document.robots.end(),
@@ -80,19 +78,10 @@ namespace motion_planning
                 return &(*exactIt);
             }
 
-            const auto sourceIt = std::find_if(
-                document.robots.begin(),
-                document.robots.end(),
-                [&](const simulation_project::RobotDesc& robot) {
-                    return robot.id != planningRobotId &&
-                        (containsCaseSensitive(robot.id, "burnner") ||
-                         containsCaseSensitive(robot.name, "burnner") ||
-                         containsCaseSensitive(robot.sourcePath, "burnner"));
-                });
-            return sourceIt == document.robots.end() ? nullptr : &(*sourceIt);
+            return nullptr;
         }
 
-        const simulation_project::SceneObjectDesc* findBurnnerObject(
+        const simulation_project::SceneObjectDesc* findObstacleObject(
             const simulation_project::ProjectDocument& document,
             const ProjectCdfQpRepairOptions& options)
         {
@@ -106,15 +95,7 @@ namespace motion_planning
                 return &(*exactIt);
             }
 
-            const auto sourceIt = std::find_if(
-                document.objects.begin(),
-                document.objects.end(),
-                [](const simulation_project::SceneObjectDesc& object) {
-                    return containsCaseSensitive(object.id, "burnner") ||
-                        containsCaseSensitive(object.name, "burnner") ||
-                        containsCaseSensitive(object.sourcePath, "burnner");
-                });
-            return sourceIt == document.objects.end() ? nullptr : &(*sourceIt);
+            return nullptr;
         }
 
         bool hasDetector(
@@ -137,7 +118,8 @@ namespace motion_planning
         {
             simulation_project::CollisionDetectorDesc detector;
             detector.id = detectorId;
-            detector.name = "CDF ABB4600-burnner detector";
+            detector.name = "CDF " + planningRobotId + " - " +
+                (options.obstacleName.empty() ? options.obstacleId : options.obstacleName) + " detector";
             detector.type = "RobotRobot";
             detector.enabled = true;
             detector.geometryRole = "Exact";
@@ -171,7 +153,8 @@ namespace motion_planning
         {
             simulation_project::CollisionDetectorDesc detector;
             detector.id = detectorId;
-            detector.name = "CDF ABB4600-burnner detector";
+            detector.name = "CDF " + planningRobotId + " - " +
+                (options.obstacleName.empty() ? options.obstacleId : options.obstacleName) + " detector";
             detector.type = "RobotObject";
             detector.enabled = true;
             detector.geometryRole = "Exact";
@@ -866,10 +849,15 @@ namespace motion_planning
                     oracle.motionValid = [&](const auto& a, const auto& b) {
                         return queries.pathValid({a, b}, validation);
                     };
+                    oracle.stepSize=options.apfStepSize;
+                    oracle.influenceDistance=options.apfInfluenceDistance;
+                    oracle.repulsionGain=options.apfRepulsionGain;
+                    oracle.iterationBudget=options.apfIterationBudget;
                     detail::ApfGuidance localGuide;
                     if(guidance) {
                         localGuide = *guidance;
                         localGuide.positions.assign(guidance->positions.begin()+begin, guidance->positions.begin()+end+1);
+                        if(guidance->projectStation) localGuide.projectStation=[&,begin](auto& q,std::size_t i){return guidance->projectStation(q,begin+i);};
                     }
                     detail::ApfPath replacement;
                     // Use the configured clearance; the old 5 mm floor silently
@@ -1445,7 +1433,8 @@ namespace motion_planning
             const ProjectCdfQpRepairOptions& options,
             ProjectCdfQpRepairStatistics* statistics,
             std::vector<MotionPlanningDiagnostic>* diagnostics,
-            std::vector<std::vector<double>>* repairedPath)
+            std::vector<std::vector<double>>* repairedPath,
+            const std::function<bool(std::vector<std::vector<double>>&)>& project = {})
         {
             if(repairedPath == nullptr || statistics == nullptr) {
                 return false;
@@ -1545,8 +1534,9 @@ namespace motion_planning
                 const int currentInvalidSegments = countInvalidSegments(path);
                 std::vector<std::vector<double>> candidatePath = qpResult.path;
                 if(options.progress) options.progress("Validating QP candidate clearance and motion");
-                double candidatePhi = evaluatePathMinimum(candidatePath);
-                int candidateInvalidSegments = countInvalidSegments(candidatePath);
+                const bool projected = !project || project(candidatePath);
+                double candidatePhi = projected ? evaluatePathMinimum(candidatePath) : -std::numeric_limits<double>::max();
+                int candidateInvalidSegments = projected ? countInvalidSegments(candidatePath) : 1;
 
                 if(candidateInvalidSegments == 0 &&
                     (currentInvalidSegments > 0 || candidatePhi >= std::min(currentPhi, targetPhi) - 1.0e-9))
@@ -1557,8 +1547,9 @@ namespace motion_planning
                     double alpha = 0.5;
                     for(int backtrack = 0; backtrack < 5; ++backtrack) {
                         std::vector<std::vector<double>> blended = blendPath(path, qpResult.path, alpha);
-                        const double blendedPhi = evaluatePathMinimum(blended);
-                        const int blendedInvalidSegments = countInvalidSegments(blended);
+                        const bool projected = !project || project(blended);
+                        const double blendedPhi = projected ? evaluatePathMinimum(blended) : -std::numeric_limits<double>::max();
+                        const int blendedInvalidSegments = projected ? countInvalidSegments(blended) : 1;
                         if(blendedInvalidSegments == 0 &&
                             (currentInvalidSegments > 0 || blendedPhi >= std::min(currentPhi, targetPhi) - 1.0e-9))
                         {
@@ -1583,6 +1574,50 @@ namespace motion_planning
         }
     }
 
+    bool ProjectCdfQpTrajectoryRepairService::collisionSetupConfigured(
+        const simulation_project::ProjectDocument& document,const std::string& robotId,
+        const ProjectCdfQpRepairOptions& options)
+    {
+        if(!document.collision.query.enabled || !findRobot(document,robotId))return false;
+        const auto object=std::find_if(document.objects.begin(),document.objects.end(),
+            [&](const auto& o){return o.id==options.obstacleId;});
+        if(object==document.objects.end() && !findRobot(document,options.obstacleId))return false;
+        for(const auto& d:document.collision.detectors) {
+            if(d.id!=options.detectorId || !d.enabled || !d.distance || !d.nearestPoints)continue;
+            const auto target=[&](const std::string& id) {return std::any_of(d.targets.begin(),d.targets.end(),
+                [&](const auto& t){return t.robotId==id || t.objectId==id;});};
+            if(!target(robotId) || !target(options.obstacleId))continue;
+            for(const auto& g:d.pairGenerators) {
+                if(g.type=="RobotObject" && g.robotId==robotId && g.objectId==options.obstacleId)return true;
+                if(g.type=="RobotRobot" && ((g.robotA==robotId && g.robotB==options.obstacleId) ||
+                    (g.robotB==robotId && g.robotA==options.obstacleId)))return true;
+            }
+        }
+        return false;
+    }
+
+    std::vector<std::string> ProjectCdfQpTrajectoryRepairService::distanceDetectorIds(
+        const simulation_project::ProjectDocument& document,const std::string& robotId)
+    {
+        std::vector<std::string> ids;
+        if(!document.collision.query.enabled)return ids;
+        for(const auto& d:document.collision.detectors) {
+            if(!d.enabled || !d.distance || !d.nearestPoints)continue;
+            const auto setTargetsRobot=[&](const std::string& setId) {
+                return std::any_of(document.collision.selectionSets.begin(),document.collision.selectionSets.end(),[&](const auto& set) {
+                    return set.enabled && set.id==setId && std::any_of(set.members.begin(),set.members.end(),
+                        [&](const auto& member){return member.robotId==robotId;});
+                });
+            };
+            const bool target=std::any_of(d.targets.begin(),d.targets.end(),[&](const auto& t){return t.robotId==robotId;});
+            const bool pair=std::any_of(d.pairGenerators.begin(),d.pairGenerators.end(),[&](const auto& g) {
+                return g.robotId==robotId || g.robotA==robotId || g.robotB==robotId;
+            });
+            if(target || pair || setTargetsRobot(d.selectionSetAId) || setTargetsRobot(d.selectionSetBId))ids.push_back(d.id);
+        }
+        return ids;
+    }
+
     bool ProjectCdfQpTrajectoryRepairService::ensureCollisionSetup(
         simulation_project::ProjectDocument& document,
         const std::string& robotId,
@@ -1599,31 +1634,34 @@ namespace motion_planning
             return false;
         }
 
-        document.collision.query.enabled = true;
+        if(!options.detectorIds.empty()) {
+            if(!document.collision.query.enabled) {
+                addDiagnostic(diagnostics,"cdf_collision_disabled","Global collision queries are disabled."); return false;
+            }
+            for(const auto& id:options.detectorIds) {
+                const auto it=std::find_if(document.collision.detectors.begin(),document.collision.detectors.end(),
+                    [&](const auto& d){return d.id==id && d.enabled;});
+                if(it==document.collision.detectors.end()) {
+                    addDiagnostic(diagnostics,"cdf_detector_missing","Selected enabled detector not found: "+id); return false;
+                }
+            }
+            if(detectorId) *detectorId=options.detectorIds.front();
+            return true;
+        }
 
         const simulation_project::RobotDesc* obstacleRobot =
-            findBurnnerRobot(document, options, robotId);
+            findObstacleRobot(document, options, robotId);
         const simulation_project::SceneObjectDesc* obstacleObject =
-            obstacleRobot == nullptr ? findBurnnerObject(document, options) : nullptr;
+            obstacleRobot == nullptr ? findObstacleObject(document, options) : nullptr;
 
         if(obstacleRobot == nullptr && obstacleObject == nullptr) {
-            simulation_project::RobotDesc burnner;
-            burnner.id = options.obstacleId;
-            burnner.name = options.obstacleName.empty() ? options.obstacleId : options.obstacleName;
-            burnner.sourceType = "urdf";
-            burnner.sourcePath = options.obstacleRobotSourcePath;
-            burnner.collisionEnabled = true;
-            burnner.visible = true;
-            burnner.baseTransform.x = options.obstacleX;
-            burnner.baseTransform.y = options.obstacleY;
-            burnner.baseTransform.z = options.obstacleZ;
-            burnner.baseTransform.roll = options.obstacleRoll;
-            burnner.baseTransform.pitch = options.obstaclePitch;
-            burnner.baseTransform.yaw = options.obstacleYaw;
-            document.robots.push_back(std::move(burnner));
-            obstacleRobot = &document.robots.back();
-            addDiagnostic(diagnostics, "cdf_burnner_added", "Added burnner as a static URDF robot obstacle for CDF/QP planning.");
+            addDiagnostic(diagnostics, "cdf_obstacle_missing",
+                "Collision target is not present in the project: " + options.obstacleId +
+                ". Add the workpiece explicitly; deleted scene entities are never recreated.");
+            return false;
         }
+
+        document.collision.query.enabled = true;
 
         const std::string selectedDetectorId = options.detectorId.empty()
             ? std::string("cdf_abb4600_burnner_detector")
@@ -1668,6 +1706,10 @@ namespace motion_planning
         auto seedTrajectory = inputTrajectory;
         bool usedEquivalentSeed = false;
         ProjectCdfQpRepairResult result;
+        try {
+        if(options.cancelled && options.cancelled()) {
+            result.cancelled=true; addDiagnostic(&result.diagnostics,"cdf_cancelled","Planning cancelled."); return result;
+        }
         result.statistics.inputWaypointCount = static_cast<int>(seedTrajectory.points.size());
         if(!std::isfinite(options.apfMaxTcpDeviation) || options.apfMaxTcpDeviation < 0.0 ||
             (options.apfMaxTcpDeviation > 0.0 && !options.worldForwardKinematics)) {
@@ -1680,7 +1722,7 @@ namespace motion_planning
             return result;
         }
         if(robotId.empty()) {
-            addDiagnostic(&result.diagnostics, "cdf_missing_robot_id", "Select ABB4600_urdf before running CDF/QP repair.");
+            addDiagnostic(&result.diagnostics, "cdf_missing_robot_id", "Select a planning robot before running CDF/QP repair.");
             return result;
         }
         if(jointNames.empty()) {
@@ -1702,11 +1744,12 @@ namespace motion_planning
         const std::string detectorId = options.detectorId.empty()
             ? std::string("cdf_abb4600_burnner_detector")
             : options.detectorId;
-        if(!hasDetector(document, detectorId)) {
+        const auto detectorIds=options.detectorIds.empty()?std::vector<std::string>{detectorId}:options.detectorIds;
+        for(const auto& selectedId:detectorIds) if(!hasDetector(document, selectedId)) {
             addDiagnostic(
                 &result.diagnostics,
                 "cdf_detector_missing",
-                "CDF/QP collision detector is not configured in the project: " + detectorId);
+                "CDF/QP collision detector is not configured in the project: " + selectedId);
             return result;
         }
 
@@ -1716,7 +1759,7 @@ namespace motion_planning
                 planningDocument.collision.detectors.begin(),
                 planningDocument.collision.detectors.end(),
                 [&](const simulation_project::CollisionDetectorDesc& detector) {
-                    return detector.id != detectorId;
+                    return std::find(detectorIds.begin(),detectorIds.end(),detector.id)==detectorIds.end();
                 }),
             planningDocument.collision.detectors.end());
 
@@ -1725,11 +1768,14 @@ namespace motion_planning
         request.jointNames = jointNames;
         request.start = seedTrajectory.points.front().q;
         request.goal = seedTrajectory.points.back().q;
-        request.collisionDetectorIds = { detectorId };
+        request.collisionDetectorIds = detectorIds;
         // Every accepted APF, QP and smoothing segment must use the same
         // resolution as the final gate. A coarser earlier check can miss thin
         // contacts and leave shape restoration with an invalid fallback path.
         request.validation.maxJointStep = std::min(options.validationMaxJointStep, 0.00025);
+        // Repair validates the stored joint polyline, including explicitly chosen turns.
+        request.validation.preserveJointTurns = true;
+        request.validation.cancelled = options.cancelled;
         if(options.progress) options.progress("Collision validation step (all stages): "
             + std::to_string(request.validation.maxJointStep) + " rad");
 
@@ -1743,6 +1789,14 @@ namespace motion_planning
         if(!scene) {
             addDiagnostic(&result.diagnostics, "cdf_scene_build_failed", sceneError);
             return result;
+        }
+        if(!options.detectorIds.empty()) {
+            for(const auto& id:options.detectorIds) {
+                const auto pairs=scene->collisionRuntime().pairDiagnostics(id);
+                if(!std::any_of(pairs.begin(),pairs.end(),[](const auto& p){return p.effective;})) {
+                    addDiagnostic(&result.diagnostics,"cdf_empty_detector","No effective collision pairs: "+id); return result;
+                }
+            }
         }
 
         if(!options.cartesianTargets.empty()) {
@@ -1804,7 +1858,7 @@ namespace motion_planning
             }
         }
 
-        detail::CdfQueryBatch queries(*scene, planningDocument, projectBaseOrParent(projectBasePath), request, options.queryWorkers);
+        detail::CdfQueryBatch queries(*scene, planningDocument, projectBaseOrParent(projectBasePath), request, options.queryWorkers,true,options.cancelled);
         if(options.progress) options.progress("CDF query workers: " + std::to_string(queries.workerCount()));
 
         result.referenceSeedTrajectory = seedTrajectory;
@@ -1813,8 +1867,8 @@ namespace motion_planning
             densifyTrajectory(
                 seedTrajectory,
                 scene->jointBounds(),
-                options.segmentIntermediateSamples,
-                options.optimizationMaxJointStep, &correspondence);
+                options.densifyKnots ? options.segmentIntermediateSamples : 0,
+                options.densifyKnots ? options.optimizationMaxJointStep : std::numeric_limits<double>::max(), &correspondence);
         result.statistics.inputWaypointCount = static_cast<int>(denseSeedTrajectory.size());
 
         std::vector<std::vector<double>> path;
@@ -1828,7 +1882,7 @@ namespace motion_planning
         path = unwrapContinuousPath(path, scene->jointBounds());
         detail::ApfGuidance tcpGuide;
         const bool constrainTcp = options.apfMaxTcpDeviation > 0.0;
-        if(options.tcpStateAdmissible && (!constrainTcp || !options.worldForwardKinematics)) {
+        if((options.tcpStateAdmissible || options.surfaceProject) && (!constrainTcp || !options.worldForwardKinematics)) {
             addDiagnostic(&result.diagnostics, "tcp_constraint_invalid", "TCP process constraint requires actual FK and an enabled ordered TCP guide.");
             return result;
         }
@@ -1857,6 +1911,21 @@ namespace motion_planning
                     for(int j = 0; j < 3; ++j) p[j] += station.second * (controlPositions[station.first+1][j] - p[j]);
                 tcpGuide.positions.push_back(std::move(p));
             }
+        }
+        if(options.surfaceProject) tcpGuide.projectStation = [&](auto& q,std::size_t i) {
+            return i<correspondence.size() && options.surfaceProject(q,correspondence[i].first,correspondence[i].second);
+        };
+        const auto projectCandidate = [&](auto& candidate,std::size_t begin=0) {
+            if(!tcpGuide.projectStation)return true;
+            for(std::size_t i=0;i<candidate.size();++i) {
+                // Exact endpoint joints remain immutable, including shared scan boundaries.
+                if(begin+i==0 || begin+i+1==path.size())continue;
+                if(!tcpGuide.projectStation(candidate[i],begin+i))return false;
+            }
+            return true;
+        };
+        if(!projectCandidate(path)) {
+            addDiagnostic(&result.diagnostics,"surface_mapping_failed","Surface-normal mapping/IK failed for the ordered seed stations."); return result;
         }
         const auto followsReference = [&](const auto& candidate, std::size_t begin = 0) {
             return !constrainTcp || detail::followsApfPath(candidate, tcpGuide, begin);
@@ -1964,6 +2033,12 @@ namespace motion_planning
                 + (options.tcpStateAdmissible ? ". TCP process admissibility is enforced along the ordered path." : ". Position only; no orientation constraint."));
         }
         captureStage(usedEquivalentSeed ? "Continuous IK seed (dense reference)" : "Input (dense reference)", path, result.statistics.initialMinimumPhi, initialInvalidSegments);
+        if(options.stage == ProjectCdfQpRepairOptions::Stage::CdfOnly &&
+            (initialInvalidSegments != 0 || !followsReference(path) || result.statistics.initialMinimumPhi < targetPhi)) {
+            addDiagnostic(&result.diagnostics,"cdf_input_not_collision_free",
+                "CDF requires a freshly validated collision-free complete input. APF was not run in this stage.");
+            return result;
+        }
         if(initialInvalidSegments != 0 || !followsReference(path)) {
             const bool apfRepaired = repairCollisionRunsWithApf(
                 *scene,
@@ -1998,6 +2073,8 @@ namespace motion_planning
         addDiagnostic(&result.diagnostics, "apf_full_path_validated",
             "All trajectory segments passed collision and configured TCP corridor validation before QP/CDF.");
 
+        result.statistics.finalMinimumPhi = apfMinimumPhi;
+        if(options.stage != ProjectCdfQpRepairOptions::Stage::ApfOnly) {
         // Optimize geometry independently of duplicate/dwell source timestamps.
         const auto knotTimes = constrainTcp ? jointPathParameters(tcpGuide.positions, 0.01) : jointPathParameters(path);
         const double smoothingStep = options.postSmoothingStep /
@@ -2014,7 +2091,7 @@ namespace motion_planning
         }
         if(constrainTcp) smoothingOracle.project = [&](auto& q,std::size_t i) {
             return detail::projectApfPosition(q,tcpGuide.positions[i],refinementLower,refinementUpper,tcpGuide,
-                tcpGuide.maxDeviation*0.99);
+                tcpGuide.maxDeviation*0.99,12,i);
         };
         smoothingOracle.progress = [&](int pass, int total) {
             if(options.progress) options.progress("APF curve refinement " + std::to_string(pass+1) + " / " + std::to_string(total));
@@ -2058,7 +2135,10 @@ namespace motion_planning
                     :"No complete validated TCP shape restoration was found; retained the preceding path without relaxing collision or deviation limits.");
         };
         path = unwrapContinuousPath(path, scene->jointBounds());
-        if(options.postSmoothingIterations > 0) {
+        // The explicit CDF stage consumes an independently accepted APF path.
+        // Start its QP immediately instead of repeating APF's pre-QP fairing;
+        // the configured post-QP smoothing and fresh final validation still run.
+        if(options.stage != ProjectCdfQpRepairOptions::Stage::CdfOnly && options.postSmoothingIterations > 0) {
             if(options.progress) options.progress("Smoothing APF seed with collision-validated windows");
             const double beforeLength = detail::jointPathLength(path);
             const double beforeBending = detail::jointPathBending(path, knotTimes);
@@ -2070,14 +2150,17 @@ namespace motion_planning
                 << " -> " << detail::jointPathBending(path, knotTimes) << ".";
             addDiagnostic(&result.diagnostics, "apf_seed_smoothing", message.str());
         }
-        refineShape();
+        if(options.stage != ProjectCdfQpRepairOptions::Stage::CdfOnly)refineShape();
         captureStage("APF (refined, before QP)", path, evaluatePathMinimum(path), 0);
         seedPath = path;
 
         // The complete path has passed the gate above. QP candidates and the
         // final output retain their existing collision acceptance checks.
         for(int iteration = 0; iteration < maxIterations; ++iteration) {
+            const auto beforeQpPath=path;
+            const int acceptedBefore=result.statistics.acceptedQpSteps;
             if(options.progress) options.progress("CDF/QP iteration " + std::to_string(iteration + 1));
+            if(options.previewState && !path.empty()) options.previewState(path[path.size()/2]);
             if(options.progress) options.progress("CDF gradients 0 / " + std::to_string(path.size()));
             auto linearizations = queries.linearizations(path, options.safetyMargin, options.distanceThreshold,
                 options.finiteDifferenceStep, result.statistics);
@@ -2124,10 +2207,11 @@ namespace motion_planning
             const double currentPhi = minimumPhi;
             std::vector<std::vector<double>> candidatePath = qpResult.path;
             if(options.progress) options.progress("Validating QP candidate clearance and motion");
-            double candidatePhi = evaluatePathMinimum(candidatePath);
+            const bool projected=projectCandidate(candidatePath);
+            double candidatePhi = projected ? evaluatePathMinimum(candidatePath) : -std::numeric_limits<double>::max();
             // A failed clearance predicate already rejects this candidate. Keep
             // the same acceptance rule, but avoid an irrelevant full motion scan.
-            if((currentInvalidSegments > 0 || candidatePhi >= std::min(currentPhi, targetPhi) - 1.0e-9) &&
+            if(projected && (currentInvalidSegments > 0 || candidatePhi >= std::min(currentPhi, targetPhi) - 1.0e-9) &&
                 followsReference(candidatePath) && countInvalidSegments(candidatePath) == 0)
             {
                 path = std::move(candidatePath);
@@ -2138,8 +2222,9 @@ namespace motion_planning
                 for(int backtrack = 0; backtrack < 5; ++backtrack) {
                     if(options.progress) options.progress("QP line search " + std::to_string(backtrack + 1) + " / 5");
                     std::vector<std::vector<double>> candidate = blendPath(path, qpResult.path, alpha);
-                    const double blendedPhi = evaluatePathMinimum(candidate);
-                    if((currentInvalidSegments > 0 || blendedPhi >= std::min(currentPhi, targetPhi) - 1.0e-9) &&
+                    const bool projected=projectCandidate(candidate);
+                    const double blendedPhi = projected ? evaluatePathMinimum(candidate) : -std::numeric_limits<double>::max();
+                    if(projected && (currentInvalidSegments > 0 || blendedPhi >= std::min(currentPhi, targetPhi) - 1.0e-9) &&
                         followsReference(candidate) && countInvalidSegments(candidate) == 0)
                     {
                         path = std::move(candidate);
@@ -2151,7 +2236,18 @@ namespace motion_planning
                 }
             }
 
-            if(qpResult.maximumCorrection < 1.0e-5 &&
+            double appliedCorrection=0;
+            for(std::size_t i=0;i<path.size();++i)for(std::size_t j=0;j<path[i].size();++j)
+                appliedCorrection=std::max(appliedCorrection,std::abs(path[i][j]-beforeQpPath[i][j]));
+            addDiagnostic(&result.diagnostics,"cdf_projected_step","iteration="+std::to_string(iteration+1)
+                +"; accepted="+std::to_string(result.statistics.acceptedQpSteps-acceptedBefore)
+                +"; applied_max_rad="+std::to_string(appliedCorrection)
+                +"; bending="+std::to_string(detail::jointPathBending(beforeQpPath,knotTimes))
+                +" -> "+std::to_string(detail::jointPathBending(path,knotTimes)));
+            // Projection back to the fixed surface can remove a QP's proposed
+            // correction. Test the accepted step, rather than repeatedly solving
+            // the same unconstrained proposal at an already feasible fixed point.
+            if(appliedCorrection < 1.0e-5 &&
                 qpResult.maximumSlack < 1.0e-5 &&
                 minimumPhi >= targetPhi) {
                 break;
@@ -2265,6 +2361,7 @@ namespace motion_planning
                         // local smoother after the complete window is collision-free.
                         auto windowGuide = tcpGuide;
                         if(constrainTcp) windowGuide.positions.assign(tcpGuide.positions.begin()+beginIndex, tcpGuide.positions.begin()+endIndex+1);
+                        if(tcpGuide.projectStation) windowGuide.projectStation=[&,beginIndex](auto& q,std::size_t i){return tcpGuide.projectStation(q,beginIndex+i);};
                         const bool apfWindowChanged = repairCollisionRunsWithApf(
                             *scene,
                             queries,
@@ -2291,7 +2388,7 @@ namespace motion_planning
                             localOptions,
                             &result.statistics,
                             &result.diagnostics,
-                            &repairedWindow);
+                            &repairedWindow,[&](auto& candidate){return projectCandidate(candidate,beginIndex) && followsReference(candidate,beginIndex);});
                         if(!windowSolved || repairedWindow.size() != windowPath.size()) {
                             return resultWindow;
                         }
@@ -2422,7 +2519,8 @@ namespace motion_planning
             return result;
         }
 
-        if(countInvalidSegments(path) != 0 && !repairInvalidWindows()) {
+        if(countInvalidSegments(path) != 0 &&
+            (options.stage == ProjectCdfQpRepairOptions::Stage::CdfOnly || !repairInvalidWindows())) {
             addDiagnostic(
                 &result.diagnostics,
                 "cdf_repair_segment_window_invalid",
@@ -2459,6 +2557,8 @@ namespace motion_planning
         if(result.statistics.finalMinimumPhi <= -std::numeric_limits<double>::max() * 0.25) {
             return result;
         }
+
+        } // optional CDF/QP; APF-only proceeds directly to fresh final validation.
 
         // The trajectory player linearly interpolates raw joint values. Output
         // the same continuous chart used by shortest-arc motion validation, even
@@ -2542,5 +2642,24 @@ namespace motion_planning
                 "CDF/QP repair finished but did not reach the requested clearance.");
         }
         return result;
+        } catch(const std::exception& e) {
+            result.success=false; result.plan={};
+            result.cancelled=options.cancelled && options.cancelled();
+            addDiagnostic(&result.diagnostics,result.cancelled?"cdf_cancelled":"cdf_exception",e.what());
+            return result;
+        }
     }
+}
+
+namespace motion_planning::detail {
+std::vector<double> proposeCdfQpPointStep(ProjectPlanningSceneSnapshot& scene,
+    const std::vector<double>& current,const std::vector<double>& seed,const ProjectCdfQpRepairOptions& input) {
+    auto options=input;options.keepEndpoints=false;
+    ProjectCdfQpRepairStatistics statistics;
+    const auto linearization=linearizeSignedPhi(scene,current,scene.jointBounds(),options.safetyMargin,
+        options.distanceThreshold,options.finiteDifferenceStep,statistics);
+    if(!linearization.sample.valid) return {};
+    const auto qp=solveTrajectoryWithOsqp({current},{seed},{linearization},scene.jointBounds(),options);
+    return qp.success && !qp.path.empty()?qp.path.front():std::vector<double>{};
+}
 }

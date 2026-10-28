@@ -64,6 +64,73 @@ namespace
         require(!motion_planning::MotionPlanningProjectStore::removePlan(document, plan.id), "Missing delete fails");
     }
 
+    void verifyJointTcpExport()
+    {
+        using Editor = motion_planning::ProjectTrajectoryControlPointEditor;
+        motion_planning::StoredMotionPlan plan;
+        plan.jointNames = {"J1", "J2", "J3", "J4", "J5", "J6"};
+        // More rows than the GUI table: export must include every final node and endpoint.
+        for(int i = 0; i < 1205; ++i) {
+            robottrajectory::TimedJointPoint point;
+            point.time = i * .125;
+            point.q = {i * .02, .4, -.2, i * .01, -.7, 8.0};
+            plan.trajectory.points.push_back(point);
+        }
+        // Stale source targets must never substitute for the final joint result.
+        plan.cartesianControlPoints.points.push_back(robottrajectory::TimedCartesianPoint{});
+        const auto fk = [](const std::vector<double>& q) {
+            Eigen::Isometry3d pose = Eigen::Isometry3d::Identity();
+            pose.translation() = Eigen::Vector3d(q[0] + 1.2, q[3] - .3, q[5] * .1);
+            pose.linear() = (Eigen::AngleAxisd(q[0], Eigen::Vector3d::UnitZ()) *
+                Eigen::AngleAxisd(q[4], Eigen::Vector3d::UnitY())).toRotationMatrix();
+            return pose;
+        };
+        std::string text, error;
+        const auto path = std::filesystem::current_path() / "final_tcp_matrix_roundtrip.txt";
+        motion_planning::TrajectoryImportOptions options;
+        options.robotId = "test";
+        options.jointNames = plan.jointNames;
+        for(bool mapSigns : {false, true}) {
+            require(Editor::serializeJointTcpMatrices(plan, fk, mapSigns, text, &error), error);
+            { std::ofstream out(path); out << text; }
+            const auto imported = motion_planning::ProjectTrajectoryImporter::importFile(path, options);
+            require(imported.success && imported.plan.cartesianControlPoints.points.size() == 1205,
+                "Export all final joint nodes, not the original control points or sampled table");
+            for(std::size_t i = 0; i < 1205; ++i) {
+                auto runtime = plan.trajectory.points[i].q;
+                if(mapSigns) for(int axis : {0, 3, 4, 5}) runtime[axis] = -runtime[axis];
+                const auto& point = imported.plan.cartesianControlPoints.points[i];
+                require(point.tcpPose.matrix().isApprox(fk(runtime).matrix(), 1e-12),
+                    "Full TCP matrix, millimeters, ABB signs and multi-turn joints survive round trip");
+                require(point.time == plan.trajectory.points[i].time, "Keep every recorded final timestamp");
+            }
+        }
+        std::filesystem::remove(path);
+        text = "untouched";
+        auto invalid = plan;
+        invalid.trajectory.points.back().q.pop_back();
+        require(!Editor::serializeJointTcpMatrices(invalid, fk, true, text, &error), "Reject invalid late joint row");
+        invalid = plan;
+        invalid.trajectory.points.back().time = std::numeric_limits<double>::infinity();
+        require(!Editor::serializeJointTcpMatrices(invalid, fk, true, text, &error), "Reject nonfinite timestamp");
+        invalid = plan;
+        invalid.trajectory.points.back().q[0] = std::numeric_limits<double>::quiet_NaN();
+        require(!Editor::serializeJointTcpMatrices(invalid, fk, true, text, &error), "Reject nonfinite joint");
+        require(!Editor::serializeJointTcpMatrices(plan, {}, true, text, &error), "Require actual-model TCP snapshot");
+        require(!Editor::serializeJointTcpMatrices(plan, [](const auto&) -> Eigen::Isometry3d {
+            throw std::runtime_error("FK failed");
+        }, true, text, &error), "Report FK exception");
+        require(!Editor::serializeJointTcpMatrices(plan, [](const auto&) {
+            Eigen::Isometry3d pose = Eigen::Isometry3d::Identity();
+            pose.linear()(0,0) = 2.0;
+            return pose;
+        }, true, text, &error), "Reject invalid pose");
+        require(text == "untouched", "Failed export never publishes partial output");
+        require(plan.trajectory.points.back().q[5] == 8.0 && plan.cartesianControlPoints.points.size() == 1,
+            "Export leaves source result and legal turns untouched");
+        std::cout << "Final TCP export verified: all nodes, full poses, units, signs, turns, timing and atomic failures.\n";
+    }
+
     void verifyLocalRotations()
     {
         using Editor = motion_planning::ProjectTrajectoryControlPointEditor;
@@ -164,6 +231,7 @@ int main(int argc, char** argv)
 {
     try {
         verifyLocalRotations();
+        verifyJointTcpExport();
         motion_planning::TrajectoryImportOptions options;
         options.robotId = "ABB4600_urdf";
         options.jointNames = {"Joint1", "Joint2", "Joint3", "Joint4", "Joint5", "Joint6"};

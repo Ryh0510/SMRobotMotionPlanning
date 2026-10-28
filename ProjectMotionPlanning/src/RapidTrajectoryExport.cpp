@@ -30,6 +30,46 @@ namespace motion_planning
                 << std::setprecision(9) << rotation.w() << ',' << rotation.x() << ','
                 << rotation.y() << ',' << rotation.z() << "]]";
         }
+
+        std::string serializePoses(const std::vector<Eigen::Isometry3d>& tcpPoses)
+        {
+            std::ostringstream out;
+            out.imbue(std::locale::classic());
+            out << "MODULE MainModule\r\n"
+                << "  ! Trajectory targets with explicitly selected tool0\r\n"
+                << "  ! Generated points: " << tcpPoses.size() << "\r\n"
+                << "  ! Positions: simulation world in mm, mapped to controller wobj0.\r\n"
+                << "  ! Active tool: tool0 (controller built-in flange TCP).\r\n"
+                << "  ! Target coordinates are unchanged; they now specify flange poses.\r\n"
+                << "  ! Orientations: normalized quaternion [w,x,y,z].\r\n"
+                << "  ! robconf [0,0,0,0] is the supplied template placeholder, NOT an IK branch.\r\n"
+                << "  ! Resolve robot configurations in RobotStudio before execution.\r\n"
+                << "  ! MoveL/v50/z10 changes joint interpolation and does not preserve source timing.\r\n"
+                << "  ! Validate controller path, blending and collisions before execution.\r\n\r\n";
+            Eigen::Quaterniond previous = Eigen::Quaterniond::Identity();
+            for(std::size_t i = 0; i < tcpPoses.size(); ++i) {
+                Eigen::Quaterniond rotation(tcpPoses[i].linear());
+                rotation.normalize();
+                if((i == 0 && rotation.w() < 0.0) || (i > 0 && previous.dot(rotation) < 0.0)) {
+                    rotation.coeffs() *= -1.0;
+                }
+                previous = rotation;
+                // robtarget consists of pos, orient, robconf and extax fields.
+                std::ostringstream pose;
+                pose.imbue(std::locale::classic());
+                writePose(pose, tcpPoses[i], rotation);
+                std::string fields = pose.str();
+                fields.pop_back();
+                out << "  CONST robtarget p" << i + 1 << " := " << fields
+                    << ",[0,0,0,0],[9E+09,9E+09,9E+09,9E+09,9E+09,9E+09]];\r\n";
+            }
+            out << "\r\n  PROC main()\r\n";
+            for(std::size_t i = 0; i < tcpPoses.size(); ++i) {
+                out << "    MoveL p" << i + 1 << ", v50, z10, tool0\\WObj:=wobj0;\r\n";
+            }
+            out << "  ENDPROC\r\nENDMODULE\r\n";
+            return out.str();
+        }
     }
 
     RapidTrajectoryExportResult ProjectRapidTrajectoryExporter::generate(
@@ -91,42 +131,7 @@ namespace motion_planning
             if(!validPose(flangeToTcp) || !(flangeToTcp.translation() * 1000.0).allFinite()) {
                 throw std::runtime_error("Invalid flange-to-TCP tool definition.");
             }
-            std::ostringstream out;
-            out.imbue(std::locale::classic());
-            out << "MODULE MainModule\r\n"
-                << "  ! CDF/QP targets with explicitly selected tool0\r\n"
-                << "  ! Generated points: " << tcpPoses.size() << "\r\n"
-                << "  ! Positions: simulation world in mm, mapped to controller wobj0.\r\n"
-                << "  ! Active tool: tool0 (controller built-in flange TCP).\r\n"
-                << "  ! Target coordinates are unchanged; they now specify flange poses.\r\n"
-                << "  ! Orientations: normalized quaternion [w,x,y,z].\r\n"
-                << "  ! robconf [0,0,0,0] is the supplied template placeholder, NOT an IK branch.\r\n"
-                << "  ! Resolve robot configurations in RobotStudio before execution.\r\n"
-                << "  ! MoveL/v50/z10 changes joint interpolation and does not preserve CDF timing.\r\n"
-                << "  ! Validate controller path, blending and collisions before execution.\r\n\r\n";
-            Eigen::Quaterniond previous = Eigen::Quaterniond::Identity();
-            for(std::size_t i = 0; i < tcpPoses.size(); ++i) {
-                Eigen::Quaterniond rotation(tcpPoses[i].linear());
-                rotation.normalize();
-                if((i == 0 && rotation.w() < 0.0) || (i > 0 && previous.dot(rotation) < 0.0)) {
-                    rotation.coeffs() *= -1.0;
-                }
-                previous = rotation;
-                // robtarget consists of pos, orient, robconf and extax fields.
-                std::ostringstream pose;
-                pose.imbue(std::locale::classic());
-                writePose(pose, tcpPoses[i], rotation);
-                std::string fields = pose.str();
-                fields.pop_back();
-                out << "  CONST robtarget p" << i + 1 << " := " << fields
-                    << ",[0,0,0,0],[9E+09,9E+09,9E+09,9E+09,9E+09,9E+09]];\r\n";
-            }
-            out << "\r\n  PROC main()\r\n";
-            for(std::size_t i = 0; i < tcpPoses.size(); ++i) {
-                out << "    MoveL p" << i + 1 << ", v50, z10, tool0\\WObj:=wobj0;\r\n";
-            }
-            out << "  ENDPROC\r\nENDMODULE\r\n";
-            result.program = out.str();
+            result.program = serializePoses(tcpPoses);
             result.pointCount = tcpPoses.size();
             result.success = true;
         } catch(const std::exception& error) {
@@ -134,4 +139,29 @@ namespace motion_planning
         }
         return result;
     }
+
+    RapidTrajectoryExportResult ProjectRapidTrajectoryExporter::generateCartesian(const StoredMotionPlan& plan)
+    {
+        RapidTrajectoryExportResult result;
+        try {
+            if(plan.cartesianControlPoints.empty()) throw std::runtime_error("A Cartesian trajectory is required.");
+            std::vector<Eigen::Isometry3d> poses;
+            poses.reserve(plan.cartesianControlPoints.points.size());
+            for(std::size_t i = 0; i < plan.cartesianControlPoints.points.size(); ++i) {
+                const auto& point = plan.cartesianControlPoints.points[i];
+                if(!std::isfinite(point.time) || !validPose(point.tcpPose) ||
+                    !(point.tcpPose.translation() * 1000.0).allFinite()) {
+                    throw std::runtime_error("Invalid Cartesian pose/time at point " + std::to_string(i + 1));
+                }
+                poses.push_back(point.tcpPose);
+            }
+            result.program = serializePoses(poses);
+            result.pointCount = poses.size();
+            result.success = true;
+        } catch(const std::exception& error) {
+            result.error = error.what();
+        }
+        return result;
+    }
+
 }

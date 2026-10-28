@@ -135,7 +135,7 @@ namespace motion_planning::detail
                 if(amount[i]<=1e-8)continue;
                 auto target=positions[i];
                 for(int j=0;j<3;++j)target[j]+=amount[i]*(targets[i][j]-target[j]);
-                if(!projectApfPosition(candidate[i],target,lower,upper,guidance,0.00002,30))return false;
+                if(!projectApfPosition(candidate[i],target,lower,upper,guidance,0.00002,30,i))return false;
                 const auto actual=guidance.position(candidate[i]);
                 projected[i]=actual.size()==3;
                 if(projected[i])for(double v:actual)if(!std::isfinite(v))projected[i]=false;
@@ -176,7 +176,7 @@ namespace motion_planning::detail
         for(const auto& q:*path)targets.push_back(guidance.position(q));
         ApfOracle projected=oracle;
         projected.project=[&](auto& q,std::size_t i) {
-            if(!projectApfPosition(q,targets[i],lower,upper,guidance,0.0002,20))return false;
+            if(!projectApfPosition(q,targets[i],lower,upper,guidance,0.0002,20,i))return false;
             const auto p=guidance.position(q);
             return p.size()==3 && distance(p,targets[i])<=0.000201;
         };

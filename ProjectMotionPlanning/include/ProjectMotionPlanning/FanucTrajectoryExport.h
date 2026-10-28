@@ -32,5 +32,10 @@ namespace motion_planning
         // match the simulation. No controller calibration or joint-branch conversion.
         static FanucTrajectoryExportResult generate(
             const StoredMotionPlan& plan, const FanucTrajectoryExportOptions& options);
+
+        // Direct world Cartesian poses in meters; no robot model or FK required.
+        // Shares the joint exporter template and WPR conversion.
+        static FanucTrajectoryExportResult generateCartesian(
+            const StoredMotionPlan& plan, const FanucTrajectoryExportOptions& options = {});
     };
 }

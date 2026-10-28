@@ -1,4 +1,7 @@
 #include <ProjectMotionPlanning/TrajectoryControlPointEditing.h>
+#include <ProjectMotionPlanning/TrajectoryInverseKinematics.h>
+
+#include <exception>
 
 #include <algorithm>
 #include <cmath>
@@ -255,6 +258,51 @@ bool ProjectTrajectoryControlPointEditor::serializeCartesianMatrices(const Store
     }
     text = output.str();
     return true;
+}
+
+bool ProjectTrajectoryControlPointEditor::serializeJointTcpMatrices(const StoredMotionPlan& plan,
+    const std::function<Eigen::Isometry3d(const std::vector<double>&)>& worldTcpForwardKinematics,
+    bool mapIrb4600StoredJointSigns, std::string& text, std::string* errorMessage)
+{
+    if(plan.trajectory.empty() || plan.jointNames.empty() || !worldTcpForwardKinematics ||
+        (mapIrb4600StoredJointSigns && plan.jointNames.size() != 6)) {
+        setError(errorMessage, "A complete joint trajectory and actual TCP kinematics are required.");
+        return false;
+    }
+    StoredMotionPlan cartesian;
+    cartesian.cartesianControlPoints.points.reserve(plan.trajectory.points.size());
+    try {
+        for(std::size_t i = 0; i < plan.trajectory.points.size(); ++i) {
+            const auto& source = plan.trajectory.points[i];
+            if(source.q.size() != plan.jointNames.size() || !std::isfinite(source.time) ||
+                !std::all_of(source.q.begin(), source.q.end(), [](double q) { return std::isfinite(q); })) {
+                setError(errorMessage, "Invalid joint row or timestamp at point " + std::to_string(i + 1));
+                return false;
+            }
+            // Undo stored ABB signs exactly once, without wrapping legal joint turns.
+            const auto q = mapIrb4600StoredJointSigns
+                ? ProjectTrajectoryInverseKinematics::irb4600RobotSystemJointValues(source.q) : source.q;
+            robottrajectory::TimedCartesianPoint point;
+            point.time = source.time;
+            point.tcpPose = worldTcpForwardKinematics(q);
+            const auto& pose = point.tcpPose;
+            if(!pose.matrix().allFinite() || !(pose.translation() * 1000.0).allFinite() ||
+                (pose.linear().transpose() * pose.linear() - Eigen::Matrix3d::Identity()).norm() > 1e-7 ||
+                std::abs(pose.linear().determinant() - 1.0) > 1e-7 ||
+                (pose.matrix().row(3) - Eigen::RowVector4d(0, 0, 0, 1)).norm() > 1e-9) {
+                setError(errorMessage, "Invalid actual-model TCP pose at point " + std::to_string(i + 1));
+                return false;
+            }
+            cartesian.cartesianControlPoints.points.push_back(std::move(point));
+        }
+    } catch(const std::exception& error) {
+        setError(errorMessage, std::string("TCP forward kinematics failed: ") + error.what());
+        return false;
+    } catch(...) {
+        setError(errorMessage, "TCP forward kinematics failed.");
+        return false;
+    }
+    return serializeCartesianMatrices(cartesian, text, errorMessage);
 }
 
 } // namespace motion_planning

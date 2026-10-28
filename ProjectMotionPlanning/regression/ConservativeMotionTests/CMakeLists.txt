@@ -1,0 +1,10 @@
+cmake_minimum_required(VERSION 3.20)
+add_executable(ProjectPlanning-ConservativeTests main.cpp)
+target_compile_features(ProjectPlanning-ConservativeTests PRIVATE cxx_std_17)
+target_link_libraries(ProjectPlanning-ConservativeTests PRIVATE SMRobotMotionPlanning::ProjectMotionPlanning)
+copy_runtime_dlls(ProjectPlanning-ConservativeTests)
+if(BuildTests)
+    add_test(NAME ProjectPlanningConservativeMotion COMMAND ProjectPlanning-ConservativeTests
+        "${CMAKE_SOURCE_DIR}/config/projects/420-red4600-tool.sys.json")
+    set_tests_properties(ProjectPlanningConservativeMotion PROPERTIES TIMEOUT 120)
+endif()
