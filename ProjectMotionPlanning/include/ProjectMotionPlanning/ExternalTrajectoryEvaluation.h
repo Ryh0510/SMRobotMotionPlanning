@@ -13,6 +13,13 @@ namespace motion_planning
 
     // Deterministic planning boundary for external callers. No GUI state is mutated.
     // All translations/mesh scales use metres, all joints use runtime-model radians.
+    struct GaRejectedConnection
+    {
+        std::size_t sourceEdge = 0;
+        std::vector<double> fromJoints;
+        std::vector<double> toJoints;
+    };
+
     struct ExternalTrajectoryEvaluationRequest
     {
         StoredMotionPlan plan;
@@ -36,7 +43,7 @@ namespace motion_planning
         double maximumTcpPositionDeviation = 0.001;
         double maximumTcpOrientationDeviation = 0.01;
         std::size_t maxSamplesPerEdge = 10000;
-        // Empty retains legacy API. Explicit stages are ik, ga, apf, cdf, validate.
+        // Empty retains legacy API. Explicit stages are ik, ga, apf, cdf, validate, downsample.
         std::string pipelineStage;
         AdaptivePostureOptions postureOptions;
         bool includeKinematicAudit = false;
@@ -56,6 +63,10 @@ namespace motion_planning
         int anchorSearchAttempts = 104;
         double anchorSearchSeconds = 0; // zero: no single-point wall-clock deadline
         bool gaEvaluateAllPoints = false; // full initial pool even for already safe controls
+        // APF feedback: exact original-control seed; resample only these controls.
+        // Other controls remain fixed. Failed joint pairs are search exclusions only.
+        std::vector<std::size_t> gaResampleControls;
+        std::vector<GaRejectedConnection> gaRejectedConnections;
         robottrajectory::JointTrajectory optimizationSeed;
         bool densifyOptimizationKnots = false;
         // Zero keeps legacy adaptive support. Nonzero targets a balanced node count; safety may require additional nodes.
@@ -103,6 +114,10 @@ namespace motion_planning
     {
         bool success = false;
         bool cancelled = false;
+        // APF geometry/process checks completed, but source timing was rejected.
+        // Never an accepted plan: retime these exact joints and independently replay.
+        robottrajectory::JointTrajectory retimingCandidate;
+        std::vector<ApfConnectionFailure> apfConnectionFailures;
         // Search feedback, never a proof that no other pose/IK/path exists.
         bool retryWorkpiecePose = false;
         std::string kinematicAudit;

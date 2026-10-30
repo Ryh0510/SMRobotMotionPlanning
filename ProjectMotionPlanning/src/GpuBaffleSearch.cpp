@@ -9,6 +9,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #ifdef _WIN32
 #define NOMINMAX
 #include <Windows.h>
@@ -96,7 +97,13 @@ public:
             void* program=nullptr;check(nvrtcCreateProgram(&program,source.c_str(),"rws_planning.cu",0,nullptr,nullptr),"nvrtcCreateProgram");
             const std::string architecture="--gpu-architecture=compute_"+std::to_string(major)+std::to_string(minor);
             const char* options[]={architecture.c_str(),"--std=c++14","--fmad=false"};
-            const int compiled=nvrtcCompileProgram(program,3,options);
+            // NVRTC uses a deep compiler stack. Keep it off the caller's Debug
+            // planning/Eigen stack; source, options and CUDA ownership are unchanged.
+            int compiled=0;
+            try {
+                std::thread compilerThread([&](){compiled=nvrtcCompileProgram(program,3,options);});
+                compilerThread.join();
+            } catch(...) {nvrtcDestroyProgram(&program);throw;}
             if(compiled){std::size_t count=0;nvrtcGetProgramLogSize(program,&count);std::string log(count,'\0');if(count)nvrtcGetProgramLog(program,log.data());nvrtcDestroyProgram(&program);throw std::runtime_error("NVRTC compile: "+log.substr(0,4000));}
             std::size_t count=0;check(nvrtcGetPTXSize(program,&count),"nvrtcGetPTXSize");std::vector<char> ptx(count);check(nvrtcGetPTX(program,ptx.data()),"nvrtcGetPTX");nvrtcDestroyProgram(&program);
             check(cuCtxCreate_v2(&context,0,gpu),"cuCtxCreate");

@@ -170,3 +170,10 @@ if(BuildTests)
     set_tests_properties(GaApfCdfDetectorAndFailureGates PROPERTIES
         WORKING_DIRECTORY $<TARGET_FILE_DIR:GaApfCdfCheck>)
 endif()
+
+# Explicit long-running verification driver; user supplies project/input paths.
+add_executable(ProjectMotionPlanning-WholeTrajectoryCheck WholeTrajectoryCheck.cpp)
+target_link_libraries(ProjectMotionPlanning-WholeTrajectoryCheck PRIVATE ${PACKAGE_NAME}::ProjectMotionPlanning)
+target_compile_features(ProjectMotionPlanning-WholeTrajectoryCheck PRIVATE cxx_std_17)
+set_target_properties(ProjectMotionPlanning-WholeTrajectoryCheck PROPERTIES FOLDER "Regression/SMRobotMotionPlanning")
+copy_runtime_dlls(ProjectMotionPlanning-WholeTrajectoryCheck)

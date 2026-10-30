@@ -1,4 +1,5 @@
 #include <ProjectMotionPlanning/GaApfCdfPipeline.h>
+#include <ProjectMotionPlanning/SafeTrajectoryDownsampling.h>
 #include <nlohmann/json.hpp>
 #include <ProjectMotionPlanning/VirtualBaffleEnvironment.h>
 #include <ProjectMotionPlanning/ExternalTrajectoryEvaluation.h>
@@ -21,6 +22,40 @@ int main()
     std::cout<<std::unitbuf;
     int failures=0;
     const auto check=[&](bool ok,const char* message) { std::cout<<(ok?"PASS ":"FAIL ")<<message<<'\n'; if(!ok) ++failures; };
+    {
+        robottrajectory::JointTrajectory source;
+        for(int i=0;i<9;++i) {
+            robottrajectory::TimedJointPoint point;point.time=double(i);point.q={double(i),double(i%2)};
+            source.points.push_back(point);
+        }
+        SafeTrajectoryDownsamplingOptions o;o.targetPoints=3;
+        o.edgeAdmissible=[](std::size_t a,std::size_t b){return b-a<=2;};
+        const auto safe=downsampleTrajectorySafely(source,o);
+        check(safe.success && safe.trajectory.points.size()>o.targetPoints && safe.sourceIndices.front()==0 && safe.sourceIndices.back()==8,
+            "Unsafe shortcuts restore necessary safe points above the requested budget");
+        bool exact=true;for(std::size_t i=0;i<safe.sourceIndices.size();++i)
+            exact &= safe.trajectory.points[i].q==source.points[safe.sourceIndices[i]].q && safe.trajectory.points[i].time==source.points[safe.sourceIndices[i]].time;
+        check(exact && source.points.size()==9,"Downsampling preserves endpoint/source encoder values and times without mutating the input");
+        o.edgeAdmissible=[](std::size_t,std::size_t){return true;};o.targetPoints=4;
+        const auto sparse=downsampleTrajectorySafely(source,o);
+        check(sparse.success && sparse.trajectory.points.size()==4,"Clear connections reach the entered target");
+        o.targetPoints=3;o.edgeAdmissible=[](std::size_t a,std::size_t b){return !(a==0 && b==4);};
+        const auto balanced=downsampleTrajectorySafely(source,o);
+        check(balanced.success && balanced.trajectory.points.size()==3,
+            "Restored safety bends do not permanently pin redundant uniform seeds; every replacement chord is rechecked");
+        o.targetPoints=4;o.edgeAdmissible=[](std::size_t,std::size_t){return true;};
+        o.requiredIndices={1,7};
+        const auto pinned=downsampleTrajectorySafely(source,o);
+        check(pinned.success && std::find(pinned.sourceIndices.begin(),pinned.sourceIndices.end(),1)!=pinned.sourceIndices.end() &&
+            std::find(pinned.sourceIndices.begin(),pinned.sourceIndices.end(),7)!=pinned.sourceIndices.end(),"Process boundary knots remain pinned");
+        o.requiredIndices.clear();o.edgeAdmissible=[](std::size_t a,std::size_t b){return !(a==3 && b==4) && b-a==1;};
+        const auto blocked=downsampleTrajectorySafely(source,o);
+        check(!blocked.success && blocked.trajectory.empty(),"An invalid original motion cannot publish a partial or unchecked sparse trajectory");
+        bool cancelled=false;o.cancelled=[&](){return cancelled;};
+        o.edgeAdmissible=[&](std::size_t,std::size_t){cancelled=true;return true;};
+        const auto stopped=downsampleTrajectorySafely(source,o);
+        check(stopped.cancelled && !stopped.success && stopped.trajectory.empty(),"Cancellation clears all partial downsampling output");
+    }
     {
         const Eigen::Vector3d axis=Eigen::Vector3d(1,2,3).normalized();
         const double angle=80*std::acos(-1.)/180, distance=.1;
@@ -229,6 +264,66 @@ int main()
         const auto softBudget=runGaApfCdfPipeline(budgetDocument,dir,budgetRequest,false);
         check(softBudget.success && softBudget.plan.trajectory.points.size()==121,"100-point target is soft: all 121 original controls remain valid instead of failing or being discarded");
         check(std::none_of(softBudget.stages.begin(),softBudget.stages.end(),[](const auto& stage){return stage.name.find("CDF accepted")!=std::string::npos;}),"Default GA/APF path does not run optional CDF/QP");
+        auto storedReference=softBudget.plan;
+        check(!storedReference.optimizationMetadata.empty() &&
+            MotionPlanningProjectStore::upsertPlan(budgetDocument,storedReference),
+            "Accepted GA/APF stores its original surface/process reference in the project");
+        const auto restoredPlans=MotionPlanningProjectStore::plans(budgetDocument);
+        const auto restored=std::find_if(restoredPlans.begin(),restoredPlans.end(),[&](const auto& p){return p.id==storedReference.id;});
+        check(restored!=restoredPlans.end() && restored->optimizationMetadata==storedReference.optimizationMetadata,
+            "Opaque GA/APF reference survives project store serialization without changing process metadata");
+        auto surfaceSampler=budgetRequest;surfaceSampler.plan=storedReference;surfaceSampler.preferredOutputWaypoints=7;
+        std::string referenceError;
+        check(prepareGaApfDownsamplingRequest(surfaceSampler,referenceError) && surfaceSampler.sprayTargets.size()==121 &&
+            surfaceSampler.sprayDistances.size()==121 && surfaceSampler.sprayDistances.front()>.099999 &&
+            surfaceSampler.plan.cartesianControlPoints.points.front().tcpPose.matrix().isApprox(point.tcpPose.matrix(),1e-8),
+            "Downsampling restores original source poses and exact selected distances instead of adjusted TCP anchors");
+        const auto surfaceSparse=ProjectExternalTrajectoryEvaluator::evaluate(budgetDocument,dir,surfaceSampler);
+        check(surfaceSparse.success && surfaceSparse.plan.trajectory.points.size()==7,
+            "Persisted surface reference drives the same safe domain downsampling as the pipeline output");
+        auto stale=surfaceSampler;stale.plan.trajectory.points[1].time+=.01;
+        check(!prepareGaApfDownsamplingRequest(stale,referenceError),"Edited timing cannot silently reuse stale surface mapping");
+        auto changedTool=surfaceSampler;changedTool.linkFromTcp.translation().x()+=.01;
+        check(!prepareGaApfDownsamplingRequest(changedTool,referenceError),"Changed mounted TCP invalidates saved optimization reference");
+        auto raw=budgetRequest;raw.plan.trajectory.points.clear();raw.plan.cartesianControlPoints.points.resize(2);
+        raw.plan.cartesianControlPoints.points[1].time=1.;raw.ik.cachedCandidates.clear();raw.ik.preferredJoints.clear();
+        const auto initialJointsBefore=budgetDocument.robots.front().initialJoints.size();
+        const auto fromRaw=runGaApfCdfPipeline(budgetDocument,dir,raw,false);
+        check(fromRaw.success && std::any_of(fromRaw.diagnostics.begin(),fromRaw.diagnostics.end(),
+            [](const auto& d){return d.code=="pipeline_initial_top1";}) &&
+            budgetDocument.robots.front().initialJoints.size()==initialJointsBefore,
+            "Raw Cartesian pipeline performs physical all-IK and Top-1 initialization without mutating the caller project");
+        auto sparseRequest=budgetRequest;sparseRequest.plan=softBudget.plan;
+        sparseRequest.pipelineStage="downsample";sparseRequest.preferredOutputWaypoints=7;
+        sparseRequest.verificationTrajectory=softBudget.plan.trajectory;
+        const auto sparseResult=ProjectExternalTrajectoryEvaluator::evaluate(budgetDocument,dir,sparseRequest);
+        check(sparseResult.success && sparseResult.plan.trajectory.points.size()==7 &&
+            sparseResult.plan.trajectory.points.front().q==softBudget.plan.trajectory.points.front().q &&
+            sparseResult.plan.trajectory.points.back().q==softBudget.plan.trajectory.points.back().q,
+            "Domain downsampling reaches the target under actual robot and detector checks");
+        sparseRequest.preferredOutputWaypoints=1;
+        check(!ProjectExternalTrajectoryEvaluator::evaluate(budgetDocument,dir,sparseRequest).success,
+            "Domain downsampling rejects a target that would discard trajectory boundaries");
+        // The unchanged joint-linear source traces a curved TCP arc. Its own
+        // arc must not fail a corridor built from Cartesian endpoint chords.
+        auto curved=sparseRequest;curved.preferredOutputWaypoints=2;
+        curved.maximumTcpPositionDeviation=1e-5;curved.maximumTcpOrientationDeviation=1e-6;
+        curved.plan.trajectory.points.clear();curved.plan.cartesianControlPoints.points.clear();
+        for(int i=0;i<3;++i) {
+            auto q=request.ik.model.seedJoints;q[0]+=.2*i;
+            runtime.setRobotJointValues("robot",request.plan.jointNames,q);
+            auto control=point;control.time=i;control.tcpPose=runtime.robot("robot")->instance->getLinkTransform("l5");
+            curved.plan.cartesianControlPoints.points.push_back(control);
+            auto joint=evaluated.plan.trajectory.points.front();joint.time=i;joint.q=q;
+            curved.plan.trajectory.points.push_back(joint);
+        }
+        curved.verificationTrajectory=curved.plan.trajectory;
+        const auto curvedResult=ProjectExternalTrajectoryEvaluator::evaluate(budgetDocument,dir,curved);
+        check(curvedResult.success && curvedResult.plan.trajectory.points.size()==2 &&
+            curvedResult.plan.trajectory.points.front().q==curved.plan.trajectory.points.front().q &&
+            curvedResult.plan.trajectory.points.back().q==curved.plan.trajectory.points.back().q,
+            "Downsampling uses actual source joint-linear FK rather than rejecting its curved TCP arc against endpoint chords");
+        runtime.setRobotJointValues("robot",request.plan.jointNames,request.ik.model.seedJoints);
         auto adaptive=request;adaptive.pipelineStage="posture";adaptive.controlPointsOnly=true;adaptive.returnCandidates=true;
         adaptive.postureOptions.pointEvaluations=24;adaptive.postureOptions.graphRefinementRounds=0;
         const auto adapted=ProjectExternalTrajectoryEvaluator::evaluate(document,dir,adaptive);
@@ -343,6 +438,87 @@ int main()
         check(preservedResult.success && std::none_of(preservedResult.pointSearchReports.begin(),preservedResult.pointSearchReports.end(),
             [](const auto& text){return text.find("full_pool_genetic")!=std::string::npos;}),
             "Already safe controls retain valid candidates without entering the 5000-pose repair schedule");
+        auto preference=preserved;preference.gaEvaluateAllPoints=true;preference.returnCandidates=true;
+        preference.gaPointEvaluations=256;preference.gaGenerations=2;
+        const auto preferred=ProjectExternalTrajectoryEvaluator::evaluate(document,dir,preference);
+        bool keptOriginal=preferred.success;
+        if(preferred.success)for(std::size_t i=0;i<preferred.plan.trajectory.points.size();++i) {
+            runtime.setRobotJointValues("robot",request.plan.jointNames,preferred.plan.trajectory.points[i].q);
+            const auto tcp=runtime.robot("robot")->instance->getLinkTransform("l5");
+            const auto& original=preference.plan.cartesianControlPoints.points[i].tcpPose;
+            keptOriginal &= (tcp.translation()-original.translation()).norm()<preference.ik.positionTolerance*2 &&
+                Eigen::Quaterniond(tcp.linear()).angularDistance(Eigen::Quaterniond(original.linear()))<preference.ik.orientationTolerance*2;
+        }
+        check(keptOriginal && std::any_of(preferred.diagnostics.begin(),preferred.diagnostics.end(),
+            [](const auto& d){return d.code=="ga_original_pose_preference";}),
+            "Final GA graph keeps safe original poses even when full search adds adjusted safe alternatives");
+        // A physical obstacle intersects a joint chord while both endpoints are safe.
+        // Exhaust a deliberately tiny APF effort to verify typed source-clock feedback.
+        auto feedbackDocument=document;auto midpointPart=part;
+        midpointPart.transform.x=point.tcpPose.translation().x()-.02;
+        midpointPart.transform.y=point.tcpPose.translation().y()-.02;
+        midpointPart.transform.z=point.tcpPose.translation().z()-.02;
+        feedbackDocument.objects.push_back(midpointPart);
+        robottrajectory::JointTrajectory crossed;
+        for(int sign:{-1,1}) {
+            robottrajectory::TimedJointPoint p;p.time=sign<0?3.:7.;p.q=request.ik.model.seedJoints;
+            p.q[0]+=.2*sign;crossed.points.push_back(p);
+        }
+        ProjectCdfQpRepairOptions apfEffort;apfEffort.detectorIds={"check"};
+        apfEffort.stage=ProjectCdfQpRepairOptions::Stage::ApfOnly;apfEffort.safetyMargin=0;
+        apfEffort.targetClearance=0;apfEffort.apfIterationBudget=1;apfEffort.apfStepSize=.00001;
+        apfEffort.apfMaxTcpDeviation=0;apfEffort.densifyKnots=false;apfEffort.validationMaxJointStep=.005;
+        const auto failedConnection=ProjectCdfQpTrajectoryRepairService{}.repair(feedbackDocument,dir,"robot",request.plan.jointNames,crossed,apfEffort);
+        check(!failedConnection.success && failedConnection.apfConnectionFailures.size()==1 &&
+            failedConnection.apfConnectionFailures.front().beginTime==3. && failedConnection.apfConnectionFailures.front().endTime==7. &&
+            std::any_of(failedConnection.diagnostics.begin(),failedConnection.diagnostics.end(),[](const auto& d){return d.code=="apf_segment_failed";}),
+            "Exhausted physical APF connection returns a typed failed interval in the original seed clock");
+        // Real-model feedback: both ends of the failed pair are individually safe.
+        // The new GA must change the pair without moving controls outside the window.
+        auto feedback=preserved;feedback.gaInitialPostures=128;feedback.gaGenerations=2;
+        feedback.gaPointEvaluations=320;feedback.pointSearchSequence=1;
+        feedback.plan.cartesianControlPoints.points.clear();feedback.optimizationSeed.points.clear();
+        feedback.sprayTargets.clear();feedback.sprayDistances.clear();
+        for(int i=0;i<4;++i) {
+            auto control=point;control.time=i;
+            feedback.plan.cartesianControlPoints.points.push_back(control);
+            auto joint=preservedResult.plan.trajectory.points.front();joint.time=i;
+            feedback.optimizationSeed.points.push_back(joint);
+            feedback.sprayTargets.push_back(point.tcpPose.translation()+.1*point.tcpPose.linear()*feedback.sprayAxis);
+            feedback.sprayDistances.push_back(.1);
+        }
+        feedback.gaResampleControls={1,2};
+        feedback.gaRejectedConnections={{1,feedback.optimizationSeed.points[1].q,feedback.optimizationSeed.points[2].q}};
+        const auto renewed=ProjectExternalTrajectoryEvaluator::evaluate(document,dir,feedback);
+        bool changedPair=false,feedbackAnchors=renewed.success;
+        if(renewed.success)for(std::size_t i=0;i<4;++i) {
+            const auto& q=renewed.plan.trajectory.points[i].q;
+            if(i==1 || i==2)for(std::size_t j=0;j<q.size();++j)
+                changedPair |= std::abs(q[j]-feedback.optimizationSeed.points[i].q[j])>=1e-4;
+            runtime.setRobotJointValues("robot",request.plan.jointNames,q);
+            const auto tcp=runtime.robot("robot")->instance->getLinkTransform("l5");
+            feedbackAnchors &= (tcp.translation()+.1*tcp.linear()*feedback.sprayAxis-feedback.sprayTargets[i]).norm()<.001;
+        }
+        check(renewed.success && changedPair && renewed.plan.trajectory.points.front().q==feedback.optimizationSeed.points.front().q &&
+            renewed.plan.trajectory.points.back().q==feedback.optimizationSeed.points.back().q,
+            "APF feedback resamples safe GA parents, rejects the failed encoder pair, and freezes all controls outside the window");
+        check(feedbackAnchors && renewed.pointSearchReports.size()==2 && std::all_of(renewed.pointSearchReports.begin(),renewed.pointSearchReports.end(),
+            [](const auto& text){const auto r=nlohmann::json::parse(text);return r.value("apf_feedback",false) &&
+                r.value("feedback_sequence",0)==1 && r.value("initial_pool_completed",0)==128 && r.value("generations_completed",0)==2 && r.value("feedback_local_offspring",0)==48;}),
+            "Feedback keeps original surface anchors and runs a fresh complete initial pool and offspring schedule only at requested controls");
+        auto malformedFeedback=feedback;malformedFeedback.optimizationSeed.points[2].time+=.01;
+        const auto malformedResult=ProjectExternalTrajectoryEvaluator::evaluate(document,dir,malformedFeedback);
+        check(!malformedResult.success && std::any_of(malformedResult.diagnostics.begin(),malformedResult.diagnostics.end(),
+            [](const auto& d){return d.code=="invalid_ga_feedback";}),"Feedback cannot remap a seed onto different source control stations");
+        auto lockedFeedback=feedback;lockedFeedback.startJoints=feedback.optimizationSeed.points.front().q;
+        lockedFeedback.gaResampleControls.push_back(0);
+        check(!ProjectExternalTrajectoryEvaluator::evaluate(document,dir,lockedFeedback).success,
+            "Feedback cannot mutate an explicitly locked boundary");
+        bool cancelFeedback=false;auto stoppedFeedback=feedback;
+        stoppedFeedback.cancelled=[&]{return cancelFeedback;};
+        stoppedFeedback.progress=[&](const std::string& event){if(event.find("genetic_initial_pool")!=std::string::npos)cancelFeedback=true;};
+        const auto feedbackCancelled=ProjectExternalTrajectoryEvaluator::evaluate(document,dir,stoppedFeedback);
+        check(cancelFeedback && feedbackCancelled.cancelled && !feedbackCancelled.success,"APF feedback remains cancellable during resampling");
         auto cancelRequest=anchorRequest;bool cancelGa=false;
         cancelRequest.cancelled=[&]{return cancelGa;};
         cancelRequest.progress=[&](const std::string& event) {
@@ -553,6 +729,14 @@ int main()
         blocked.ik.upper[0]=.61; blocked.ik.lower[0]=.19; blocked.ik.seedCount=1;
         const auto unrepaired=ProjectExternalTrajectoryEvaluator::evaluate(document,dir,blocked);
         check(!unrepaired.success,"Endpoint-solvable constrained IK branch can still have a colliding segment");
+        auto sparseBlocked=blocked;sparseBlocked.pipelineStage="downsample";sparseBlocked.returnCandidates=false;
+        sparseBlocked.preferredOutputWaypoints=2;
+        auto firstJoint=evaluated.plan.trajectory.points.front();firstJoint.time=0;
+        auto lastJoint=firstJoint;lastJoint.q=endJoints;lastJoint.time=4;
+        sparseBlocked.verificationTrajectory.points={firstJoint,lastJoint};
+        const auto sparseCollision=ProjectExternalTrajectoryEvaluator::evaluate(document,dir,sparseBlocked);
+        check(!sparseCollision.success && sparseCollision.plan.trajectory.empty(),
+            "Domain downsampling rejects colliding segment interiors even when both endpoint configurations are safe");
         blocked.optimizeAvoidance=true; blocked.optimizationIterations=2;
         const auto avoidance=ProjectExternalTrajectoryEvaluator::evaluate(document,dir,blocked);
         std::cout<<"BLOCKED REPAIR success="<<avoidance.success<<" retry="<<avoidance.retryWorkpiecePose<<'\n';
@@ -732,6 +916,21 @@ int main()
             const auto cachedSafe=batch.motions({{0},{.001}},options);
             check(cachedSafe[0].valid && batch.motions({{0},{.001}},options)[0].valid,
                 "Exact unwrapped safe motion can be reused in the same private scene");
+            detail::CdfQueryBatch sampleParallel(*turnScene,turnDocument,dir,turnRequest,4,false);
+            for(bool preserve : {false,true}) for(double end : {.001,1.,6.283185307179586}) {
+                options.preserveJointTurns=preserve;
+                const auto serialResult=turnScene->validateMotion({0},{end},options);
+                const auto parallelResult=sampleParallel.motions({{0},{end}},options).front();
+                check(serialResult.valid==parallelResult.valid && serialResult.diagnosticCode==parallelResult.diagnosticCode &&
+                    serialResult.message==parallelResult.message && sampleParallel.pathValid({{0},{end}},options)==serialResult.valid,
+                    "Single-edge parallel samples preserve the exact verdict, first collision ratio and winding policy");
+            }
+            auto cancelledOptions=options;cancelledOptions.cancelled=[](){return true;};
+            check(sampleParallel.motions({{0},{1}},cancelledOptions).front().diagnosticCode=="cancelled" &&
+                !sampleParallel.pathValid({{0},{1}},cancelledOptions),"Single-edge sample batches respect cancellation");
+            auto cappedOptions=options;cappedOptions.maxSamples=2;
+            check(sampleParallel.motions({{0},{1}},cappedOptions).front().diagnosticCode=="motion_sample_budget",
+                "Single-edge sample batches retain the original sampling budget gate");
             options.maxSamples=1;
             check(!batch.motions({{0},{.001}},options)[0].valid,
                 "A lower sample budget cannot reuse another motion certificate");

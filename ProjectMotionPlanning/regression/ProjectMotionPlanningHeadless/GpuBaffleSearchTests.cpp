@@ -26,6 +26,18 @@ nlohmann::json ikRegression(){
     double serialError=0;
     for(int n=0;n<512;++n){std::vector<double> q(6);for(int j=0;j<6;++j)q[j]=6*std::sin((n+1)*(j+1)*.371);serialError=std::max(serialError,(solver.forward(q).matrix()-options.model.worldForwardKinematics(q).matrix()).norm());}
     if(serialError>1e-8)throw std::runtime_error("CPU serial FK differs from original FK");
+    if(!solver.status().value("spherical_wrist_reach_bound",false))throw std::runtime_error("Spherical-wrist reach bound was not enabled");
+    for(int n=0;n<8192;++n){std::vector<double> q(6);for(int j=0;j<6;++j)q[j]=12*std::sin((n+1)*(j+1)*.371);
+        if(solver.definitelyUnreachable(options.model.worldForwardKinematics(q)))throw std::runtime_error("Reach bound rejected a reachable actual-FK target");}
+    auto remote=home;remote.translation()=V3(100,100,100);
+    if(!solver.definitelyUnreachable(remote))throw std::runtime_error("Reach bound did not reject remote target");
+    auto nonsphericalOptions=options;
+    nonsphericalOptions.model.worldForwardKinematics=[&](const std::vector<double>& q){Eigen::Isometry3d out=Eigen::Isometry3d::Identity();
+        for(int i=0;i<6;++i){const V3 pivot=pivots[i]+(i==5?V3(0,0,.1):V3::Zero());Eigen::Isometry3d t=Eigen::Isometry3d::Identity();
+            t.linear()=Eigen::AngleAxisd(q[i],axes[i]).toRotationMatrix();t.translation()=pivot-t.linear()*pivot;out=out*t;}return Eigen::Isometry3d(out*home);};
+    GpuSerialIk nonspherical;
+    if(!nonspherical.configure(model,names,"l6",nonsphericalOptions) || nonspherical.status().value("spherical_wrist_reach_bound",true) || nonspherical.definitelyUnreachable(remote))
+        throw std::runtime_error("Non-spherical wrist must retain the ordinary IK fallback");
     double jacobianError=0;
     for(int n=0;n<128;++n){std::vector<double> q(6);for(int j=0;j<6;++j)q[j]=6*std::sin((n+1)*(j+1)*.371);
         Eigen::Matrix<double,6,6> numeric;

@@ -7,6 +7,7 @@
 #include <Eigen/Geometry>
 
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <limits>
 #include <string>
@@ -19,6 +20,7 @@ namespace simulation_project
 
 namespace motion_planning
 {
+    namespace detail { class CdfQueryBatch; }
     struct ProjectPlanningRequest
     {
         std::string robotId;
@@ -91,6 +93,12 @@ namespace motion_planning
         const simulation_runtime::ProjectCollisionRuntime& collisionRuntime() const;
 
     private:
+        using MotionSampleBatch = std::function<std::vector<StateValidationResult>(
+            const std::vector<std::vector<double>>&)>;
+        StateValidationResult validateSampledMotion(const std::vector<double>& from,
+            const std::vector<double>& to, const MotionValidationOptions& options,
+            const MotionSampleBatch& batch);
+        friend class detail::CdfQueryBatch;
         class Impl;
         explicit ProjectPlanningSceneSnapshot(std::unique_ptr<Impl> impl);
 

@@ -252,6 +252,21 @@ namespace motion_planning::detail
         m_gradientSeconds += secondsSince(started); return values;
     }
 
+    StateValidationResult CdfQueryBatch::singleMotion(const std::vector<double>& from,
+        const std::vector<double>& to, const MotionValidationOptions& options)
+    {
+        if(m_scenes.size() == 1) return m_scenes.front()->validateMotion(from, to, options);
+        return m_scenes.front()->validateSampledMotion(from, to, options, [&](const auto& samples) {
+            std::vector<StateValidationResult> results(samples.size());
+            parallelFor(samples.size(), [&](std::size_t worker, std::size_t i) {
+                if(options.cancelled && options.cancelled())
+                    results[i] = StateValidationResult::failure("cancelled", "Motion validation cancelled.");
+                else results[i] = m_scenes[worker]->validateState(samples[i]);
+            });
+            return results;
+        });
+    }
+
     std::vector<StateValidationResult> CdfQueryBatch::motions(const std::vector<std::vector<double>>& path,
         const MotionValidationOptions& options, bool useCache)
     {
@@ -270,7 +285,9 @@ namespace motion_planning::detail
             if(cacheThisRequest && found != m_motions.end()) { values[i] = found->second; ++m_motionHits; }
             else { missing.push_back(i); }
         }
-        parallelFor(missing.size(), [&](std::size_t worker, std::size_t offset) {
+        if(missing.size() == 1 && m_scenes.size() > 1) {
+            const auto i = missing.front(); values[i] = singleMotion(path[i], path[i + 1], options);
+        } else parallelFor(missing.size(), [&](std::size_t worker, std::size_t offset) {
             const auto i = missing[offset];
             values[i] = m_scenes[worker]->validateMotion(path[i], path[i + 1], options);
         });
@@ -299,7 +316,10 @@ namespace motion_planning::detail
             else { missing.push_back(i); }
         }
         std::atomic<bool> valid{true};
-        parallelFor(missing.size(), [&](std::size_t worker, std::size_t offset) {
+        if(missing.size() == 1 && m_scenes.size() > 1) {
+            const auto i = missing.front(); values[i] = singleMotion(path[i], path[i + 1], options);
+            valid.store(values[i].valid);
+        } else parallelFor(missing.size(), [&](std::size_t worker, std::size_t offset) {
             if(!valid.load()) { return; }
             const auto i = missing[offset];
             values[i] = m_scenes[worker]->validateMotion(path[i], path[i + 1], options);

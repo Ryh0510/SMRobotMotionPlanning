@@ -50,17 +50,30 @@ void environmentRegression(){
     simulation_runtime::ProjectSimulationRuntime runtime;const auto loaded=runtime.loadProject(document,dir);require(loaded.success,loaded.message.c_str());
     motion_planning::VirtualBaffleEnvironment environment;environment.build(runtime);require(environment.baffles().size()==1 && environment.baffles().front().geometry.enabled,"Baffle BVH fixture unavailable");
     const auto& baffle=environment.baffles().front().geometry;
+    std::vector<motion_planning::VirtualBaffleEnvironment::SearchPose> searchPoses;
     std::mt19937 rng(1701);std::uniform_real_distribution<double> distribution(-1.,1.);int validCount=0,hitCount=0;
     for(int sample=0;sample<512;++sample){Eigen::Isometry3d pose=Eigen::Isometry3d::Identity();pose.translation()=V3(.2*distribution(rng),.15*distribution(rng),.06*distribution(rng));pose.linear()=Eigen::AngleAxisd(3*distribution(rng),V3(1,2,3).normalized()).toRotationMatrix();
         simulation_project::TransformDesc transform;transform.x=pose.translation().x();transform.y=pose.translation().y();transform.z=pose.translation().z();
         const auto angles=pose.linear().eulerAngles(2,1,0);transform.yaw=angles[0];transform.pitch=angles[1];transform.roll=angles[2];
-        const auto moved=runtime.setRobotBaseTransform("robot",transform);require(moved.success,moved.message.c_str());pose=environment.captureSearchPose(runtime).bodies.front();
+        const auto moved=runtime.setRobotBaseTransform("robot",transform);require(moved.success,moved.message.c_str());const auto captured=environment.captureSearchPose(runtime);searchPoses.push_back(captured);pose=captured.bodies.front();
         const double clearance=(sample%3)*.001;std::vector<VirtualBaffle::Triangle> transformed;V3 lower=V3::Constant(1e300),upper=V3::Constant(-1e300);bool hit=false;
         for(const auto& triangle:body){VirtualBaffle::Triangle world;for(int j=0;j<3;++j){world[j]=pose*triangle[j];lower=lower.cwiseMin(world[j]);upper=upper.cwiseMax(world[j]);}hit=hit||baffle.intersectsTriangle(world,clearance);transformed.push_back(world);}
         if(!hit)for(const auto& ring:baffle.contours)for(const auto& uv:ring){const V3 p=baffle.center+baffle.axisX*uv.x()+baffle.axisY*uv.y();if((p.array()>=lower.array()).all() && (p.array()<=upper.array()).all() && referenceContains(transformed,p))hit=true;}
         std::string reason;const bool valid=environment.validState(runtime,clearance,reason);if(valid)++validCount;else ++hitCount;require(valid==!hit,"BVH/slab/containment differs from brute-force full mesh");
     }
     require(validCount>0 && hitCount>0,"BVH regression must include passing and rejected states");
+    const auto batch=environment.searchViolationBatch(searchPoses,.001,true);
+    const auto cpu=environment.searchViolationBatch(searchPoses,.001,false);
+    for(std::size_t first=0;first<searchPoses.size();first+=32) {
+        const auto last=std::min(searchPoses.size(),first+32);
+        const std::vector<motion_planning::VirtualBaffleEnvironment::SearchPose> small(searchPoses.begin()+first,searchPoses.begin()+last);
+        const auto serial=environment.searchViolationBatch(small,.001,true);
+        for(std::size_t i=0;i<serial.size();++i) {
+            require(std::abs(serial[i]-batch[first+i])<1e-12,"Parallel/serial GPU staging changed pose order or merit");
+            require(std::abs(cpu[first+i]-batch[first+i])<1e-10,"GPU staging differs from independent CPU baffle score");
+        }
+    }
+    std::cout<<"512 parallel/serial/CPU baffle merit comparisons passed "<<environment.gpuSearchStatus().dump()<<'\n';
     for(const char* file:{"robot.urdf","body.stl","opening.stl"})std::filesystem::remove(dir/file);std::filesystem::remove(dir);
     std::cout<<"512 independent full-mesh/BVH comparisons passed\n";
 }

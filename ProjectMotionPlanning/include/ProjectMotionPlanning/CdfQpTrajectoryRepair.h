@@ -114,11 +114,19 @@ namespace motion_planning
         double elapsedSeconds = 0.0;
     };
 
+    // Failed local APF connection in the submitted seed clock, never a proof of infeasibility.
+    struct ApfConnectionFailure
+    {
+        double beginTime = 0.0;
+        double endTime = 0.0;
+    };
+
     struct ProjectCdfQpRepairResult
     {
         bool success = false;
         bool cancelled = false;
         StoredMotionPlan plan;
+        std::vector<ApfConnectionFailure> apfConnectionFailures;
         ProjectCdfQpRepairStatistics statistics;
         // Original knots of the actually selected (possibly equivalent-IK) seed.
         robottrajectory::JointTrajectory referenceSeedTrajectory;

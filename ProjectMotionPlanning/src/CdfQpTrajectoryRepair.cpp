@@ -741,7 +741,8 @@ namespace motion_planning
             ProjectCdfQpRepairStatistics* statistics,
             std::vector<MotionPlanningDiagnostic>* diagnostics,
             std::vector<std::vector<double>>* path,
-            const detail::ApfGuidance* guidance)
+            const detail::ApfGuidance* guidance,
+            std::vector<InvalidSegmentRun>* failedRuns = nullptr)
         {
             if(path == nullptr || path->size() < 2 || statistics == nullptr) return false;
             const auto runs = collectInvalidSegmentRuns(queries, *path, validation, guidance);
@@ -761,6 +762,7 @@ namespace motion_planning
                 if(!stillInvalid) continue;
                 std::size_t left = 0, right = 0;
                 if(!locateSafeApfAnchors(scene, *path, run, &left, &right, guidance)) {
+                    if(failedRuns) failedRuns->push_back(run);
                     addDiagnostic(diagnostics, "apf_anchor_missing",
                         "No safe anchors on both sides of interval " + std::to_string(run.beginSegment + 1)
                         + " -> " + std::to_string(run.endSegment + 2)
@@ -774,13 +776,20 @@ namespace motion_planning
                 bool repaired = false;
                 // Expand to nearby safe anchors when the initial anchors are too
                 // close to contact or there are too few samples for a detour.
-                for(int expansion = 0; expansion < 3 && !repaired; ++expansion) {
-                    if(options.progress) options.progress("APF anchor expansion " + std::to_string(expansion + 1) + " / 3");
-                    const std::size_t padding = expansion == 0 ? 12 : (expansion == 1 ? 40 : 120);
+                // Fixed-surface projection can require an earlier wrist transition.
+                // Exhaust the original local windows first, then widen anticipation
+                // without relaxing collision, surface, corridor or joint constraints.
+                const int expansions = guidance && guidance->projectStation ? 5 : 3;
+                const std::size_t paddings[] = {12, 40, 120, 360, 1080};
+                const double anticipations[] = {0.06, 0.12, 0.24, 0.48, 0.96};
+                for(int expansion = 0; expansion < expansions && !repaired; ++expansion) {
+                    if(options.progress) options.progress("APF anchor expansion " + std::to_string(expansion + 1)
+                        + " / " + std::to_string(expansions));
+                    const std::size_t padding = paddings[expansion];
                     std::size_t begin = left > padding ? left - padding : 0;
                     std::size_t end = std::min(path->size() - 1, right + padding);
                     if(guidance) {
-                        const double anticipation = expansion == 0 ? 0.06 : (expansion == 1 ? 0.12 : 0.24);
+                        const double anticipation = anticipations[expansion];
                         const auto span = [&](std::size_t a, std::size_t b) {
                             double length=0.0;
                             for(std::size_t i=a+1;i<=b;++i) {
@@ -811,8 +820,8 @@ namespace motion_planning
                         lower[j] -= corridor;
                         upper[j] += corridor;
                         if(!bounds[j].continuous) {
-                            lower[j] = expansion==2 ? bounds[j].lower : std::max(lower[j], bounds[j].lower);
-                            upper[j] = expansion==2 ? bounds[j].upper : std::min(upper[j], bounds[j].upper);
+                            lower[j] = expansion>=2 ? bounds[j].lower : std::max(lower[j], bounds[j].lower);
+                            upper[j] = expansion>=2 ? bounds[j].upper : std::min(upper[j], bounds[j].upper);
                         }
                     }
                     detail::ApfOracle oracle;
@@ -878,7 +887,9 @@ namespace motion_planning
                         + ", timestamps and waypoint count preserved.");
                 }
                 if(options.progress) options.progress(repaired ? "APF interval verified" : "APF interval failed");
-                if(!repaired) { addDiagnostic(diagnostics, "apf_segment_failed",
+                if(!repaired) {
+                    if(failedRuns) failedRuns->push_back(run);
+                    addDiagnostic(diagnostics, "apf_segment_failed",
                     "APF exhausted local fields/anchor expansions for interval "
                     + std::to_string(run.beginSegment + 1) + " -> " + std::to_string(run.endSegment + 2) + "; could not connect within the configured TCP corridor (" + std::to_string(options.apfMaxTcpDeviation * 1000.0)
                     + " mm). No larger detour was accepted. APF failure is not proof of infeasibility.");
@@ -2040,6 +2051,7 @@ namespace motion_planning
             return result;
         }
         if(initialInvalidSegments != 0 || !followsReference(path)) {
+            std::vector<InvalidSegmentRun> failedRuns;
             const bool apfRepaired = repairCollisionRunsWithApf(
                 *scene,
                 queries,
@@ -2048,7 +2060,12 @@ namespace motion_planning
                 options,
                 &result.statistics,
                 &result.diagnostics,
-                &path, constrainTcp ? &tcpGuide : nullptr);
+                &path, constrainTcp ? &tcpGuide : nullptr, &failedRuns);
+            for(const auto& run:failedRuns) {
+                if(run.beginSegment<denseSeedTrajectory.size() && run.endSegment+1<denseSeedTrajectory.size())
+                    result.apfConnectionFailures.push_back({denseSeedTrajectory[run.beginSegment].time,
+                        denseSeedTrajectory[run.endSegment+1].time});
+            }
             if(apfRepaired) {
                 seedPath = path;
                 result.statistics.finalMinimumPhi = evaluatePathMinimum(path);

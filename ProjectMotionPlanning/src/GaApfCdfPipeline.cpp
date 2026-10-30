@@ -1,8 +1,12 @@
 #include <ProjectMotionPlanning/GaApfCdfPipeline.h>
+#include <ProjectMotionPlanning/LayeredIkGraph.h>
+#include <RobotInstance/RobotInstance.h>
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <stdexcept>
 #include <chrono>
+#include <map>
+#include <set>
 
 namespace motion_planning
 {
@@ -49,7 +53,7 @@ namespace motion_planning
     }
 
     ProjectCdfQpRepairResult runGaApfCdfPipeline(
-        const simulation_project::ProjectDocument& document,
+        const simulation_project::ProjectDocument& inputDocument,
         const std::filesystem::path& basePath,
         ExternalTrajectoryEvaluationRequest request, bool useCdf,
         const GaSurfaceSearchOptions& surface)
@@ -61,7 +65,14 @@ namespace motion_planning
             result.diagnostics.push_back({code,message}); return result;
         };
         try {
+            auto document=inputDocument;
+            if(request.workpiece) {
+                auto found=std::find_if(document.objects.begin(),document.objects.end(),[&](const auto& o){return o.id==request.workpiece->id;});
+                if(found==document.objects.end())document.objects.push_back(*request.workpiece);else *found=*request.workpiece;
+            }
             if(request.cancelled && request.cancelled())return fail("pipeline_cancelled","Cancelled before scene construction.");
+            if(surface.maxConnectionFeedbackRounds<0 || surface.maxConnectionFeedbackRounds>64)
+                return fail("invalid_feedback_rounds","Connection feedback rounds must be 0..64.");
             if(!std::isfinite(surface.sprayDistance) || surface.sprayDistance<=0 || surface.sprayDistance>10)
                 return fail("pipeline_spray_distance","Spray distance must be positive, finite and at most 10 metres.");
             std::string error;
@@ -86,6 +97,73 @@ namespace motion_planning
             }
             if(request.plan.cartesianControlPoints.points.size()<2)
                 return fail("pipeline_input_too_short","At least two Cartesian controls or joint knots are required.");
+            request.progress=request.progress?request.progress:request.cdfOptions.progress;
+            if(request.plan.trajectory.empty() && request.startJoints.empty()) {
+                const auto began=std::chrono::steady_clock::now();
+                if(request.progress)request.progress("Initialization: enumerate original physical IK, then layered Top-1");
+                auto* runtime=scene->simulationRuntime().robot(request.plan.robotId);
+                if(!runtime || !runtime->instance || request.plan.jointNames.size()!=6)
+                    return fail("pipeline_initial_ik_model","Initialization requires the actual six-axis model.");
+                CartesianMultiIkOptions ik;
+                ik.model.robotId=request.plan.robotId;ik.model.jointNames=request.plan.jointNames;
+                std::vector<std::size_t> dofs;
+                for(const auto& name:request.plan.jointNames) {
+                    const auto& joint=runtime->model.joints.at(runtime->model.jointNameToIndex.at(name));
+                    if(joint.type!=robot::JointType::Revolute)return fail("pipeline_initial_ik_model","Six revolute joints required.");
+                    dofs.push_back(static_cast<std::size_t>(joint.dofIndex));
+                }
+                for(const auto& robot:document.robots)if(robot.id==request.plan.robotId)
+                    for(const auto& name:request.plan.jointNames) {
+                        const auto value=std::find_if(robot.initialJoints.begin(),robot.initialJoints.end(),[&](const auto& j){return j.jointName==name;});
+                        ik.model.seedJoints.push_back(value==robot.initialJoints.end()?0.:value->value);
+                    }
+                std::vector<double> lower,upper;
+                if(!ProjectTrajectoryInverseKinematics::readRevoluteJointLimits(document,basePath,request.plan.robotId,
+                    request.plan.jointNames,lower,upper,error))return fail("pipeline_initial_ik_limits",error);
+                for(std::size_t j=0;j<lower.size();++j) {
+                    ik.lower.push_back(std::max(-6.283185307179586,lower[j]));
+                    ik.upper.push_back(std::min(6.283185307179586,upper[j]));
+                }
+                ik.model.worldForwardKinematics=[&](const std::vector<double>& q) -> Eigen::Isometry3d {
+                    for(std::size_t j=0;j<dofs.size();++j)runtime->instance->setJoint(dofs[j],q.at(j));
+                    runtime->instance->update();
+                    return scene->linkWorldTransform(request.tcpLinkName)*request.linkFromTcp;
+                };
+                ik.cancelled=request.cancelled;
+                ik.progress=[&](std::size_t done,std::size_t total) {
+                    if(request.progress)request.progress(nlohmann::json{{"type","pipeline_initial_ik"},{"completed",done},{"total",total}}.dump());
+                };
+                const auto candidates=ProjectTrajectoryInverseKinematics::solveAllCartesianControlPoints(request.plan,ik);
+                if(candidates.cancelled)return fail("pipeline_cancelled","Cancelled during original IK enumeration.");
+                auto leading=candidates;
+                std::size_t prefix=0;while(prefix<leading.layers.size() && !leading.layers[prefix].candidates.empty())++prefix;
+                if(prefix==0)return fail("pipeline_initial_ik_missing","The first original pose has no physical IK for Top-1 initialization.");
+                leading.layers.resize(prefix);leading.source.cartesianControlPoints.points.resize(prefix);leading.success=true;
+                LayeredIkGraphOptions graphOptions;graphOptions.maxPaths=1;graphOptions.jointWeights.assign(6,1.);
+                graphOptions.cancelled=request.cancelled;
+                const auto graph=ProjectLayeredIkGraph::filter(leading,graphOptions);
+                if(!graph.success || graph.paths.empty())return fail("pipeline_initial_graph_failed",graph.message);
+                StoredMotionPlan selected;
+                if(!ProjectTrajectoryInverseKinematics::selectMultiIkTrajectory(leading,graph.paths.front().selections,selected,error))
+                    return fail("pipeline_initial_graph_failed",error);
+                const auto initial=selected.trajectory.points.front().q;
+                if(!ProjectTrajectoryInverseKinematics::applyJointValuesToRobotInitialJoints(document,request.plan.robotId,
+                    request.plan.jointNames,initial,&error))return fail("pipeline_initial_graph_failed",error);
+                if(prefix==candidates.layers.size())request.plan=std::move(selected);
+                else {
+                    request.ik.model.seedJoints=initial;request.ik.cachedCandidates.clear();
+                    request.ik.cachedCandidates.resize(candidates.layers.size());
+                    for(std::size_t i=0;i<candidates.layers.size();++i)
+                        for(const auto& c:candidates.layers[i].candidates)request.ik.cachedCandidates[i].push_back(c.joints);
+                }
+                scene=ProjectPlanningSceneBuilder::build(document,basePath,sceneRequest,&error);
+                if(!scene)return fail("pipeline_scene_failed",error);
+                const auto event=nlohmann::json{{"type","pipeline_initial_top1"},{"source_points",candidates.layers.size()},
+                    {"prefix_points",prefix},{"rank",1},{"cost_rad2",graph.paths.front().cost},{"initial_joints_rad",initial},
+                    {"scope","kinematic initialization only; GA repairs missing/unsafe poses; initial configuration not hard-locked"},
+                    {"seconds",std::chrono::duration<double>(std::chrono::steady_clock::now()-began).count()}}.dump();
+                result.diagnostics.push_back({"pipeline_initial_top1",event});if(request.progress)request.progress(event);
+            }
             const auto originalControls=request.plan.cartesianControlPoints;
             std::vector<Eigen::Vector3d> anchors;
             for(const auto& point:originalControls.points)
@@ -145,12 +223,33 @@ namespace motion_planning
                 s.referenceTcpPositions=s.quality.tcpPositions;
                 result.stages.push_back(std::move(s));
             };
-            const auto retime=[&](StoredMotionPlan& plan,std::vector<std::pair<double,double>>& mapping) {
+            const auto retime=[&](StoredMotionPlan& plan,std::vector<std::pair<double,double>>& mapping,bool preserveSurfaceClock=false) {
                 if(!request.cdfOptions.retimeOutput)return;
                 const auto original=plan.trajectory;
                 if(!retimeJointTrajectory(plan.trajectory,scene->jointBounds(),
                     request.cdfOptions.fallbackMaxVelocity,request.cdfOptions.fallbackMaxAcceleration))
                     throw std::runtime_error("Cannot retime the exact joint path.");
+                if(preserveSurfaceClock) {
+                    // A local change of interval duration also changes the surface
+                    // station at added APF knots. Preserve the original affine clock
+                    // with one dilation; geometry and every station stay identical.
+                    auto measured=original;
+                    const auto quality=evaluateTrajectoryQuality(measured,scene->jointBounds(),
+                        request.cdfOptions.fallbackMaxVelocity,request.cdfOptions.fallbackMaxAcceleration);
+                    if(!quality.valid || !quality.timingValid)throw std::runtime_error("Invalid APF clock.");
+                    double scale=1.;const auto& bounds=scene->jointBounds();
+                    for(std::size_t j=0;j<bounds.size();++j) {
+                        const double velocity=std::isfinite(bounds[j].maxVelocity) && bounds[j].maxVelocity>0?
+                            bounds[j].maxVelocity:request.cdfOptions.fallbackMaxVelocity;
+                        const double acceleration=std::isfinite(bounds[j].maxAcceleration) && bounds[j].maxAcceleration>0?
+                            bounds[j].maxAcceleration:request.cdfOptions.fallbackMaxAcceleration;
+                        scale=std::max(scale,quality.jointPeakVelocities[j]/velocity);
+                        scale=std::max(scale,std::sqrt(quality.jointPeakAccelerations[j]/acceleration));
+                    }
+                    const double begin=original.points.front().time;
+                    for(std::size_t i=0;i<original.points.size();++i)
+                        plan.trajectory.points[i].time=begin+(original.points[i].time-begin)*scale*1.001;
+                }
                 std::vector<std::pair<double,double>> updated;
                 for(std::size_t i=0;i<original.points.size();++i)
                     updated.emplace_back(plan.trajectory.points[i].time,sourceTimeAt(mapping,original.points[i].time));
@@ -227,9 +326,108 @@ namespace motion_planning
             request.pipelineStage="apf";request.controlPointsOnly=false;request.optimizeAvoidance=true;
             prepareSurface(sourceTimes);
             report("APF: connect GA controls and validate sampled segment interiors");
-            auto apf=evaluateStage();append(apf);
-            if(!apf.success)return fail("pipeline_apf_failed","APF did not produce an accepted connected path.");
-            retime(apf.plan,sourceTimes);
+            ExternalTrajectoryEvaluationResult apf;
+            bool pendingRetime=false;
+            std::vector<GaRejectedConnection> rejectedConnections;
+            std::map<std::size_t,int> feedbackVisits;
+            int feedbackSearchSequence=0;
+            for(int feedbackRound=0;;++feedbackRound) {
+                apf=evaluateStage();append(apf);
+                pendingRetime=!apf.success && request.cdfOptions.retimeOutput && !apf.retimingCandidate.empty() &&
+                    std::any_of(apf.diagnostics.begin(),apf.diagnostics.end(),[](const auto& d){return d.code=="apf_velocity_retime_required";});
+                if(apf.success || pendingRetime)break;
+                if(apf.cancelled || (request.cancelled && request.cancelled()))
+                    return fail("pipeline_cancelled","Cancelled during APF/GA connection feedback.");
+                if(feedbackRound>=surface.maxConnectionFeedbackRounds || apf.apfConnectionFailures.empty()) {
+                    result.apfConnectionFailures=apf.apfConnectionFailures;
+                    return fail("pipeline_apf_failed","APF did not produce an accepted connected path after available connection feedback.");
+                }
+                std::set<std::size_t> failedEdges,controls;
+                const auto& knots=ga.plan.trajectory.points;
+                for(const auto& interval:apf.apfConnectionFailures)for(std::size_t i=0;i+1<knots.size();++i)
+                    if(knots[i].time<interval.endTime-1e-10 && knots[i+1].time>interval.beginTime+1e-10)
+                        failedEdges.insert(i);
+                if(failedEdges.empty())return fail("pipeline_feedback_mapping_failed","APF failure does not map to an original control interval.");
+                int visit=0;
+                for(const auto edge:failedEdges) {
+                    visit=std::max(visit,++feedbackVisits[edge]);
+                    rejectedConnections.push_back({edge,knots[edge].q,knots[edge+1].q});
+                }
+                const std::size_t padding=std::min<std::size_t>(32,2*std::size_t(visit));
+                for(const auto edge:failedEdges) {
+                    const auto first=edge>padding?edge-padding:0;
+                    const auto last=std::min(knots.size()-1,edge+1+padding);
+                    for(std::size_t i=first;i<=last;++i)
+                        if(i!=0 || request.startJoints.empty())controls.insert(i);
+                }
+                const auto feedbackEvent=nlohmann::json{{"round",feedbackRound+1},{"source_edges_zero_based",failedEdges},
+                    {"resample_controls_zero_based",controls},{"seed","current point-safe GA controls"},
+                    {"anchors","immutable original surface points"},{"rejected_connections",rejectedConnections.size()}}.dump();
+                result.diagnostics.push_back({"pipeline_apf_ga_feedback",feedbackEvent});
+                report("APF -> GA: "+feedbackEvent);
+                // Re-enter GA with the accepted point field, not the incomplete APF path.
+                // Existing radius authorizations survive; only a newly accepted GA may
+                // select new distances, which are locked again before the next APF.
+                distancesLocked=false;request.gaRadiusEvolutionEnabled=true;
+                request.plan=ga.plan;request.optimizationSeed=ga.plan.trajectory;
+                request.verificationTrajectory={};request.pipelineStage="ga";
+                request.controlPointsOnly=true;request.optimizeAvoidance=false;
+                request.gaResampleControls.assign(controls.begin(),controls.end());
+                request.gaRejectedConnections=rejectedConnections;
+                request.pointSearchSequence=++feedbackSearchSequence;
+                prepareSurface(sourceTimes);
+                auto replacement=evaluateStage();append(replacement);
+                for(int localRetry=1;!replacement.success && !replacement.cancelled && localRetry<3;++localRetry) {
+                    const bool disconnected=std::any_of(replacement.diagnostics.begin(),replacement.diagnostics.end(),[](const auto& d){
+                        return d.code=="no_valid_candidate_path" || d.code=="ga_point_unresolved" || d.code=="ga_connection_unresolved";});
+                    const bool timing=std::any_of(replacement.diagnostics.begin(),replacement.diagnostics.end(),[](const auto& d){return d.code=="ga_velocity_retime_required";});
+                    if(!disconnected || timing || (request.cancelled && request.cancelled()))break;
+                    if(replacement.gaRadiusFractions.size()==radiusFractions.size())for(std::size_t i=0;i<radiusFractions.size();++i)
+                        radiusFractions[i]=std::max(radiusFractions[i],replacement.gaRadiusFractions[i]);
+                    const std::size_t expandedPadding=std::min<std::size_t>(32,padding+2*localRetry);
+                    for(const auto edge:failedEdges) {
+                        const auto first=edge>expandedPadding?edge-expandedPadding:0;
+                        const auto last=std::min(knots.size()-1,edge+1+expandedPadding);
+                        for(std::size_t i=first;i<=last;++i)if(i!=0 || request.startJoints.empty())controls.insert(i);
+                    }
+                    request.gaResampleControls.assign(controls.begin(),controls.end());
+                    request.pointSearchSequence=++feedbackSearchSequence;prepareSurface(sourceTimes);
+                    const auto retryEvent=nlohmann::json{{"round",feedbackRound+1},{"local_retry",localRetry},
+                        {"resample_controls_zero_based",controls},{"search_sequence",request.pointSearchSequence}}.dump();
+                    result.diagnostics.push_back({"pipeline_feedback_ga_window_expanded",retryEvent});
+                    report("GA feedback: expand disconnected local window: "+retryEvent);
+                    replacement=evaluateStage();append(replacement);
+                }
+                if(replacement.cancelled || (request.cancelled && request.cancelled()))
+                    return fail("pipeline_cancelled","Cancelled during GA feedback search.");
+                const bool needsTiming=!replacement.success && !replacement.plan.trajectory.empty() &&
+                    std::any_of(replacement.diagnostics.begin(),replacement.diagnostics.end(),[](const auto& d){return d.code=="ga_velocity_retime_required";});
+                request.gaResampleControls.clear();request.gaRejectedConnections.clear();
+                if(!replacement.success && !needsTiming)
+                    return fail("pipeline_feedback_ga_failed","Local GA feedback did not return a new connected point-safe field.");
+                if(replacement.gaRadiusFractions.size()==radiusFractions.size())radiusFractions=replacement.gaRadiusFractions;
+                lockSelectedDistances(replacement);
+                if(needsTiming) {
+                    if(!request.cdfOptions.retimeOutput)return fail("pipeline_feedback_timing_required","Feedback controls require exact retiming.");
+                    auto retimedTimes=sourceTimes;
+                    retime(replacement.plan,retimedTimes);request.plan=replacement.plan;
+                    request.optimizationSeed=replacement.plan.trajectory;prepareSurface(retimedTimes);
+                    replacement=evaluateStage();append(replacement);
+                    if(!replacement.success)return fail("pipeline_feedback_ga_replay_failed","Retimed feedback controls did not pass fresh validation.");
+                    sourceTimes=std::move(retimedTimes);
+                }
+                ga=std::move(replacement);stage("GA feedback safe controls (segment interiors unchecked)",ga.plan,false);
+                retime(ga.plan,sourceTimes);
+                request.plan=ga.plan;request.optimizationSeed=ga.plan.trajectory;
+                request.pipelineStage="apf";request.controlPointsOnly=false;request.optimizeAvoidance=true;
+                prepareSurface(sourceTimes);
+                report("APF: retry connection from new GA controls with locked selected spray distances");
+            }
+            if(pendingRetime) {
+                apf.plan=request.plan;apf.plan.trajectory=std::move(apf.retimingCandidate);
+                report("APF: geometry/process checked; retime the exact pending path, then independently replay all gates");
+            }
+            retime(apf.plan,sourceTimes,pendingRetime);
             // Retiming never changes geometry; replay the exact output under all original gates.
             request.pipelineStage="validate";request.optimizeAvoidance=false;
             request.plan=apf.plan;request.optimizationSeed={};request.verificationTrajectory=apf.plan.trajectory;
@@ -265,6 +463,18 @@ namespace motion_planning
             result.plan.trajectory.name=result.plan.id;
             for(const auto& p:result.plan.trajectory.points)result.sourceReferenceTimes.push_back(sourceTimeAt(sourceTimes,p.time));
             result.statistics.inputWaypointCount=static_cast<int>(ga.plan.trajectory.points.size());
+            nlohmann::json reference={{"type","ga_apf_surface_reference"},{"version",1},{"robot_id",result.plan.robotId},
+                {"joint_names",result.plan.jointNames},{"nominal_distance_m",surface.sprayDistance},
+                {"clearance_m",request.minimumClearance},{"tcp_link",request.tcpLinkName},
+                {"source_controls",nlohmann::json::array()},{"output_times_s",nlohmann::json::array()},
+                {"source_times_s",result.sourceReferenceTimes},{"selected_distances_m",selectedDistances}};
+            const auto matrix=[](const Eigen::Isometry3d& pose) {
+                std::vector<double> values;for(int row=0;row<4;++row)for(int column=0;column<4;++column)values.push_back(pose.matrix()(row,column));return values;
+            };
+            reference["link_from_tcp"]=matrix(request.linkFromTcp);
+            for(const auto& point:originalControls.points)reference["source_controls"].push_back({{"time_s",point.time},{"matrix",matrix(point.tcpPose)}});
+            for(const auto& point:result.plan.trajectory.points)reference["output_times_s"].push_back(point.time);
+            result.plan.optimizationMetadata=reference.dump();
             result.success=true;
             result.diagnostics.push_back({"pipeline_sampled_valid","GA -> APF -> optional CDF completed; sampled collision checks passed, not a conservative whole-motion certificate."});
             return result;

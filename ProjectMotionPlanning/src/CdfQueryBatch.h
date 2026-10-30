@@ -44,6 +44,8 @@ namespace motion_planning::detail
 
     private:
         struct StateHash { std::size_t operator()(const std::vector<double>& values) const; };
+        StateValidationResult singleMotion(const std::vector<double>& from,
+            const std::vector<double>& to, const MotionValidationOptions& options);
         void parallelFor(std::size_t count, const std::function<void(std::size_t, std::size_t)>& work);
         void rememberDistance(const std::vector<double>& key, const SignedDistanceSample& sample);
         void workerLoop(std::size_t worker);

@@ -13,6 +13,9 @@ public:
     // Numerical proposals only: accepted roots still require original-model FK.
     Eigen::Isometry3d forward(const std::vector<double>& joints) const;
     Eigen::Matrix<double,6,6> jacobian(const std::vector<double>& joints) const;
+    // Necessary geometric bound only, enabled for a verified spherical wrist.
+    // False means unknown; it never establishes reachability or safety.
+    bool definitelyUnreachable(const Eigen::Isometry3d& target) const;
 private:
     GpuSerialIkModel model_{};
     CartesianMultiIkOptions options_;
@@ -21,5 +24,10 @@ private:
     std::string modelError_;
     double modelErrorMax_=0;
     std::size_t cpuFkRejected_=0,verifiedRoots_=0;
+    bool reachBoundReady_=false;
+    Eigen::Vector3d reachAxis_=Eigen::Vector3d::UnitZ(),reachAxisPoint_=Eigen::Vector3d::Zero();
+    Eigen::Vector3d wristInTcp_=Eigen::Vector3d::Zero();
+    double shoulderAxial_=0,shoulderRadius_=0,reachMinimum_=0,reachMaximum_=0,reachPadding_=1e-5;
+    std::size_t reachRejectedTargets_=0;
 };
 }}

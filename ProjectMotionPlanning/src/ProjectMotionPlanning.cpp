@@ -161,7 +161,7 @@ namespace motion_planning
         std::vector<std::string> collisionFreeLinks;
         mutable PlanningSceneQueryCounts queries;
 
-        StateValidationResult applyState(const std::vector<double>& jointValues, bool checkCollision)
+        StateValidationResult applyState(const std::vector<double>& jointValues, bool checkCollision, bool updateCollision=true)
         {
             if(checkCollision)++queries.stateValidationRequests;
             if (jointValues.size() != jointNames.size())
@@ -186,6 +186,7 @@ namespace motion_planning
             if (!setResult.success)
                 return StateValidationResult::failure("runtime_state_update_failed", setResult.message);
 
+            if(!updateCollision)return StateValidationResult::success();
             const simulation_runtime::Result updateResult = collision.update(simulation);
             if (!updateResult.success)
                 return StateValidationResult::failure("collision_update_failed", updateResult.message);
@@ -268,6 +269,18 @@ namespace motion_planning
             }
             return StateValidationResult::success();
         }
+        return validateSampledMotion(from, to, options, {});
+    }
+
+    StateValidationResult ProjectPlanningSceneSnapshot::validateSampledMotion(
+        const std::vector<double>& from, const std::vector<double>& to,
+        const MotionValidationOptions& options, const MotionSampleBatch& batch)
+    {
+        // The conservative SDK path owns its own bounds and detector policy.
+        // The batch adapter is exclusively for this same sampled validation grid.
+        if(m_impl->conservativeMotion) return validateMotion(from, to, options);
+        if(from.size() != m_impl->jointNames.size() || to.size() != from.size())
+            return StateValidationResult::failure("motion_size_mismatch", "Motion endpoint sizes do not match the planning scene.");
         if (!(options.maxJointStep > 0.0) || !std::isfinite(options.maxJointStep))
             return StateValidationResult::failure("invalid_motion_step", "Maximum joint validation step must be positive and finite.");
 
@@ -289,6 +302,15 @@ namespace motion_planning
             1,
             static_cast<std::size_t>(std::ceil(maximumDelta / options.maxJointStep)));
 
+        const auto invalid = [](StateValidationResult result, double ratio) {
+            std::ostringstream message;
+            message << "Motion is invalid at interpolation ratio " << ratio;
+            if(!result.message.empty()) message << ": " << result.message;
+            result.message = message.str();
+            return result;
+        };
+        std::vector<std::vector<double>> samples;
+        if(batch) samples.reserve(32);
         std::vector<double> sample(from.size(), 0.0);
         for (std::size_t step = 0; step <= stepCount; ++step)
         {
@@ -306,15 +328,18 @@ namespace motion_planning
                     sample[index] = wrapContinuousAngle(sample[index]);
             }
 
-            StateValidationResult result = m_impl->applyState(sample, true);
-            if (!result.valid)
-            {
-                std::ostringstream message;
-                message << "Motion is invalid at interpolation ratio " << ratio;
-                if (!result.message.empty())
-                    message << ": " << result.message;
-                result.message = message.str();
-                return result;
+            if(batch) {
+                samples.push_back(sample);
+                if(samples.size() < 32 && step != stepCount) continue;
+                const auto checked = batch(samples);
+                if(checked.size() != samples.size())
+                    return StateValidationResult::failure("motion_batch_size", "Motion sample results are incomplete.");
+                for(std::size_t i = 0; i < checked.size(); ++i) if(!checked[i].valid)
+                    return invalid(checked[i], double(step + 1 - samples.size() + i) / double(stepCount));
+                samples.clear();
+            } else {
+                const auto result = m_impl->applyState(sample, true);
+                if(!result.valid) return invalid(result, ratio);
             }
         }
         return StateValidationResult::success();
@@ -447,7 +472,13 @@ namespace motion_planning
     std::vector<double> ProjectPlanningSceneSnapshot::virtualBaffleSearchViolations(const std::vector<std::vector<double>>& joints,double clearance,bool gpu)
     {
         std::vector<VirtualBaffleEnvironment::SearchPose> poses;poses.reserve(joints.size());
-        for(const auto& q:joints)poses.push_back(setState(q)?m_impl->baffles.captureSearchPose(m_impl->simulation):VirtualBaffleEnvironment::SearchPose{});
+        // Ranking needs actual attachment/link transforms, not refreshed physical
+        // collision broadphase trees for every proposal. Safety queries retain their
+        // normal full updates. Synchronize once at the end for external observers.
+        for(const auto& q:joints)poses.push_back(m_impl->applyState(q,false,false).valid?
+            m_impl->baffles.captureSearchPose(m_impl->simulation):VirtualBaffleEnvironment::SearchPose{});
+        if(!joints.empty() && !m_impl->collision.update(m_impl->simulation).success)
+            return std::vector<double>(joints.size(),std::numeric_limits<double>::infinity());
         return m_impl->baffles.searchViolationBatch(poses,clearance,gpu);
     }
     std::string ProjectPlanningSceneSnapshot::virtualBaffleSearchStatus() const

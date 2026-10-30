@@ -12,6 +12,8 @@
 #include <limits>
 #include <numeric>
 #include <functional>
+#include <future>
+#include <thread>
 namespace motion_planning {
 namespace {
 using Triangle=ModelTrajPlan::VirtualBaffle::Triangle;
@@ -245,9 +247,13 @@ std::vector<double> VirtualBaffleEnvironment::searchViolationBatch(const std::ve
             for(const auto& b:baffles_){gpuEdgeOffsets_.push_back(int(edges.size()/4));for(const auto& ring:b.geometry.contours)for(std::size_t j=0;j<ring.size();++j){const auto& a=ring[j];const auto& c=ring[(j+1)%ring.size()];edges.insert(edges.end(),{a.x(),a.y(),c.x(),c.y()});}}
             gpuEdgeOffsets_.push_back(int(edges.size()/4));auto backend=std::make_shared<detail::GpuBaffleSearch>();backend->configure(std::move(triangles),std::move(edges));gpu_=std::move(backend);
         }
-        std::vector<detail::GpuBaffleTask> tasks;std::vector<std::size_t> owners;
-        for(std::size_t i=0;i<poses.size();++i){const auto& pose=poses[i];
-            if(!pose.valid || pose.bodies.size()!=bodies_.size() || pose.objects.size()!=baffles_.size())return cpu();
+        // Each pose owns its staging buffer. Geometry and BVH data are immutable;
+        // merge in the original pose/body order before the single CUDA submission.
+        // Small batches retain the serial path to avoid thread startup overhead.
+        std::vector<std::vector<detail::GpuBaffleTask>> prepared(poses.size());
+        const auto prepare=[&](std::size_t i) {
+            const auto& pose=poses[i];
+            if(!pose.valid || pose.bodies.size()!=bodies_.size() || pose.objects.size()!=baffles_.size())return false;
             for(std::size_t j=0;j<baffles_.size();++j){const auto& g=baffles_[j].geometry;if(!g.enabled)continue;
                 for(std::size_t k=0;k<bodies_.size();++k){const auto& body=bodies_[k];if(body.triangles.empty())continue;
                     const Eigen::Isometry3d tf=pose.objects[j].inverse()*pose.bodies[k];const double margin=clearance+body.margin,half=g.thickness/2+margin;
@@ -273,10 +279,24 @@ std::vector<double> VirtualBaffleEnvironment::searchViolationBatch(const std::ve
                     }
                     if(t.triangleIndices.empty())continue;
                     if(t.triangleIndices.size()==body.triangles.size())t.triangleIndices.clear();
-                    tasks.push_back(std::move(t));owners.push_back(i);
+                    prepared[i].push_back(std::move(t));
                 }
             }
-        }
+            return true;
+        };
+        const unsigned workers=poses.size()<64?1:std::min(4u,std::max(1u,std::thread::hardware_concurrency()/4));
+        const auto prepareRange=[&](unsigned worker) {
+            bool valid=true;
+            for(std::size_t i=worker;i<poses.size();i+=workers)if(!prepare(i))valid=false;
+            return valid;
+        };
+        std::vector<std::future<bool>> pending;
+        for(unsigned worker=1;worker<workers;++worker)pending.push_back(std::async(std::launch::async,prepareRange,worker));
+        bool preparedAll=prepareRange(0);
+        for(auto& work:pending)if(!work.get())preparedAll=false;
+        if(!preparedAll)return cpu();
+        std::vector<detail::GpuBaffleTask> tasks;std::vector<std::size_t> owners;
+        for(std::size_t i=0;i<prepared.size();++i)for(auto& task:prepared[i]){tasks.push_back(std::move(task));owners.push_back(i);}
         std::vector<double> merits;
         if(!gpu_->evaluate(tasks,merits)){++gpuFallbackBatches_;return cpu();}
         for(std::size_t i=0;i<merits.size();++i)result[owners[i]]=std::max(result[owners[i]],merits[i]);return result;

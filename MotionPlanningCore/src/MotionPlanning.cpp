@@ -330,6 +330,7 @@ namespace motion_planning
                 plan.robotId = planJson.value("robotId", std::string());
                 plan.jointNames = planJson.value("jointNames", std::vector<std::string>());
                 plan.processMetadata = planJson.value("processMetadata", std::string());
+                plan.optimizationMetadata = planJson.value("optimizationMetadata", std::string());
                 if(planJson.contains("trajectory")) {
                     plan.trajectory = readTrajectory(planJson.at("trajectory"));
                 }
@@ -410,7 +411,8 @@ namespace motion_planning
                 { "jointNames", storedPlan.jointNames },
                 { "trajectory", writeTrajectory(storedPlan.trajectory) },
                 { "cartesianControlPoints", writeCartesianTrajectory(storedPlan.cartesianControlPoints) },
-                { "processMetadata", storedPlan.processMetadata }
+                { "processMetadata", storedPlan.processMetadata },
+                { "optimizationMetadata", storedPlan.optimizationMetadata }
             });
         }
         const std::string payload = Json{

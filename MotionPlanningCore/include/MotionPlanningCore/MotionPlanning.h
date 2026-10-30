@@ -186,6 +186,8 @@ namespace motion_planning
         // Optional producer-owned process metadata. Kept opaque here to avoid
         // coupling the planning core to a particular spray/workbench package.
         std::string processMetadata;
+        // Optional domain-owned optimization reference, opaque to the core.
+        std::string optimizationMetadata;
     };
 
     class MotionPlanningProjectStore
