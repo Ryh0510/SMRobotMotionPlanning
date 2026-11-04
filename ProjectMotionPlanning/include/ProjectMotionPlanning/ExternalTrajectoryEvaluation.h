@@ -18,6 +18,7 @@ namespace motion_planning
         std::size_t sourceEdge = 0;
         std::vector<double> fromJoints;
         std::vector<double> toJoints;
+        bool requiresDirectProcess = false;
     };
 
     struct ExternalTrajectoryEvaluationRequest
@@ -43,13 +44,19 @@ namespace motion_planning
         double maximumTcpPositionDeviation = 0.001;
         double maximumTcpOrientationDeviation = 0.01;
         std::size_t maxSamplesPerEdge = 10000;
-        // Empty retains legacy API. Explicit stages are ik, ga, apf, cdf, validate, downsample.
+        // Empty retains legacy API. Explicit stages are ik, ga, apf, cdf, validate.
         std::string pipelineStage;
         AdaptivePostureOptions postureOptions;
         bool includeKinematicAudit = false;
         int gaPointEvaluations = 131072; // established portfolio, then bounded GA rescue
         bool gaGpuEnabled = true; // GPU search merit; CPU exact IK/collision gates
         bool gaGpuIkEnabled = true; // actual serial-chain GPU IK, CPU FK validated
+        // Maximum parallel point jobs; short remaining queues use ordered continuation.
+        // Execution scheduling only. Each worker owns an isolated full-model scene.
+        int gaPointWorkers = 3;
+        // Internal candidate-generation job; never a continuous-path certificate.
+        bool gaCandidateGenerationOnly = false;
+        std::vector<std::size_t> gaSearchControls;
         int gaInitialPostures = 5000;
         int gaGenerations = 8; // 24 nominal offspring/round; enabled radius adds 24/round after unlocking
         bool gaRadiusEvolutionEnabled = false; // opt-in; rounds 3/4/5 unlock +/-30/50/80% only while unsafe
@@ -69,13 +76,14 @@ namespace motion_planning
         std::vector<GaRejectedConnection> gaRejectedConnections;
         robottrajectory::JointTrajectory optimizationSeed;
         bool densifyOptimizationKnots = false;
-        // Zero keeps legacy adaptive support. Nonzero targets a balanced node count; safety may require additional nodes.
+        // Legacy caller hint, retained for source compatibility; sparse APF uses local support only.
         std::size_t preferredOutputWaypoints = 0;
         bool optimizeAvoidance = false;
         bool cdfPointOptimization = false;
         ProjectCdfQpRepairOptions cdfOptions = [] { ProjectCdfQpRepairOptions o; o.postSmoothingIterations=2; return o; }();
         std::vector<double> jointWeights;
         std::vector<double> startJoints; // exact shared segment boundary, radians
+        bool cartesianLinearMotion = false; // MoveL; legacy direct evaluator callers remain joint-linear
         bool controlPointsOnly = false;
         // Independent nodes only: no edges, smoothing or whole-path certificate.
         bool independentPointsOnly = false;

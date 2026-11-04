@@ -13,6 +13,7 @@
 #include <limits>
 #include <sstream>
 #include <utility>
+#include <nlohmann/json.hpp>
 
 namespace motion_planning
 {
@@ -257,7 +258,8 @@ namespace motion_planning
                     auto candidate = attempt.joints;
                     for(std::size_t j = 0; j < candidate.size(); ++j) {
                         candidate[j] += delta(static_cast<int>(j));
-                        if(!multi) { candidate[j] = normalizeAngle(candidate[j]); }
+                        if(!multi && options.lower.size()==candidate.size())
+                            candidate[j]=std::clamp(candidate[j],options.lower[j],options.upper[j]);
                     }
                     const Eigen::Matrix4d pose = options.worldForwardKinematics(candidate).matrix();
                     const double norm = pose.allFinite() ? rigidPoseError(pose, desired).norm()
@@ -324,7 +326,7 @@ namespace motion_planning
 
         std::vector<std::vector<double>> makeSeedSet(
             const std::vector<double>& preferredSeed,
-            const std::vector<double>& previousSolution)
+            const std::vector<double>& previousSolution, bool preserveTurns = false)
         {
             std::vector<std::vector<double>> seeds;
             auto appendSeed = [&](std::vector<double> seed) {
@@ -332,7 +334,7 @@ namespace motion_planning
                     return;
                 }
                 for(double& joint : seed) {
-                    joint = normalizeAngle(joint);
+                    if(!preserveTurns) joint = normalizeAngle(joint);
                 }
                 if(std::find(seeds.begin(), seeds.end(), seed) == seeds.end()) {
                     seeds.push_back(std::move(seed));
@@ -453,6 +455,14 @@ namespace motion_planning
             result.diagnostics.push_back(diagnostic("invalid_ik_options", "IK parameters must be finite and positive."));
             return result;
         }
+        if(!options.lower.empty() || !options.upper.empty()) {
+            if(options.lower.size()!=kIrb4600JointCount || options.upper.size()!=kIrb4600JointCount) {
+                result.diagnostics.push_back(diagnostic("invalid_ik_bounds","IK physical limits must match the joint group."));return result;
+            }
+            for(std::size_t j=0;j<kIrb4600JointCount;++j)if(std::isnan(options.lower[j]) || std::isnan(options.upper[j]) || options.lower[j]>options.upper[j]) {
+                result.diagnostics.push_back(diagnostic("invalid_ik_bounds","Invalid physical joint interval."));return result;
+            }
+        }
         result.plan.robotId = robotId;
         result.plan.jointNames = resolvedJointNames(plan, options);
 
@@ -465,6 +475,31 @@ namespace motion_planning
             preferredSeed.assign(kIrb4600JointCount, 0.0);
         }
 
+        std::vector<std::vector<double>> exportedSeeds;
+        if(options.worldForwardKinematics && !plan.optimizationMetadata.empty()) try {
+            const auto saved=nlohmann::json::parse(plan.optimizationMetadata,nullptr,false);
+            if(saved.is_object() && saved.value("kind",std::string())=="tcp_joint_seeds_v1" &&
+                saved.value("robot_id",std::string())==robotId && saved.value("joint_names",std::vector<std::string>())==result.plan.jointNames &&
+                saved.contains("points") && saved["points"].is_array() && saved["points"].size()==plan.cartesianControlPoints.points.size()) {
+                bool valid=true;
+                for(std::size_t i=0;i<saved["points"].size();++i) {
+                    const auto& row=saved["points"][i];auto q=row.value("q",std::vector<double>());
+                    const auto convention=saved.value("joint_convention",std::string("caller"));
+                    if(q.size()==kIrb4600JointCount && ((convention=="runtime" && options.mapIrb4600StoredJointSigns) ||
+                        (convention=="irb4600_stored" && !options.mapIrb4600StoredJointSigns)))
+                        q=irb4600RobotSystemJointValues(q);
+                    valid &= q.size()==kIrb4600JointCount && std::abs(row.value("time",-1.)-plan.cartesianControlPoints.points[i].time)<1e-9;
+                    if(q.size()==kIrb4600JointCount)for(std::size_t j=0;j<q.size();++j)
+                        valid &= std::isfinite(q[j]) && (options.lower.empty() || (q[j]>=options.lower[j]-1e-9 && q[j]<=options.upper[j]+1e-9));
+                    if(valid) {
+                        const auto pose=options.worldForwardKinematics(q);
+                        valid=pose.matrix().allFinite() && rigidPoseError(pose.matrix(),plan.cartesianControlPoints.points[i].tcpPose.matrix()).norm()<=options.tolerance;
+                    }
+                    exportedSeeds.push_back(std::move(q));
+                }
+                if(!valid)exportedSeeds.clear();
+            }
+        } catch(const nlohmann::json::exception&) {exportedSeeds.clear();}
         std::vector<double> previousSolution;
         result.points.reserve(plan.cartesianControlPoints.points.size());
         result.plan.trajectory.points.reserve(plan.cartesianControlPoints.points.size());
@@ -488,19 +523,50 @@ namespace motion_planning
                 continue;
             }
             IkAttempt bestAttempt;
+            if(!exportedSeeds.empty()) {
+                bestAttempt.joints=exportedSeeds[pointIndex];bestAttempt.success=true;bestAttempt.errorNorm=0;
+            }
             const std::vector<std::vector<double>> seeds = makeSeedSet(
                 preferredSeed,
-                options.usePreviousSolutionAsSeed ? previousSolution : std::vector<double>());
-            for(const std::vector<double>& seed : seeds) {
+                options.usePreviousSolutionAsSeed ? previousSolution : std::vector<double>(),
+                bool(options.worldForwardKinematics));
+            double bestContinuity = std::numeric_limits<double>::infinity();
+            const auto& reference = previousSolution.empty() ? preferredSeed : previousSolution;
+            for(auto seed : seeds) {
+                if(!exportedSeeds.empty())break;
+                if(options.lower.size()==seed.size())for(std::size_t j=0;j<seed.size();++j)
+                    seed[j]=std::clamp(seed[j],options.lower[j],options.upper[j]);
                 IkAttempt attempt = options.worldForwardKinematics
                     ? solveModelPose(worldTarget, seed, options)
                     : solveSinglePose(dhParams, flangeTarget, seed, options);
-                if(attempt.errorNorm < bestAttempt.errorNorm) {
-                    bestAttempt = std::move(attempt);
+                double continuity=0;
+                if(attempt.success && options.worldForwardKinematics) {
+                    for(std::size_t j=0;j<attempt.joints.size();++j) {
+                        const double value=attempt.joints[j];
+                        double turn=std::round((reference[j]-value)/(2*kPi));
+                        if(options.lower.size()==attempt.joints.size()) {
+                            const double first=std::ceil((options.lower[j]-value)/(2*kPi)-1e-10);
+                            const double last=std::floor((options.upper[j]-value)/(2*kPi)+1e-10);
+                            if(first>last){attempt.success=false;break;}
+                            turn=std::clamp(turn,first,last);
+                        }
+                        attempt.joints[j]=value+turn*2*kPi;
+                        continuity=std::max(continuity,std::abs(attempt.joints[j]-reference[j]));
+                    }
+                    if(attempt.success) {
+                        const auto pose=options.worldForwardKinematics(attempt.joints).matrix();
+                        attempt.errorNorm=pose.allFinite()?rigidPoseError(pose,worldTarget).norm():std::numeric_limits<double>::infinity();
+                        attempt.success=attempt.errorNorm<=options.tolerance;
+                    }
                 }
-                if(bestAttempt.success) {
-                    break;
+                if(attempt.success && (!bestAttempt.success || continuity<bestContinuity)) {
+                    bestContinuity=continuity;bestAttempt=std::move(attempt);
+                } else if(!bestAttempt.success && attempt.errorNorm<bestAttempt.errorNorm) {
+                    bestAttempt=std::move(attempt);
                 }
+                // Continue from the previous legal turn chart. Only ambiguous,
+                // distant branches need the remaining alternate seeds.
+                if(bestAttempt.success && (!options.worldForwardKinematics || bestContinuity<0.5))break;
             }
 
             pointResult.success = bestAttempt.success;
@@ -529,6 +595,12 @@ namespace motion_planning
         result.success = result.plan.trajectory.points.size() == plan.cartesianControlPoints.points.size();
         if(!result.success && result.diagnostics.empty()) {
             result.diagnostics.push_back(diagnostic("ik_failed", "Inverse kinematics failed."));
+        }
+        if(options.worldForwardKinematics) {
+            auto metadata=nlohmann::json::parse(result.plan.optimizationMetadata,nullptr,false);
+            if(!metadata.is_object())metadata=nlohmann::json::object();
+            metadata["joint_convention"]=options.mapIrb4600StoredJointSigns?"irb4600_stored":"runtime";
+            result.plan.optimizationMetadata=metadata.dump();
         }
         return result;
     }

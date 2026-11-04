@@ -59,6 +59,42 @@ namespace
 int main()
 {
     {
+        std::vector<std::vector<std::vector<double>>> values(2);
+        for(int i=0;i<96;++i)values[0].push_back({double(i)});
+        values[1].push_back({0.});
+        const auto sample=fixture(values);LayeredIkGraphOptions o;o.maxPaths=3;
+        int probes=0;
+        o.edgeAdmissible=[&](std::size_t,const auto& a,const auto&){++probes;return a.joints[0]>=2.;};
+        const auto chosen=ProjectLayeredIkGraph::filter(sample,o);
+        bool exact=chosen.success && chosen.paths.size()==3;
+        for(std::size_t i=0;exact && i<3;++i)exact &= chosen.paths[i].selections==std::vector<std::size_t>({i+2,0}) &&
+            chosen.paths[i].cost==double((i+2)*(i+2));
+        check(exact,"Rejected low-cost edges do not displace the exact next three paths");
+        check(probes<=8,"Top-3 avoids expensive collision probes of irrelevant higher-cost edges");
+    }
+    {
+        const auto sample=fixture({{{.13},{1.21},{2.34}},{{-.45},{.72},{2.18}},{{-.81},{1.56}},{{.24},{2.07}}});
+        LayeredIkGraphOptions o;o.maxPaths=30;o.jointWeights={1.7};
+        o.nodeCost=[](std::size_t i,const auto& c){return .07*i+.03*c.joints[0]*c.joints[0];};
+        o.edgeAdmissible=[](std::size_t i,const auto& a,const auto& b){
+            return (int(std::llround(std::abs(a.joints[0])*100))+int(std::llround(std::abs(b.joints[0])*100))+int(i))%5>=2;
+        };
+        auto expected=enumerate(sample,o.jointWeights);
+        expected.erase(std::remove_if(expected.begin(),expected.end(),[&](const auto& path){
+            for(std::size_t i=1;i<path.selections.size();++i)if(!o.edgeAdmissible(i-1,
+                sample.layers[i-1].candidates[path.selections[i-1]],sample.layers[i].candidates[path.selections[i]]))return true;
+            return false;
+        }),expected.end());
+        for(auto& path:expected)for(std::size_t i=0;i<path.selections.size();++i)
+            path.cost+=o.nodeCost(i,sample.layers[i].candidates[path.selections[i]]);
+        std::sort(expected.begin(),expected.end(),[](const auto& a,const auto& b){return a.cost<b.cost;});
+        const auto actual=ProjectLayeredIkGraph::filter(sample,o);
+        bool exact=actual.success && actual.paths.size()==std::min(o.maxPaths,expected.size());
+        for(std::size_t i=0;exact && i<actual.paths.size();++i)exact &= actual.paths[i].selections==expected[i].selections &&
+            std::abs(actual.paths[i].cost-expected[i].cost)<1e-10;
+        check(exact,"Collision-gated Top-M with node costs matches independent exhaustive path enumeration");
+    }
+    {
         auto sample=fixture({{{0.},{1.}},{{0.},{1.}}});LayeredIkGraphOptions o;
         o.nodeCost=[](std::size_t,const CartesianIkCandidate& c){return c.joints[0]<.5?10.:0.;};
         const auto chosen=ProjectLayeredIkGraph::filter(sample,o);

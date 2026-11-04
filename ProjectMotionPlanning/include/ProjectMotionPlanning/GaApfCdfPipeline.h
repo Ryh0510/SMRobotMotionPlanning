@@ -16,11 +16,6 @@ namespace motion_planning
         const std::string& robotId, std::string& linkName,
         Eigen::Isometry3d& linkFromTcp, std::string& error);
 
-    // Restore immutable surface/process references saved by the pipeline before
-    // downsampling/replaying its exact output. Reject malformed/stale references.
-    bool prepareGaApfDownsamplingRequest(ExternalTrajectoryEvaluationRequest& request,
-        std::string& error);
-
     // Cartesian-only input first enumerates physical IK and selects Top-1 for
     // initialization (a complete leading prefix if missing poses require GA).
     // GA checks control points only. APF connects them and independently replays

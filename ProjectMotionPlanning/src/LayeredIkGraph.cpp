@@ -123,6 +123,11 @@ namespace motion_planning
                 if(cancelled()) { return cancel(); }
                 if(!allowed[i][k]) { continue; }
                 std::vector<double> edges(previous.size());
+                std::vector<bool> verified(previous.size(), false);
+                const auto edgeAllowed = [&](std::size_t j) {
+                    return !options.edgeAdmissible || options.edgeAdmissible(i - 1,
+                        ik.layers[i-1].candidates[j], ik.layers[i].candidates[k]);
+                };
                 Heap heap;
                 // Each predecessor provides a sorted list shifted by one edge cost.
                 // A k-way merge obtains the exact M best prefixes for this node.
@@ -140,8 +145,7 @@ namespace motion_planning
                             admissible = false; break;
                         }
                     }
-                    if(!admissible || (options.edgeAdmissible && !options.edgeAdmissible(i - 1,
-                        ik.layers[i-1].candidates[j], ik.layers[i].candidates[k]))) { continue; }
+                    if(!admissible) { continue; }
                     double cost = nodeCosts[i][k];
                     for(std::size_t r = 0; r < dimension; ++r) {
                         if(weights[r] == 0.0) { continue; }
@@ -149,7 +153,10 @@ namespace motion_planning
                         cost += weights[r] * delta * delta;
                     }
                     const double sum = cost + previous[j][0].cost;
-                    if(!std::isfinite(sum)) { return fail("Joint displacement cost overflow."); }
+                    if(!std::isfinite(sum)) {
+                        if(!edgeAllowed(j)) { continue; }
+                        return fail("Joint displacement cost overflow.");
+                    }
                     edges[j] = cost;
                     heap.push({sum, j, 0});
                 }
@@ -157,6 +164,13 @@ namespace motion_planning
                 while(!heap.empty() && best.size() < options.maxPaths) {
                     if(cancelled()) { return cancel(); }
                     const auto entry = heap.top(); heap.pop();
+                    // Heap order is a lower bound before collision/process checks.
+                    // Only an edge that can enter this node's exact Top-M needs
+                    // its expensive predicate. Rejected edges contribute no ranks.
+                    if(!verified[entry.node]) {
+                        if(!edgeAllowed(entry.node)) { continue; }
+                        verified[entry.node] = true;
+                    }
                     best.push_back({entry.cost, static_cast<std::uint32_t>(entry.node), static_cast<std::uint32_t>(entry.rank)});
                     const auto next = entry.rank + 1;
                     if(next < previous[entry.node].size()) {

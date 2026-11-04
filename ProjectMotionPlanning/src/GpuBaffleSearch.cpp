@@ -28,12 +28,15 @@ public:
 #ifdef _WIN32
     using Ptr=unsigned long long;
     HMODULE driver=nullptr,rtc=nullptr,builtins=nullptr;
+    int gpuOrdinal=0;void* stream=nullptr;
     void* context=nullptr;void* module=nullptr;void* function=nullptr;void* ikFunction=nullptr;
 #define FN(name,signature) using name##_t=int(__stdcall*)signature; name##_t name=nullptr
     FN(cuInit,(unsigned));FN(cuDeviceGet,(int*,int));FN(cuDeviceGetName,(char*,int,int));
-    FN(cuDeviceGetAttribute,(int*,int,int));FN(cuCtxCreate_v2,(void**,unsigned,int));
-    FN(cuCtxDestroy_v2,(void*));FN(cuCtxPushCurrent_v2,(void*));FN(cuCtxPopCurrent_v2,(void**));
-    FN(cuCtxSynchronize,());FN(cuMemAlloc_v2,(Ptr*,std::size_t));FN(cuMemFree_v2,(Ptr));
+    FN(cuDeviceGetAttribute,(int*,int,int));FN(cuDevicePrimaryCtxRetain,(void**,int));
+    FN(cuDevicePrimaryCtxRelease_v2,(int));FN(cuStreamCreate,(void**,unsigned));
+    FN(cuStreamDestroy_v2,(void*));FN(cuStreamSynchronize,(void*));
+    FN(cuCtxPushCurrent_v2,(void*));FN(cuCtxPopCurrent_v2,(void**));
+    FN(cuMemAlloc_v2,(Ptr*,std::size_t));FN(cuMemFree_v2,(Ptr));
     FN(cuMemcpyHtoD_v2,(Ptr,const void*,std::size_t));FN(cuMemcpyDtoH_v2,(void*,Ptr,std::size_t));
     FN(cuMemsetD8_v2,(Ptr,unsigned char,std::size_t));
     FN(cuModuleLoadDataEx,(void**,const void*,unsigned,void*,void*));FN(cuModuleUnload,(void*));
@@ -72,7 +75,8 @@ public:
             if(!driver)throw std::runtime_error("NVIDIA CUDA driver unavailable");
 #define LOAD(name) symbol(driver,name,#name)
             LOAD(cuInit);LOAD(cuDeviceGet);LOAD(cuDeviceGetName);LOAD(cuDeviceGetAttribute);
-            LOAD(cuCtxCreate_v2);LOAD(cuCtxDestroy_v2);LOAD(cuCtxPushCurrent_v2);LOAD(cuCtxPopCurrent_v2);LOAD(cuCtxSynchronize);
+            LOAD(cuDevicePrimaryCtxRetain);LOAD(cuDevicePrimaryCtxRelease_v2);LOAD(cuStreamCreate);LOAD(cuStreamDestroy_v2);LOAD(cuStreamSynchronize);
+            LOAD(cuCtxPushCurrent_v2);LOAD(cuCtxPopCurrent_v2);
             LOAD(cuMemAlloc_v2);LOAD(cuMemFree_v2);LOAD(cuMemcpyHtoD_v2);LOAD(cuMemcpyDtoH_v2);LOAD(cuMemsetD8_v2);
             LOAD(cuModuleLoadDataEx);LOAD(cuModuleUnload);LOAD(cuModuleGetFunction);LOAD(cuLaunchKernel);
 #undef LOAD
@@ -106,8 +110,11 @@ public:
             } catch(...) {nvrtcDestroyProgram(&program);throw;}
             if(compiled){std::size_t count=0;nvrtcGetProgramLogSize(program,&count);std::string log(count,'\0');if(count)nvrtcGetProgramLog(program,log.data());nvrtcDestroyProgram(&program);throw std::runtime_error("NVRTC compile: "+log.substr(0,4000));}
             std::size_t count=0;check(nvrtcGetPTXSize(program,&count),"nvrtcGetPTXSize");std::vector<char> ptx(count);check(nvrtcGetPTX(program,ptx.data()),"nvrtcGetPTX");nvrtcDestroyProgram(&program);
-            check(cuCtxCreate_v2(&context,0,gpu),"cuCtxCreate");
-            try {check(cuModuleLoadDataEx(&module,ptx.data(),0,nullptr,nullptr),"cuModuleLoadData");check(cuModuleGetFunction(&function,module,"scoreMesh"),"cuModuleGetFunction");check(cuModuleGetFunction(&ikFunction,module,"solveSerialIk"),"cuModuleGetFunction IK");
+            // Share only the device primary context. Every planner keeps its own
+            // module, stream and buffers; releasing this owner never resets CUDA.
+            gpuOrdinal=gpu;check(cuDevicePrimaryCtxRetain(&context,gpu),"cuDevicePrimaryCtxRetain");
+            check(cuCtxPushCurrent_v2(context),"cuCtxPushCurrent initialize");
+            try {check(cuStreamCreate(&stream,1),"cuStreamCreate nonblocking");check(cuModuleLoadDataEx(&module,ptx.data(),0,nullptr,nullptr),"cuModuleLoadData");check(cuModuleGetFunction(&function,module,"scoreMesh"),"cuModuleGetFunction");check(cuModuleGetFunction(&ikFunction,module,"solveSerialIk"),"cuModuleGetFunction IK");
                 upload(mesh,triangles.data(),triangles.size()*sizeof(double));upload(contours,edges.data(),edges.size()*sizeof(double));
             }catch(...){void* popped=nullptr;cuCtxPopCurrent_v2(&popped);throw;}
             void* popped=nullptr;check(cuCtxPopCurrent_v2(&popped),"cuCtxPopCurrent");ready=true;
@@ -117,8 +124,10 @@ public:
     ~Impl(){
         if(context && cuCtxPushCurrent_v2 && cuCtxPushCurrent_v2(context)==0){
             for(auto* b:{&mesh,&contours,&data,&indices,&starts,&outside,&hits,&ikModel,&ikInputs,&ikOutputs})if(b->ptr)cuMemFree_v2(b->ptr);
-            if(module)cuModuleUnload(module);void* popped=nullptr;cuCtxPopCurrent_v2(&popped);cuCtxDestroy_v2(context);
+            if(module)cuModuleUnload(module);if(stream)cuStreamDestroy_v2(stream);
+            void* popped=nullptr;cuCtxPopCurrent_v2(&popped);
         }
+        if(context && cuDevicePrimaryCtxRelease_v2)cuDevicePrimaryCtxRelease_v2(gpuOrdinal);
         if(rtc)FreeLibrary(rtc);if(builtins)FreeLibrary(builtins);if(driver)FreeLibrary(driver);
     }
 #endif
@@ -162,13 +171,16 @@ bool GpuBaffleSearch::evaluate(const std::vector<GpuBaffleTask>& tasks,std::vect
         impl->check(impl->cuMemsetD8_v2(impl->outside.ptr,0,tasks.size()*sizeof(double)),"clear merits");
         impl->check(impl->cuMemsetD8_v2(impl->hits.ptr,0,tasks.size()*sizeof(unsigned)),"clear hits");
         int count=int(tasks.size());
+        // Complete default-stream copies/clears before using this owner's
+        // nonblocking stream, without waiting for other owners' kernels.
+        impl->check(impl->cuStreamSynchronize(nullptr),"scoreMesh inputs ready");
         // Bounded kernels avoid long display-GPU watchdog stalls on large meshes.
         for(unsigned long long base=0;base<begins.back();base+=1048576){
             unsigned long long end=std::min(begins.back(),base+1048576);
             void* args[]={&impl->mesh.ptr,&impl->contours.ptr,&impl->data.ptr,&impl->indices.ptr,&impl->starts.ptr,&count,&base,&end,&impl->outside.ptr,&impl->hits.ptr};
-            impl->check(impl->cuLaunchKernel(impl->function,unsigned((end-base+255)/256),1,1,256,1,1,0,nullptr,args,nullptr),"scoreMesh launch");
+            impl->check(impl->cuLaunchKernel(impl->function,unsigned((end-base+255)/256),1,1,256,1,1,0,impl->stream,args,nullptr),"scoreMesh launch");
         }
-        impl->check(impl->cuCtxSynchronize(),"scoreMesh synchronize");
+        impl->check(impl->cuStreamSynchronize(impl->stream),"scoreMesh stream synchronize");
         std::vector<double> outside(tasks.size());std::vector<unsigned> hits(tasks.size());
         impl->check(impl->cuMemcpyDtoH_v2(outside.data(),impl->outside.ptr,outside.size()*sizeof(double)),"read merits");
         impl->check(impl->cuMemcpyDtoH_v2(hits.data(),impl->hits.ptr,hits.size()*sizeof(unsigned)),"read hits");
@@ -190,6 +202,7 @@ nlohmann::json GpuBaffleSearch::status() const {
         {"batch_queries",impl->queries},{"body_tasks",impl->taskCount},{"triangles_scored",impl->triangleCount},
         {"query_ms",impl->elapsedMs},{"initialization_ms",impl->initializationMs},
         {"ik_batches",impl->ikQueries},{"ik_tasks",impl->ikTasks},{"ik_converged",impl->ikConverged},{"ik_ms",impl->ikMs},
+        {"execution","shared_primary_context_private_nonblocking_stream_and_buffers"},
         {"scope","actual-model IK candidates and mesh/slab/aperture merit; independent CPU FK and safety gates required"}};
 }
 bool GpuBaffleSearch::solveIk(const GpuSerialIkModel& model,const std::vector<GpuIkTask>& tasks,
@@ -208,9 +221,10 @@ bool GpuBaffleSearch::solveIk(const GpuSerialIkModel& model,const std::vector<Gp
         impl->check(impl->cuCtxPushCurrent_v2(impl->context),"cuCtxPushCurrent IK");pushed=true;
         impl->upload(impl->ikModel,model.data(),model.size()*sizeof(double));impl->upload(impl->ikInputs,input.data(),input.size()*sizeof(double));impl->reserve(impl->ikOutputs,tasks.size()*7*sizeof(double));
         int count=int(tasks.size());
+        impl->check(impl->cuStreamSynchronize(nullptr),"solveSerialIk inputs ready");
         void* args[]={&impl->ikModel.ptr,&impl->ikInputs.ptr,&count,&iterations,&positionTolerance,&orientationTolerance,&damping,&step,&impl->ikOutputs.ptr};
-        impl->check(impl->cuLaunchKernel(impl->ikFunction,unsigned((count+63)/64),1,1,64,1,1,0,nullptr,args,nullptr),"solveSerialIk launch");
-        impl->check(impl->cuCtxSynchronize(),"solveSerialIk synchronize");std::vector<double> output(tasks.size()*7);
+        impl->check(impl->cuLaunchKernel(impl->ikFunction,unsigned((count+63)/64),1,1,64,1,1,0,impl->stream,args,nullptr),"solveSerialIk launch");
+        impl->check(impl->cuStreamSynchronize(impl->stream),"solveSerialIk stream synchronize");std::vector<double> output(tasks.size()*7);
         impl->check(impl->cuMemcpyDtoH_v2(output.data(),impl->ikOutputs.ptr,output.size()*sizeof(double)),"read IK roots");
         roots.resize(tasks.size());for(std::size_t i=0;i<tasks.size();++i){auto& r=roots[i];r.converged=output[7*i+6]==1.;for(int j=0;j<6;++j){r.joints[j]=output[7*i+j];if(!std::isfinite(r.joints[j]))r.converged=false;}if(r.converged)++impl->ikConverged;}
         void* popped=nullptr;impl->check(impl->cuCtxPopCurrent_v2(&popped),"cuCtxPopCurrent IK");pushed=false;

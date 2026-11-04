@@ -1,4 +1,5 @@
 #include <ProjectMotionPlanning/CdfQpTrajectoryRepair.h>
+#include <ProjectMotionPlanning/CartesianMotion.h>
 
 #include <ProjectMotionPlanning/ProjectMotionPlanning.h>
 #include <ProjectMotionPlanning/TrajectoryInverseKinematics.h>
@@ -11,6 +12,7 @@
 #include <osqp.h>
 
 #include <algorithm>
+#include <set>
 #include <chrono>
 #include <cmath>
 #include <limits>
@@ -403,7 +405,7 @@ namespace motion_planning
             for(std::size_t i = 0; i < states.size(); ++i) {
                 const auto valid = [&](std::size_t k) {
                     return states[k].valid && (!guidance || detail::followsApfGuide(path[k], path[k+1],
-                        guidance->positions[k], guidance->positions[k+1], *guidance));
+                        guidance->positions[k], guidance->positions[k+1], *guidance,0.001,double(k),double(k+1)));
                 };
                 if(valid(i)) continue;
                 const std::size_t begin = i;
@@ -427,7 +429,7 @@ namespace motion_planning
 
             const auto safe = [&](std::size_t i) {
                 return scene.validateState(path[i]).valid && (!guidance || detail::followsApfGuide(path[i], path[i],
-                    guidance->positions[i], guidance->positions[i], *guidance));
+                    guidance->positions[i], guidance->positions[i], *guidance,0.001,double(i),double(i)));
             };
             std::size_t left = run.beginSegment;
             while(true) {
@@ -753,9 +755,9 @@ namespace motion_planning
                     + " -> " + std::to_string(run.endSegment + 2));
                 bool stillInvalid = false;
                 for(std::size_t i = run.beginSegment; i <= run.endSegment; ++i)
-                    if(!scene.validateMotion((*path)[i], (*path)[i + 1], validation).valid ||
+                    if(!queries.pathValid({(*path)[i], (*path)[i + 1]}, validation) ||
                         (guidance && !detail::followsApfGuide((*path)[i], (*path)[i+1],
-                            guidance->positions[i], guidance->positions[i+1], *guidance))) {
+                            guidance->positions[i], guidance->positions[i+1], *guidance,0.001,double(i),double(i+1)))) {
                         stillInvalid = true;
                         break;
                     }
@@ -771,7 +773,7 @@ namespace motion_planning
                 }
                 const auto safe = [&](std::size_t i) {
                     return scene.validateState((*path)[i]).valid && (!guidance || detail::followsApfGuide((*path)[i], (*path)[i],
-                        guidance->positions[i], guidance->positions[i], *guidance));
+                        guidance->positions[i], guidance->positions[i], *guidance,0.001,double(i),double(i)));
                 };
                 bool repaired = false;
                 // Expand to nearby safe anchors when the initial anchors are too
@@ -782,7 +784,14 @@ namespace motion_planning
                 const int expansions = guidance && guidance->projectStation ? 5 : 3;
                 const std::size_t paddings[] = {12, 40, 120, 360, 1080};
                 const double anticipations[] = {0.06, 0.12, 0.24, 0.48, 0.96};
-                for(int expansion = 0; expansion < expansions && !repaired; ++expansion) {
+                std::vector<std::pair<std::size_t,std::size_t>> triedWindows;
+                std::vector<std::pair<std::vector<double>,std::vector<double>>> triedBounds;
+                // Sparse stations need earlier anticipation than the old dense grid.
+                // Try the established second window first; keep all original search
+                // windows as fallbacks and retain the same physical acceptance gates.
+                const int sparseOrder[] = {1,0,2,3,4};
+                for(int search = 0; search < expansions && !repaired; ++search) {
+                    const int expansion=options.selectiveSupport?sparseOrder[search]:search;
                     if(options.progress) options.progress("APF anchor expansion " + std::to_string(expansion + 1)
                         + " / " + std::to_string(expansions));
                     const std::size_t padding = paddings[expansion];
@@ -824,6 +833,12 @@ namespace motion_planning
                             upper[j] = expansion>=2 ? bounds[j].upper : std::min(upper[j], bounds[j].upper);
                         }
                     }
+                    bool repeated=false;
+                    for(std::size_t trial=0;trial<triedWindows.size();++trial)
+                        if(triedWindows[trial]==std::make_pair(begin,end) &&
+                            triedBounds[trial].first==lower && triedBounds[trial].second==upper){repeated=true;break;}
+                    if(repeated)continue;
+                    triedWindows.push_back({begin,end});triedBounds.push_back({lower,upper});
                     detail::ApfOracle oracle;
                     oracle.progress = [&](int attempt, int iteration) {
                         if(options.progress) options.progress("APF field " + std::to_string(attempt)
@@ -866,6 +881,7 @@ namespace motion_planning
                     if(guidance) {
                         localGuide = *guidance;
                         localGuide.positions.assign(guidance->positions.begin()+begin, guidance->positions.begin()+end+1);
+                        if(guidance->orderedStateAdmissible)localGuide.orderedStateAdmissible=[&,begin](const auto& q,double station){return guidance->orderedStateAdmissible(q,double(begin)+station);};
                         if(guidance->projectStation) localGuide.projectStation=[&,begin](auto& q,std::size_t i){return guidance->projectStation(q,begin+i);};
                     }
                     detail::ApfPath replacement;
@@ -1872,14 +1888,72 @@ namespace motion_planning
         detail::CdfQueryBatch queries(*scene, planningDocument, projectBaseOrParent(projectBasePath), request, options.queryWorkers,true,options.cancelled);
         if(options.progress) options.progress("CDF query workers: " + std::to_string(queries.workerCount()));
 
+        queries.setCartesianMotion(options.cartesianMotion);
         result.referenceSeedTrajectory = seedTrajectory;
         std::vector<std::pair<std::size_t, double>> correspondence;
-        const std::vector<robottrajectory::TimedJointPoint> denseSeedTrajectory =
+        std::vector<robottrajectory::TimedJointPoint> denseSeedTrajectory =
             densifyTrajectory(
                 seedTrajectory,
                 scene->jointBounds(),
-                options.densifyKnots ? options.segmentIntermediateSamples : 0,
-                options.densifyKnots ? options.optimizationMaxJointStep : std::numeric_limits<double>::max(), &correspondence);
+                options.densifyKnots && !options.selectiveSupport ? options.segmentIntermediateSamples : 0,
+                options.densifyKnots && !options.selectiveSupport ? options.optimizationMaxJointStep : std::numeric_limits<double>::max(), &correspondence);
+        std::vector<bool> originalCollisionEdges(seedTrajectory.points.size()-1,false);
+        if(options.selectiveSupport) {
+            std::vector<std::vector<double>> controls;
+            for(const auto& point:seedTrajectory.points)controls.push_back(point.q);
+            if(options.progress)options.progress("Checking original control connections: 0 / "+std::to_string(controls.size()-1));
+            const auto precheckStarted=std::chrono::steady_clock::now();
+            queries.setMotionCertificates(options.pipelineMotionCertificates);
+            const auto motions=queries.motions(controls,request.validation,true,[&](std::size_t done,std::size_t total) {
+                if(options.progress)options.progress("Checking original control connections: "+std::to_string(done)+" / "+
+                    std::to_string(total)+"; elapsed seconds="+std::to_string(std::chrono::duration<double>(
+                        std::chrono::steady_clock::now()-precheckStarted).count()));
+            });
+            queries.setMotionCertificates({});
+            denseSeedTrajectory.clear();correspondence.clear();
+            denseSeedTrajectory.push_back(seedTrajectory.points.front());correspondence.push_back({0,0});
+            std::size_t blocked=0;
+            for(std::size_t edge=0;edge<motions.size();++edge) {
+                const auto& a=seedTrajectory.points[edge];const auto& b=seedTrajectory.points[edge+1];
+                bool direct=motions[edge].valid;
+                if(!direct) {
+                    const auto& code=motions[edge].diagnosticCode;
+                    if(code!="state_in_collision" && code!="virtual_baffle_collision" && code!="motion_in_collision" && code!="cartesian_ik_failed") {
+                        addDiagnostic(&result.diagnostics,"apf_direct_motion_unavailable",motions[edge].message);
+                        return result;
+                    }
+                    originalCollisionEdges[edge]=code!="cartesian_ik_failed";
+                }
+                // Screening samples are internal. Any inadmissible direct connection
+                // receives one bounded four-knot attempt, never recursive subdivision.
+                if(direct && options.processStateAdmissible)for(int k=1;k<16 && direct;++k) {
+                    const double f=double(k)/16;auto q=a.q;std::string error;
+                    if(options.cartesianMotion)direct=options.cartesianMotion->sample(a.q,b.q,f,q,error);
+                    else for(std::size_t j=0;j<q.size();++j)q[j]+=f*(b.q[j]-a.q[j]);
+                    direct=direct && options.processStateAdmissible(q,a.time+f*(b.time-a.time));
+                }
+                if(!direct) {
+                    ++blocked;
+                    for(int k=1;k<=4;++k) {
+                        const double f=double(k)/5;auto point=a;point.time=a.time+f*(b.time-a.time);
+                        if(options.cartesianMotion) {
+                            std::string error;
+                            if(!options.cartesianMotion->sample(a.q,b.q,f,point.q,error)) {
+                                point.q=a.q;
+                                for(std::size_t j=0;j<point.q.size();++j)point.q[j]+=f*(b.q[j]-a.q[j]);
+                                // This is a proposal only. Surface projection, actual IK,
+                                // collisions and complete MoveL replay must still pass.
+                            }
+                        } else for(std::size_t j=0;j<point.q.size();++j)point.q[j]+=f*(b.q[j]-a.q[j]);
+                        point.qd.clear();point.qdd.clear();
+                        denseSeedTrajectory.push_back(std::move(point));correspondence.push_back({edge,f});
+                    }
+                }
+                denseSeedTrajectory.push_back(b);correspondence.push_back({edge,1});
+            }
+            addDiagnostic(&result.diagnostics,"apf_selective_support","Retained "+std::to_string(seedTrajectory.points.size())+
+                " original controls; added four knots only in "+std::to_string(blocked)+" inadmissible direct intervals (collision, IK or process). Each original interval has at most four intermediate knots; unresolved connections return to GA. Collision samples remain internal.");
+        }
         result.statistics.inputWaypointCount = static_cast<int>(denseSeedTrajectory.size());
 
         std::vector<std::vector<double>> path;
@@ -1892,6 +1966,9 @@ namespace motion_planning
         }
         path = unwrapContinuousPath(path, scene->jointBounds());
         detail::ApfGuidance tcpGuide;
+        if(options.cartesianMotion)tcpGuide.sampleMotion=[sampler=options.cartesianMotion](const auto& a,const auto& b,double f,auto& q) {
+            std::string error;return sampler->sample(a,b,f,q,error);
+        };
         const bool constrainTcp = options.apfMaxTcpDeviation > 0.0;
         if((options.tcpStateAdmissible || options.surfaceProject) && (!constrainTcp || !options.worldForwardKinematics)) {
             addDiagnostic(&result.diagnostics, "tcp_constraint_invalid", "TCP process constraint requires actual FK and an enabled ordered TCP guide.");
@@ -1923,6 +2000,12 @@ namespace motion_planning
                 tcpGuide.positions.push_back(std::move(p));
             }
         }
+        if(options.processStateAdmissible)tcpGuide.orderedStateAdmissible=[&](const auto& q,double station) {
+            if(!std::isfinite(station) || station<0 || station>double(denseSeedTrajectory.size()-1))return false;
+            const auto i=std::min(denseSeedTrajectory.size()-1,static_cast<std::size_t>(station));
+            const auto j=std::min(i+1,denseSeedTrajectory.size()-1);const double f=station-i;
+            return options.processStateAdmissible(q,(1-f)*denseSeedTrajectory[i].time+f*denseSeedTrajectory[j].time);
+        };
         if(options.surfaceProject) tcpGuide.projectStation = [&](auto& q,std::size_t i) {
             return i<correspondence.size() && options.surfaceProject(q,correspondence[i].first,correspondence[i].second);
         };
@@ -1931,7 +2014,13 @@ namespace motion_planning
             for(std::size_t i=0;i<candidate.size();++i) {
                 // Exact endpoint joints remain immutable, including shared scan boundaries.
                 if(begin+i==0 || begin+i+1==path.size())continue;
-                if(!tcpGuide.projectStation(candidate[i],begin+i))return false;
+                if(!tcpGuide.projectStation(candidate[i],begin+i)) {
+                    if(options.selectiveSupport && begin+i<correspondence.size()) {
+                        const auto edge=std::min(seedTrajectory.points.size()-2,correspondence[begin+i].first);
+                        result.apfConnectionFailures.push_back({seedTrajectory.points[edge].time,seedTrajectory.points[edge+1].time,!originalCollisionEdges[edge]});
+                    }
+                    return false;
+                }
             }
             return true;
         };
@@ -1994,7 +2083,9 @@ namespace motion_planning
         };
 
         auto countInvalidSegments = [&](const std::vector<std::vector<double>>& candidate) {
-            const auto results = queries.motions(candidate, request.validation);
+            const auto results = queries.motions(candidate, request.validation,true,[&](std::size_t done,std::size_t total) {
+                if(options.progress)options.progress("Checking path connections: "+std::to_string(done)+" / "+std::to_string(total));
+            });
             return static_cast<int>(std::count_if(results.begin(), results.end(), [](const auto& value) { return !value.valid; }));
         };
 
@@ -2036,7 +2127,9 @@ namespace motion_planning
         if(constrainTcp) {
             int shapeInvalidSegments = 0;
             for(std::size_t i=1; i<path.size(); ++i)
-                if(!detail::followsApfGuide(path[i-1], path[i], tcpGuide.positions[i-1], tcpGuide.positions[i], tcpGuide)) ++shapeInvalidSegments;
+                if(!detail::followsApfGuide(path[i-1], path[i], tcpGuide.positions[i-1], tcpGuide.positions[i], tcpGuide,0.001,double(i-1),double(i))) ++shapeInvalidSegments;
+            if(options.progress)options.progress("Initial direct/path constraints: motion collisions="+std::to_string(initialInvalidSegments)+
+                ", process/shape violations="+std::to_string(shapeInvalidSegments)+", planning knots="+std::to_string(path.size()));
             addDiagnostic(&result.diagnostics, "apf_tcp_corridor",
                 "TCP corridor " + std::to_string(options.apfMaxTcpDeviation * 1000.0)
                 + " mm relative to the ordered original control-point polyline; input shape violations="
@@ -2062,7 +2155,7 @@ namespace motion_planning
                 &result.diagnostics,
                 &path, constrainTcp ? &tcpGuide : nullptr, &failedRuns);
             for(const auto& run:failedRuns) {
-                if(run.beginSegment<denseSeedTrajectory.size() && run.endSegment+1<denseSeedTrajectory.size())
+                if(!options.selectiveSupport && run.beginSegment<denseSeedTrajectory.size() && run.endSegment+1<denseSeedTrajectory.size())
                     result.apfConnectionFailures.push_back({denseSeedTrajectory[run.beginSegment].time,
                         denseSeedTrajectory[run.endSegment+1].time});
             }
@@ -2080,6 +2173,19 @@ namespace motion_planning
         const double apfMinimumPhi = evaluatePathMinimum(path);
 
         if(result.statistics.invalidSegmentCount != 0 || !followsReference(path)) {
+            if(options.selectiveSupport) {
+                const auto unresolved=collectInvalidSegmentRuns(queries,path,request.validation,constrainTcp?&tcpGuide:nullptr);
+                std::set<std::size_t> reported;
+                for(const auto& run:unresolved)for(std::size_t segment=run.beginSegment;segment<=run.endSegment;++segment) {
+                    const double time=denseSeedTrajectory[segment].time;
+                    const auto upper=std::upper_bound(seedTrajectory.points.begin(),seedTrajectory.points.end(),time,
+                        [](double value,const auto& point){return value<point.time;});
+                    const auto edge=std::min(seedTrajectory.points.size()-2,upper==seedTrajectory.points.begin()?std::size_t(0):
+                        std::size_t(upper-seedTrajectory.points.begin()-1));
+                    if(reported.insert(edge).second)result.apfConnectionFailures.push_back({seedTrajectory.points[edge].time,
+                        seedTrajectory.points[edge+1].time,!originalCollisionEdges[edge]});
+                }
+            }
             captureStage("APF (incomplete)", path, apfMinimumPhi, result.statistics.invalidSegmentCount);
             result.statistics.finalMinimumPhi = evaluatePathMinimum(path);
             const std::string apfFailureDetails = result.diagnostics.empty() ? std::string() : " Details: " + result.diagnostics.back().message;
@@ -2098,7 +2204,7 @@ namespace motion_planning
             (1.0 + std::max(0.0, options.postSmoothingSeedWeight));
         detail::ApfOracle smoothingOracle;
         smoothingOracle.motionValid = [&](const auto& a, const auto& b) {
-            return scene->validateMotion(a, b, request.validation).valid;
+            return queries.pathValid({a, b}, request.validation);
         };
         double smoothingPhiFloor = std::min(apfMinimumPhi, targetPhi);
         detail::ApfState refinementLower,refinementUpper;
@@ -2378,6 +2484,7 @@ namespace motion_planning
                         // local smoother after the complete window is collision-free.
                         auto windowGuide = tcpGuide;
                         if(constrainTcp) windowGuide.positions.assign(tcpGuide.positions.begin()+beginIndex, tcpGuide.positions.begin()+endIndex+1);
+                        if(tcpGuide.orderedStateAdmissible) windowGuide.orderedStateAdmissible=[&,beginIndex](const auto& q,double station){return tcpGuide.orderedStateAdmissible(q,double(beginIndex)+station);};
                         if(tcpGuide.projectStation) windowGuide.projectStation=[&,beginIndex](auto& q,std::size_t i){return tcpGuide.projectStation(q,beginIndex+i);};
                         const bool apfWindowChanged = repairCollisionRunsWithApf(
                             *scene,
@@ -2581,6 +2688,54 @@ namespace motion_planning
         // the same continuous chart used by shortest-arc motion validation, even
         // when smoothing is disabled or the trajectory has only two points.
         path = unwrapContinuousPath(path, scene->jointBounds());
+        if(options.stage == ProjectCdfQpRepairOptions::Stage::ApfOnly && options.selectiveSupport &&
+            options.cartesianMotion && options.processStateAdmissible) {
+            // Reject an already process-invalid proposal before the expensive
+            // fresh collision sweep. Use the execution sampler (including its
+            // adaptive encoder-step refinement) and the original ordered clock,
+            // exactly as the external APF replay does. Passing this preflight
+            // never substitutes for either of the independent collision gates.
+            if(options.progress) options.progress("Prechecking MoveL process constraints before final collision verification");
+            bool sampled = true;
+            std::size_t checkedSamples = 0;
+            for(std::size_t i = 1; i < path.size() && sampled; ++i) {
+                if(options.cancelled && options.cancelled()) {
+                    addDiagnostic(&result.diagnostics, "planning_cancelled", "MoveL process preflight cancelled.");
+                    return result;
+                }
+                std::vector<std::vector<double>> samples;
+                std::string error;
+                if(!options.cartesianMotion->connection(path[i-1], path[i], options.validationMaxJointStep,
+                    request.validation.maxSamples, samples, error, options.cancelled)) {
+                    // Keep IK/budget/cancellation handling at the existing fresh
+                    // motion gate; a failed sampling attempt is never accepted.
+                    sampled = false;
+                    break;
+                }
+                for(std::size_t k = i == 1 ? 0 : 1; k < samples.size(); ++k) {
+                    if(options.cancelled && options.cancelled()) {
+                        addDiagnostic(&result.diagnostics, "planning_cancelled", "MoveL process preflight cancelled.");
+                        return result;
+                    }
+                    const double fraction = double(k) / (samples.size()-1);
+                    const double time = denseSeedTrajectory[i-1].time + fraction *
+                        (denseSeedTrajectory[i].time-denseSeedTrajectory[i-1].time);
+                    ++checkedSamples;
+                    if(!options.processStateAdmissible(samples[k], time)) {
+                        result.apfConnectionFailures.push_back({denseSeedTrajectory[i-1].time,
+                            denseSeedTrajectory[i].time, true});
+                        std::ostringstream message;
+                        message << "MoveL process preflight rejected segment " << i-1
+                            << " at fraction " << fraction << " after " << checkedSamples
+                            << " samples; the proposal was returned to GA before the final collision sweep.";
+                        addDiagnostic(&result.diagnostics, "apf_process_preflight_rejected", message.str());
+                        return result;
+                    }
+                }
+            }
+            if(sampled) addDiagnostic(&result.diagnostics, "apf_process_preflight_passed",
+                "Execution-sampled process preflight passed; fresh full-path collision verification and external replay remain required.");
+        }
         if(options.progress) options.progress("Final full-path collision verification");
         result.statistics.invalidSegmentCount = 0;
         // Fresh final validation: bypass the cache and retain every original sample.

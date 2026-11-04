@@ -225,6 +225,15 @@ int main()
         lanes.positions.push_back({t,y,0});bowed.push_back({t,y+(i<=100?1:-1)*0.06*std::sin(3.14159265358979323846*t),0,6.4});}
     if(!restoreApfTcpShape(&bowed,{-1,-1,-1,5},{2,1,1,8},restore,lanes))return 40;
     for(std::size_t i=5;i<95;++i)if(bowed[i][1]>=bowed[200-i][1])return 41;
+    {
+        ApfGuidance ordered;ordered.position=[](const auto& q){return q;};
+        ordered.positions={{0,0},{1,0}};ordered.maxDeviation=1;
+        ordered.orderedStateAdmissible=[](const auto& q,double station){return std::abs(q[0]-station)<1e-8;};
+        if(!followsApfPath({{0,0},{1,0}},ordered))return 42;
+        if(!followsApfGuide({1,0},{0,0},{1,0},{0,0},ordered,.001,1,0))return 43;
+        ordered.orderedStateAdmissible=[](const auto& q,double station){return std::abs(q[0]-station*station)<.01;};
+        if(followsApfPath({{0,0},{1,0}},ordered))return 44;
+    }
     std::cout << "PASS APF: free path, obstacle, fixed anchors, deterministic escape, blocked corridor, invalid oracle, ordered zigzag, turn preservation, hard TCP corridor, nonlinear FK segment, time-aware smoothing\n";
     return 0;
 }

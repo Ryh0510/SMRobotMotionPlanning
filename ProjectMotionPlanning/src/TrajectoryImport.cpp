@@ -1,4 +1,5 @@
 #include <ProjectMotionPlanning/TrajectoryImport.h>
+#include <ProjectMotionPlanning/CdfJointAngleImport.h>
 
 #include <nlohmann/json.hpp>
 
@@ -1135,6 +1136,34 @@ namespace motion_planning
             const TrajectoryImportOptions& options,
             const std::vector<std::string>& lines)
         {
+            const bool versioned = std::any_of(lines.begin(), lines.end(), [](const auto& line) {
+                return trim(line).rfind("# RWS_JOINT_TABLE", 0) == 0;
+            });
+            const bool degreeTable = std::any_of(lines.begin(), lines.end(), [](const auto& line) {
+                return lowerCopy(trim(line)).rfind("time_s", 0) == 0;
+            });
+            if(versioned || degreeTable) {
+                const auto imported = ProjectCdfJointAngleImporter::importFile(path);
+                if(!imported.success) return failure("joint_table_parse_failed", imported.message());
+                StoredMotionPlan plan = imported.plan;
+                if(imported.hasMotionMetadata) {
+                    if((!options.robotId.empty() && plan.robotId != options.robotId) ||
+                        (!options.jointNames.empty() && plan.jointNames != options.jointNames))
+                        return failure("joint_table_robot_mismatch", "Joint table belongs to a different robot or joint group.");
+                } else {
+                    plan.robotId = options.robotId;
+                    plan.jointNames = options.jointNames.empty() ? imported.jointNames : options.jointNames;
+                    if(plan.jointNames.size() != imported.jointNames.size())
+                        return failure("joint_table_robot_mismatch", "Joint table joint count does not match the robot.");
+                    for(const auto& row : imported.points) {
+                        robottrajectory::TimedJointPoint point; point.time = row.timeSeconds;
+                        for(double degrees : row.jointAnglesDegrees) point.q.push_back(degrees * 3.14159265358979323846 / 180.0);
+                        plan.trajectory.points.push_back(std::move(point));
+                    }
+                }
+                return finalizeImportedPlan(path, options, std::move(plan), TrajectoryImportDataKind::JointTrajectory);
+            }
+
             JointTable table;
             std::string errorMessage;
             if(!parseJointTable(lines, options, table, errorMessage)) {
@@ -1165,6 +1194,15 @@ namespace motion_planning
             plan.robotId = options.robotId;
             plan.jointNames = options.jointNames;
             plan.cartesianControlPoints = std::move(trajectory);
+            std::ifstream provenance(path);std::string firstLine;std::getline(provenance,firstLine);
+            const std::string marker="# RWS_JOINT_SEEDS_V1 ";
+            if(firstLine.compare(0,marker.size(),marker)==0)try {
+                const auto metadata=Json::parse(firstLine.substr(marker.size()),nullptr,false);
+                if(metadata.is_object() && metadata.value("kind",std::string())=="tcp_joint_seeds_v1" &&
+                    metadata.value("robot_id",std::string())==options.robotId &&
+                    metadata.value("joint_names",std::vector<std::string>())==options.jointNames)
+                    plan.optimizationMetadata=metadata.dump();
+            } catch(const Json::exception&) {}
             return finalizeImportedPlan(
                 path,
                 options,
@@ -1219,6 +1257,12 @@ namespace motion_planning
             return failure("open_failed", errorMessage);
         }
 
+        // A declared joint table is authoritative: never reinterpret damaged metadata as TCP poses.
+        if(std::any_of(lines.begin(), lines.end(), [](const auto& line) {
+            const auto value = trim(line);
+            return value.rfind("# RWS_JOINT_TABLE", 0) == 0 || lowerCopy(value).rfind("time_s", 0) == 0;
+        })) return importJointTableFile(path, options, lines);
+
         if(extension == ".csv") {
             return importJointTableFile(path, options, lines);
         }
@@ -1226,7 +1270,7 @@ namespace motion_planning
         robottrajectory::CartesianTrajectory cartesianTrajectory;
         if(parseStructuredCartesianText(lines, options, cartesianTrajectory)) {
             cartesianTrajectory.sortByTime();
-            return importCartesianFile(path, options, std::move(cartesianTrajectory));
+            return importCartesianFile(path,options,std::move(cartesianTrajectory));
         }
 
         const bool selectedJointShape =

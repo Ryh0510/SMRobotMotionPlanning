@@ -5,6 +5,7 @@
 
 #include <filesystem>
 #include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -15,12 +16,22 @@ namespace simulation_project
 
 namespace motion_planning
 {
+    class CartesianMotionSampler;
+    namespace detail { class CdfMotionCertificates; }
+
     struct ProjectCdfQpRepairOptions
     {
         // Explicit external workflow: APF stops before QP; CDF rejects unsafe input.
         enum class Stage { Combined, ApfOnly, CdfOnly };
         Stage stage = Stage::Combined;
         bool densifyKnots = true;
+        // Direct valid chords remain sparse. Blocked intervals get 2..4 knots.
+        bool selectiveSupport = false;
+        std::shared_ptr<const CartesianMotionSampler> cartesianMotion;
+        // Internal, invocation-scoped original-edge geometry certificates.
+        // Only the immutable GA/APF pipeline creates these; final replay is fresh.
+        std::shared_ptr<detail::CdfMotionCertificates> pipelineMotionCertificates;
+        std::function<bool(const std::vector<double>&,double)> processStateAdmissible;
         double apfStepSize = .02;
         double apfInfluenceDistance = .08;
         double apfRepulsionGain = 2.5;
@@ -78,7 +89,7 @@ namespace motion_planning
         // Optimization knots are independent of the fine collision sampling.
         double optimizationMaxJointStep = 0.04;
         double validationMaxJointStep = 0.02;
-        // Execution only: 0 = auto (up to 4 isolated query scenes), 1 = serial.
+        // Execution only: 0 = auto (up to 8 isolated query scenes), 1 = serial.
         // Does not change sample spacing, QP tolerances or optimization settings.
         int queryWorkers = 0;
         // Optional synchronous observation; the callback must not mutate the scene.
@@ -119,6 +130,8 @@ namespace motion_planning
     {
         double beginTime = 0.0;
         double endTime = 0.0;
+        // No collision support exists here; GA must also repair the direct process chord.
+        bool requiresDirectProcess = false;
     };
 
     struct ProjectCdfQpRepairResult

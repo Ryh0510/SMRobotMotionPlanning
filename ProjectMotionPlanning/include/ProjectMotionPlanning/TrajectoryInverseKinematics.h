@@ -30,6 +30,11 @@ namespace motion_planning
         std::vector<double> seedJoints;
         CartesianIkToolMode toolMode = CartesianIkToolMode::FixedTool;
         bool usePreviousSolutionAsSeed = true;
+        // The FK callback and limits consume the legacy ABB display convention.
+        bool mapIrb4600StoredJointSigns = false;
+        // Optional physical limits in the same stored joint convention as FK.
+        std::vector<double> lower;
+        std::vector<double> upper;
         int maxIterations = 1000;
         double tolerance = 1.0e-6;
         double stepSize = 0.1;

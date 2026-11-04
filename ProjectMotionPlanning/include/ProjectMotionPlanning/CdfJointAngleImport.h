@@ -1,5 +1,7 @@
 #pragma once
 
+#include <MotionPlanningCore/MotionPlanning.h>
+
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -27,6 +29,9 @@ struct CdfJointAngleImportResult
     std::vector<std::string> jointNames;
     std::vector<CdfJointAnglePoint> points;
     std::vector<std::string> diagnostics;
+    // Exact source commands and motion law; populated only for a validated versioned export.
+    bool hasMotionMetadata = false;
+    StoredMotionPlan plan;
 
     std::string message() const;
 };

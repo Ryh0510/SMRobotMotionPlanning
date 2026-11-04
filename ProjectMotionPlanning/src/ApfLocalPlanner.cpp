@@ -98,7 +98,7 @@ namespace motion_planning::detail
 
     bool followsApfGuide(const ApfState& from, const ApfState& to,
         const ApfState& guideFrom, const ApfState& guideTo,
-        const ApfGuidance& guidance, double jointStep)
+        const ApfGuidance& guidance, double jointStep, double stationFrom, double stationTo)
     {
         if(!guidance.position || from.empty() || from.size() != to.size() ||
             guideFrom.empty() || !finite(guideFrom, guideFrom.size()) || !finite(guideTo, guideFrom.size()) ||
@@ -111,11 +111,14 @@ namespace motion_planning::detail
         for(std::size_t i = 0; i <= steps; ++i) {
             const double t = static_cast<double>(i) / steps;
             auto q = from, target = guideFrom;
-            for(std::size_t j = 0; j < q.size(); ++j) q[j] += t * (to[j] - from[j]);
+            if(guidance.sampleMotion) {if(!guidance.sampleMotion(from,to,t,q))return false;}
+            else for(std::size_t j = 0; j < q.size(); ++j) q[j] += t * (to[j] - from[j]);
             for(std::size_t j = 0; j < target.size(); ++j) target[j] += t * (guideTo[j] - guideFrom[j]);
             const auto p = guidance.position(q);
             if(!finite(p, target.size()) || norm(difference(p, target)) > guidance.maxDeviation + 1e-9) return false;
             if(guidance.stateAdmissible && !guidance.stateAdmissible(q, target)) return false;
+            if(guidance.orderedStateAdmissible && (!std::isfinite(stationFrom) || !std::isfinite(stationTo) ||
+                !guidance.orderedStateAdmissible(q,(1-t)*stationFrom+t*stationTo)))return false;
         }
         return true;
     }
@@ -123,9 +126,9 @@ namespace motion_planning::detail
     bool followsApfPath(const ApfPath& path, const ApfGuidance& guidance, std::size_t begin)
     {
         if(path.empty() || begin >= guidance.positions.size() || path.size() > guidance.positions.size() - begin) return false;
-        if(path.size() == 1) return followsApfGuide(path[0], path[0], guidance.positions[begin], guidance.positions[begin], guidance);
+        if(path.size() == 1) return followsApfGuide(path[0], path[0], guidance.positions[begin], guidance.positions[begin], guidance,0.001,double(begin),double(begin));
         for(std::size_t i = 1; i < path.size(); ++i)
-            if(!followsApfGuide(path[i-1], path[i], guidance.positions[begin+i-1], guidance.positions[begin+i], guidance)) return false;
+            if(!followsApfGuide(path[i-1], path[i], guidance.positions[begin+i-1], guidance.positions[begin+i], guidance,0.001,double(begin+i-1),double(begin+i))) return false;
         return true;
     }
 
@@ -164,9 +167,9 @@ namespace motion_planning::detail
         if(!std::isfinite(startDistance) || !std::isfinite(goalDistance) || startDistance < 0.0 || goalDistance < 0.0) return false;
         if(!finite(metric(reference.front()), metricReference.front().size()) ||
             !finite(metric(reference.back()), metricReference.front().size())) return false;
-        const auto edgeValid = [&](const ApfState& a, const ApfState& b, const ApfState& ra, const ApfState& rb) {
+        const auto edgeValid = [&](const ApfState& a, const ApfState& b, const ApfState& ra, const ApfState& rb, double ia, double ib) {
             // Reject shape violations before launching expensive collision queries.
-            return (!guidance || followsApfGuide(a, b, ra, rb, *guidance)) && oracle.motionValid(a, b);
+            return (!guidance || followsApfGuide(a, b, ra, rb, *guidance,0.001,ia,ib)) && oracle.motionValid(a, b);
         };
 
         // Visit ALL reference stations in order. A collision-free chord to the
@@ -240,15 +243,15 @@ namespace motion_planning::detail
                     auto carried = target;
                     for(std::size_t j = 0; j < dimension; ++j)
                         carried[j] = std::clamp(target[j] + 0.85 * (publishedStart[j] - fieldReference[index(station-1)][j]), lower[j], upper[j]);
-                    if((!guidance || !guidance->projectStation || guidance->projectStation(carried,index(station))) && norm(difference(carried, target)) > 1e-5 && forecast(carried) >= clearance && edgeValid(publishedStart, carried, a, b)) {
+                    if((!guidance || !guidance->projectStation || guidance->projectStation(carried,index(station))) && norm(difference(carried, target)) > 1e-5 && forecast(carried) >= clearance && edgeValid(publishedStart, carried, a, b,double(index(station-1)),double(index(station)))) {
                         path.push_back(std::move(carried)); continue;
                     }
                 }
-                if(forecast(target) >= clearance && edgeValid(publishedStart, target, a, b)) { path.push_back(target); continue; }
+                if(forecast(target) >= clearance && edgeValid(publishedStart, target, a, b,double(index(station-1)),double(index(station)))) { path.push_back(target); continue; }
                 ApfState q = publishedStart, previousForce(dimension, 0.0);
                 ApfPath integrated{publishedStart}, backfilled;
                 const auto connectStation = [&](const ApfState& end) {
-                    if(edgeValid(publishedStart,end,a,b))return true;
+                    if(edgeValid(publishedStart,end,a,b,double(index(station-1)),double(index(station))))return true;
                     // A curved integration cannot be saved as one colliding
                     // chord. Retreat into preceding stations and distribute the
                     // verified detour over them; keep point count and anchors.
@@ -279,7 +282,7 @@ namespace motion_planning::detail
                         bool valid=true;
                         if(guidance)for(std::size_t i=1;i<replacement.size() && valid;++i)
                             valid=followsApfGuide(replacement[i-1],replacement[i],
-                                metricReference[index(begin+i-1)],metricReference[index(begin+i)],*guidance);
+                                metricReference[index(begin+i-1)],metricReference[index(begin+i)],*guidance,0.001,double(index(begin+i-1)),double(index(begin+i)));
                         for(std::size_t i=1;i<replacement.size() && valid;++i)
                             valid=oracle.motionValid(replacement[i-1],replacement[i]);
                         if(!valid)continue;
@@ -316,11 +319,11 @@ namespace motion_planning::detail
                     // The final anchor is fixed. A local trial may shift the preceding
                     // station, but must validate BOTH adjacent reference intervals.
                     if((!guidance || !guidance->projectStation) && station + 1 == reference.size() && path.size() >= 2 &&
-                        edgeValid(path[path.size()-2], q, metricReference[index(station-2)], a) &&
-                        edgeValid(q, target, a, b)) {
+                        edgeValid(path[path.size()-2], q, metricReference[index(station-2)], a,double(index(station-2)),double(index(station-1))) &&
+                        edgeValid(q, target, a, b,double(index(station-1)),double(index(station)))) {
                         path.back() = q; q = target; reached = true; break;
                     }
-                    if(station+1==reference.size() && edgeValid(q,target,b,b) && connectStation(target)) {
+                    if(station+1==reference.size() && edgeValid(q,target,b,b,double(index(station)),double(index(station))) && connectStation(target)) {
                         q=target;reached=true;break;
                     }
                     const auto position = metric(q);

@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <functional>
+#include <limits>
 #include <vector>
 
 namespace motion_planning::detail
@@ -36,6 +37,8 @@ namespace motion_planning::detail
         // Actual TCP position, in metres. Positions keep the input point order.
         std::function<ApfState(const ApfState&)> position;
         ApfPath positions;
+        std::function<bool(const ApfState&,const ApfState&,double,ApfState&)> sampleMotion;
+        std::function<bool(const ApfState&,double)> orderedStateAdmissible;
         double maxDeviation = 0.10;
         std::function<bool(const ApfState&, const ApfState&)> stateAdmissible;
         std::function<bool(ApfState&, std::size_t)> projectStation;
@@ -45,7 +48,9 @@ namespace motion_planning::detail
     // its endpoints. No wrapping: the caller supplies legal turn coordinates.
     bool followsApfGuide(const ApfState& from, const ApfState& to,
         const ApfState& guideFrom, const ApfState& guideTo,
-        const ApfGuidance& guidance, double jointStep = 0.001);
+        const ApfGuidance& guidance, double jointStep = 0.001,
+        double stationFrom = std::numeric_limits<double>::quiet_NaN(),
+        double stationTo = std::numeric_limits<double>::quiet_NaN());
 
     bool followsApfPath(const ApfPath& path, const ApfGuidance& guidance, std::size_t begin = 0);
 

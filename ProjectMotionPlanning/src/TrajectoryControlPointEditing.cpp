@@ -1,4 +1,5 @@
 #include <ProjectMotionPlanning/TrajectoryControlPointEditing.h>
+#include <ProjectMotionPlanning/CartesianMotion.h>
 #include <ProjectMotionPlanning/TrajectoryInverseKinematics.h>
 
 #include <exception>
@@ -9,6 +10,7 @@
 #include <sstream>
 #include <iomanip>
 #include <locale>
+#include <nlohmann/json.hpp>
 
 namespace motion_planning
 {
@@ -257,6 +259,74 @@ bool ProjectTrajectoryControlPointEditor::serializeCartesianMatrices(const Store
         output << point.time << "\n\n";
     }
     text = output.str();
+    if(plan.trajectory.points.size()==plan.cartesianControlPoints.points.size() && !plan.jointNames.empty()) {
+        nlohmann::json joints=nlohmann::json::array();bool valid=true;
+        for(std::size_t i=0;i<plan.trajectory.points.size();++i) {
+            const auto& point=plan.trajectory.points[i];
+            valid &= point.q.size()==plan.jointNames.size() && std::abs(point.time-plan.cartesianControlPoints.points[i].time)<1e-9 &&
+                std::all_of(point.q.begin(),point.q.end(),[](double q){return std::isfinite(q);});
+            joints.push_back({{"time",point.time},{"q",point.q}});
+        }
+        const auto metadata=nlohmann::json::parse(plan.optimizationMetadata,nullptr,false);
+        const std::string convention=metadata.is_object()?metadata.value("joint_convention",std::string("caller")):"caller";
+        if(valid)text="# RWS_JOINT_SEEDS_V1 "+nlohmann::json{{"kind","tcp_joint_seeds_v1"},
+            {"robot_id",plan.robotId},{"joint_names",plan.jointNames},{"points",joints},
+            {"motion",CartesianMotionSampler::isMoveL(plan)?"cartesian_linear":"joint_linear"},{"joint_convention",convention}}.dump()+"\n"+text;
+    }
+    return true;
+}
+
+bool ProjectTrajectoryControlPointEditor::serializeJointTable(const StoredMotionPlan& plan,
+    std::string& text, std::string* errorMessage)
+{
+    text.clear();
+    if(plan.trajectory.empty() || plan.jointNames.empty()) {
+        setError(errorMessage, "A complete joint trajectory is required.");
+        return false;
+    }
+    for(std::size_t j = 0; j < plan.jointNames.size(); ++j) {
+        const auto& name = plan.jointNames[j];
+        if(name.empty() || std::find(plan.jointNames.begin(), plan.jointNames.begin() + j, name) != plan.jointNames.begin() + j) {
+            setError(errorMessage, "Joint names must be nonempty and unique.");
+            return false;
+        }
+    }
+    auto metadata = nlohmann::json::parse(plan.optimizationMetadata, nullptr, false);
+    const std::string convention = metadata.is_object()
+        ? metadata.value("joint_convention", std::string("caller")) : "caller";
+    if(convention != "caller" && convention != "runtime" && convention != "irb4600_stored") {
+        setError(errorMessage, "Unsupported joint convention.");
+        return false;
+    }
+    std::ostringstream output;
+    output.imbue(std::locale::classic());
+    output << std::fixed << std::setprecision(6);
+    output << "# IK joint angle export\n# Time unit: seconds\n# Joint angle unit: degrees\ntime_s";
+    for(std::size_t j = 0; j < plan.jointNames.size(); ++j) output << "\tJ" << j + 1 << "_deg";
+    output << '\n';
+    nlohmann::json rows = nlohmann::json::array();
+    for(std::size_t i = 0; i < plan.trajectory.points.size(); ++i) {
+        const auto& point = plan.trajectory.points[i];
+        if(point.q.size() != plan.jointNames.size() || !std::isfinite(point.time) ||
+            (i && point.time <= plan.trajectory.points[i - 1].time) ||
+            !std::all_of(point.q.begin(), point.q.end(), [](double q) {
+                return std::isfinite(q) && std::isfinite(q * 180.0 / 3.14159265358979323846);
+            })) {
+            setError(errorMessage, "Invalid joint row or non-increasing time.");
+            return false;
+        }
+        rows.push_back({{"time", point.time}, {"q", point.q}});
+    }
+    output << "# RWS_JOINT_TABLE_V1 " << nlohmann::json{
+        {"kind", "joint_table_v1"}, {"robot_id", plan.robotId}, {"joint_names", plan.jointNames},
+        {"motion", CartesianMotionSampler::isMoveL(plan) ? "cartesian_linear" : "joint_linear"},
+        {"joint_convention", convention}, {"points", rows}}.dump() << '\n';
+    for(const auto& point : plan.trajectory.points) {
+        output << point.time;
+        for(double q : point.q) output << '\t' << q * 180.0 / 3.14159265358979323846;
+        output << '\n';
+    }
+    text = output.str();
     return true;
 }
 
@@ -302,6 +372,12 @@ bool ProjectTrajectoryControlPointEditor::serializeJointTcpMatrices(const Stored
         setError(errorMessage, "TCP forward kinematics failed.");
         return false;
     }
+    cartesian.robotId=plan.robotId;cartesian.jointNames=plan.jointNames;cartesian.trajectory=plan.trajectory;
+    auto metadata=nlohmann::json::parse(plan.optimizationMetadata,nullptr,false);
+    if(!metadata.is_object())metadata=nlohmann::json::object();
+    metadata["joint_convention"]="runtime";cartesian.optimizationMetadata=metadata.dump();
+    if(mapIrb4600StoredJointSigns)for(auto& point:cartesian.trajectory.points)
+        point.q=ProjectTrajectoryInverseKinematics::irb4600RobotSystemJointValues(point.q);
     return serializeCartesianMatrices(cartesian, text, errorMessage);
 }
 

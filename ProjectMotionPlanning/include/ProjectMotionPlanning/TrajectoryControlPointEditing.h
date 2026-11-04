@@ -37,6 +37,10 @@ public:
     static bool serializeCartesianMatrices(const StoredMotionPlan& plan,
         std::string& text, std::string* errorMessage = nullptr);
 
+    // Degree table with validated exact radians, times and motion metadata in a versioned comment.
+    static bool serializeJointTable(const StoredMotionPlan& plan,
+        std::string& text, std::string* errorMessage = nullptr);
+
     // Export every stored joint point through an independent actual-model TCP snapshot.
     // FK consumes runtime radians and returns world TCP meters; recorded times are retained.
     static bool serializeJointTcpMatrices(const StoredMotionPlan& plan,

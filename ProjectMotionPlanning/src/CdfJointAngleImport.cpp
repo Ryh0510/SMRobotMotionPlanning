@@ -1,10 +1,14 @@
 #include <ProjectMotionPlanning/CdfJointAngleImport.h>
 
+#include <nlohmann/json.hpp>
+
 #include <algorithm>
 #include <cctype>
 #include <cmath>
 #include <fstream>
 #include <sstream>
+#include <stdexcept>
+#include <locale>
 
 namespace motion_planning
 {
@@ -50,6 +54,7 @@ std::vector<std::string> splitFields(std::string line)
     }
 
     std::istringstream stream(line);
+    stream.imbue(std::locale::classic());
     std::vector<std::string> fields;
     std::string field;
     while(stream >> field) {
@@ -60,13 +65,10 @@ std::vector<std::string> splitFields(std::string line)
 
 bool parseNumber(const std::string& token, double& value)
 {
-    try {
-        std::size_t consumed = 0;
-        value = std::stod(token, &consumed);
-        return consumed == token.size() && std::isfinite(value);
-    } catch(const std::exception&) {
-        return false;
-    }
+    std::istringstream input(token);
+    input.imbue(std::locale::classic());
+    input >> value;
+    return input && input.peek() == std::char_traits<char>::eof() && std::isfinite(value);
 }
 
 bool isNumericRow(const std::vector<std::string>& fields)
@@ -156,10 +158,27 @@ CdfJointAngleImportResult ProjectCdfJointAngleImporter::importFile(const std::fi
     std::string line;
     std::size_t lineNumber = 0;
     std::size_t expectedFieldCount = 0;
+    nlohmann::json exact;
+    bool hasMarker = false;
     while(std::getline(file, line)) {
         ++lineNumber;
         line = trim(line);
         if(line.empty()) {
+            continue;
+        }
+
+        const std::string marker = "# RWS_JOINT_TABLE_V1 ";
+        if(line.rfind("# RWS_JOINT_TABLE", 0) == 0) {
+            if(hasMarker || line.rfind(marker, 0) != 0) {
+                appendDiagnostic(result, "Duplicate or unsupported joint table metadata.");
+                return result;
+            }
+            hasMarker = true;
+            exact = nlohmann::json::parse(line.substr(marker.size()), nullptr, false);
+            if(!exact.is_object()) {
+                appendDiagnostic(result, "Malformed joint table metadata.");
+                return result;
+            }
             continue;
         }
 
@@ -185,6 +204,16 @@ CdfJointAngleImportResult ProjectCdfJointAngleImporter::importFile(const std::fi
         if(!isNumericRow(fields)) {
             const std::vector<std::string> names = jointNamesFromHeader(fields);
             if(!names.empty()) {
+                const bool radians = std::all_of(fields.begin() + 1, fields.end(), [](const auto& field) {
+                    const auto lower = lowerText(field);
+                    return lower.size() >= 4 && lower.substr(lower.size() - 4) == "_rad";
+                });
+                const bool degrees = std::all_of(fields.begin() + 1, fields.end(), [](const auto& field) {
+                    const auto lower = lowerText(field);
+                    return lower.size() >= 4 && lower.substr(lower.size() - 4) == "_deg";
+                });
+                if(radians) result.sourceUnit = CdfJointAngleUnit::Radians;
+                if(degrees) result.sourceUnit = CdfJointAngleUnit::Degrees;
                 result.jointNames = names;
                 expectedFieldCount = result.jointNames.size() + 1;
             }
@@ -245,6 +274,56 @@ CdfJointAngleImportResult ProjectCdfJointAngleImporter::importFile(const std::fi
         appendDiagnostic(result, "CDF joint name count does not match joint angle count.");
         result.success = false;
         return result;
+    }
+
+    if(hasMarker) {
+        try {
+            const auto names = exact.at("joint_names").get<std::vector<std::string>>();
+            const auto motion = exact.at("motion").get<std::string>();
+            const auto convention = exact.at("joint_convention").get<std::string>();
+            const auto& rows = exact.at("points");
+            if(exact.at("kind") != "joint_table_v1" || names.size() != jointCount ||
+                !rows.is_array() || rows.size() != result.points.size() ||
+                (motion != "cartesian_linear" && motion != "joint_linear") ||
+                (convention != "runtime" && convention != "irb4600_stored" && convention != "caller") ||
+                !result.diagnostics.empty() || result.sourceUnit != CdfJointAngleUnit::Degrees) {
+                throw std::runtime_error("Invalid joint table metadata, units or row count.");
+            }
+            for(std::size_t j = 0; j < jointCount; ++j) {
+                if(names[j].empty() || result.jointNames[j] != "J" + std::to_string(j + 1) ||
+                    std::find(names.begin(), names.begin() + j, names[j]) != names.begin() + j)
+                    throw std::runtime_error("Joint table header or names do not match metadata.");
+            }
+            result.plan.robotId = exact.at("robot_id").get<std::string>();
+            result.plan.jointNames = names;
+            result.plan.trajectory.interpolation = robottrajectory::TrajectoryInterpolation::Linear;
+            for(std::size_t i = 0; i < rows.size(); ++i) {
+                robottrajectory::TimedJointPoint point;
+                point.time = rows[i].at("time").get<double>();
+                point.q = rows[i].at("q").get<std::vector<double>>();
+                if(!std::isfinite(point.time) || point.q.size() != jointCount ||
+                    (i && point.time <= result.plan.trajectory.points.back().time) ||
+                    std::abs(point.time - result.points[i].timeSeconds) > 5.01e-7)
+                    throw std::runtime_error("Joint table timestamps do not match metadata.");
+                for(std::size_t j = 0; j < jointCount; ++j) {
+                    const double degrees = point.q[j] * 180.0 / kPi;
+                    if(!std::isfinite(degrees) ||
+                        std::abs(degrees - result.points[i].jointAnglesDegrees[j]) > 5.01e-7)
+                        throw std::runtime_error("Joint table angles do not match metadata.");
+                    result.points[i].jointAnglesDegrees[j] = degrees;
+                }
+                result.points[i].timeSeconds = point.time;
+                result.plan.trajectory.points.push_back(std::move(point));
+            }
+            result.plan.optimizationMetadata = nlohmann::json{
+                {"motion", motion}, {"joint_convention", convention}}.dump();
+            result.jointNames = names;
+            result.hasMotionMetadata = true;
+        } catch(const std::exception& error) {
+            result.plan = {};
+            appendDiagnostic(result, std::string("Joint table provenance rejected: ") + error.what());
+            return result;
+        }
     }
 
     std::sort(

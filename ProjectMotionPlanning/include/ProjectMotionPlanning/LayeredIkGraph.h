@@ -13,7 +13,8 @@ namespace motion_planning
         std::vector<double> maxJointVelocities;
         // Zero disables the hard unwrapped per-axis jump limit.
         double maxJointDelta = 0.0;
-        // Called synchronously, once per node / reachable edge per search.
+        // Called synchronously, once per node / at most once per considered edge.
+        // Edges unable to enter exact Top-M may skip the expensive predicate.
         // Use these for collision, singularity and process constraints on an isolated scene.
         std::function<bool(std::size_t, const CartesianIkCandidate&)> nodeAdmissible;
         // Optional nonnegative soft node cost. Empty preserves legacy ranking.

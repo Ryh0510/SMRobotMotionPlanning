@@ -1,4 +1,6 @@
 #include <ProjectMotionPlanning/GaApfCdfPipeline.h>
+#include <ProjectMotionPlanning/CartesianMotion.h>
+#include "CdfQueryBatch.h"
 #include <ProjectMotionPlanning/LayeredIkGraph.h>
 #include <RobotInstance/RobotInstance.h>
 #include <nlohmann/json.hpp>
@@ -79,6 +81,7 @@ namespace motion_planning
             if(request.tcpLinkName.empty() && !resolvePlanningTcp(document,request.plan.robotId,
                 request.tcpLinkName,request.linkFromTcp,error)) return fail("pipeline_tcp_missing",error);
             if(request.collisionDetectorIds.empty()) return fail("pipeline_detector_missing","Select a robot/workpiece collision detector.");
+            request.cartesianLinearMotion=true;
             ProjectPlanningRequest sceneRequest;
             sceneRequest.robotId=request.plan.robotId;sceneRequest.jointNames=request.plan.jointNames;
             sceneRequest.collisionDetectorIds=request.collisionDetectorIds;
@@ -164,6 +167,8 @@ namespace motion_planning
                     {"seconds",std::chrono::duration<double>(std::chrono::steady_clock::now()-began).count()}}.dump();
                 result.diagnostics.push_back({"pipeline_initial_top1",event});if(request.progress)request.progress(event);
             }
+            auto moveL=CartesianMotionSampler::create(*scene,request.tcpLinkName,request.linkFromTcp,error);
+            if(!moveL)return fail("pipeline_movel_model",error);
             const auto originalControls=request.plan.cartesianControlPoints;
             std::vector<Eigen::Vector3d> anchors;
             for(const auto& point:originalControls.points)
@@ -200,12 +205,16 @@ namespace motion_planning
             request.anchorSearchSeconds=0.;
             request.validationJointStep=std::min(.001,request.cdfOptions.validationMaxJointStep);
             request.densifyOptimizationKnots=false;
-            request.preferredOutputWaypoints=100;
+            request.preferredOutputWaypoints=0;
 
             request.progress=request.progress?request.progress:request.cdfOptions.progress;
             const auto report=[&](const std::string& text){if(request.progress)request.progress(text);};
+            // The document stays immutable from here through all APF feedback.
+            // Reuse only original-edge geometry, never process or final replay gates.
+            const auto motionCertificates=std::make_shared<detail::CdfMotionCertificates>();
             const auto evaluateStage=[&]() {
                 const auto began=std::chrono::steady_clock::now();
+                request.cdfOptions.pipelineMotionCertificates=request.pipelineStage=="apf"?motionCertificates:nullptr;
                 auto evaluated=ProjectExternalTrajectoryEvaluator::evaluate(document,basePath,request);
                 report(nlohmann::json{{"type","pipeline_stage_timing"},{"stage",request.pipelineStage},
                     {"seconds",std::chrono::duration<double>(std::chrono::steady_clock::now()-began).count()},
@@ -217,6 +226,9 @@ namespace motion_planning
             };
             const auto stage=[&](const std::string& name,const StoredMotionPlan& plan,bool accepted) {
                 CdfTrajectoryStage s;s.name=name;s.plan=plan;
+                auto metadata=nlohmann::json::parse(s.plan.optimizationMetadata,nullptr,false);
+                if(!metadata.is_object())metadata=nlohmann::json::object();
+                metadata["motion"]="cartesian_linear";s.plan.optimizationMetadata=metadata.dump();
                 s.invalidSegments=accepted?0:-1;s.tcpCorridorValid=accepted;
                 s.quality=evaluateTrajectoryQuality(s.plan.trajectory,scene->jointBounds(),
                     request.cdfOptions.fallbackMaxVelocity,request.cdfOptions.fallbackMaxAcceleration,{},fk);
@@ -225,6 +237,7 @@ namespace motion_planning
             };
             const auto retime=[&](StoredMotionPlan& plan,std::vector<std::pair<double,double>>& mapping,bool preserveSurfaceClock=false) {
                 if(!request.cdfOptions.retimeOutput)return;
+                preserveSurfaceClock |= request.cartesianLinearMotion;
                 const auto original=plan.trajectory;
                 if(!retimeJointTrajectory(plan.trajectory,scene->jointBounds(),
                     request.cdfOptions.fallbackMaxVelocity,request.cdfOptions.fallbackMaxAcceleration))
@@ -234,6 +247,8 @@ namespace motion_planning
                     // station at added APF knots. Preserve the original affine clock
                     // with one dilation; geometry and every station stay identical.
                     auto measured=original;
+                    robottrajectory::JointTrajectory execution;std::string moveLError;
+                    if(moveL->execution(original,execution,moveLError,.005,request.cancelled))measured=std::move(execution);
                     const auto quality=evaluateTrajectoryQuality(measured,scene->jointBounds(),
                         request.cdfOptions.fallbackMaxVelocity,request.cdfOptions.fallbackMaxAcceleration);
                     if(!quality.valid || !quality.timingValid)throw std::runtime_error("Invalid APF clock.");
@@ -342,16 +357,19 @@ namespace motion_planning
                     result.apfConnectionFailures=apf.apfConnectionFailures;
                     return fail("pipeline_apf_failed","APF did not produce an accepted connected path after available connection feedback.");
                 }
-                std::set<std::size_t> failedEdges,controls;
+                std::set<std::size_t> failedEdges,directProcessEdges,controls;
                 const auto& knots=ga.plan.trajectory.points;
                 for(const auto& interval:apf.apfConnectionFailures)for(std::size_t i=0;i+1<knots.size();++i)
                     if(knots[i].time<interval.endTime-1e-10 && knots[i+1].time>interval.beginTime+1e-10)
+                    {
                         failedEdges.insert(i);
+                        if(interval.requiresDirectProcess)directProcessEdges.insert(i);
+                    }
                 if(failedEdges.empty())return fail("pipeline_feedback_mapping_failed","APF failure does not map to an original control interval.");
                 int visit=0;
                 for(const auto edge:failedEdges) {
                     visit=std::max(visit,++feedbackVisits[edge]);
-                    rejectedConnections.push_back({edge,knots[edge].q,knots[edge+1].q});
+                    rejectedConnections.push_back({edge,knots[edge].q,knots[edge+1].q,directProcessEdges.count(edge)!=0});
                 }
                 const std::size_t padding=std::min<std::size_t>(32,2*std::size_t(visit));
                 for(const auto edge:failedEdges) {
@@ -361,7 +379,7 @@ namespace motion_planning
                         if(i!=0 || request.startJoints.empty())controls.insert(i);
                 }
                 const auto feedbackEvent=nlohmann::json{{"round",feedbackRound+1},{"source_edges_zero_based",failedEdges},
-                    {"resample_controls_zero_based",controls},{"seed","current point-safe GA controls"},
+                    {"resample_controls_zero_based",controls},{"direct_process_edges_zero_based",directProcessEdges},{"seed","current point-safe GA controls"},
                     {"anchors","immutable original surface points"},{"rejected_connections",rejectedConnections.size()}}.dump();
                 result.diagnostics.push_back({"pipeline_apf_ga_feedback",feedbackEvent});
                 report("APF -> GA: "+feedbackEvent);
@@ -464,7 +482,7 @@ namespace motion_planning
             for(const auto& p:result.plan.trajectory.points)result.sourceReferenceTimes.push_back(sourceTimeAt(sourceTimes,p.time));
             result.statistics.inputWaypointCount=static_cast<int>(ga.plan.trajectory.points.size());
             nlohmann::json reference={{"type","ga_apf_surface_reference"},{"version",1},{"robot_id",result.plan.robotId},
-                {"joint_names",result.plan.jointNames},{"nominal_distance_m",surface.sprayDistance},
+                {"joint_names",result.plan.jointNames},{"joint_convention","runtime"},{"motion","cartesian_linear"},{"nominal_distance_m",surface.sprayDistance},
                 {"clearance_m",request.minimumClearance},{"tcp_link",request.tcpLinkName},
                 {"source_controls",nlohmann::json::array()},{"output_times_s",nlohmann::json::array()},
                 {"source_times_s",result.sourceReferenceTimes},{"selected_distances_m",selectedDistances}};

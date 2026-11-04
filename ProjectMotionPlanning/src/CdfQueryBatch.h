@@ -1,6 +1,7 @@
 #pragma once
 
 #include "CdfDistanceField.h"
+#include <ProjectMotionPlanning/CartesianMotion.h>
 
 #include <functional>
 #include <limits>
@@ -10,9 +11,18 @@
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#include <map>
 
 namespace motion_planning::detail
 {
+    // One sequential pipeline over an immutable robot/workpiece/baffle scene.
+    // Contains only successful original-edge geometry checks, never process or
+    // timing verdicts. It is not persisted or reused by independent final replay.
+    class CdfMotionCertificates
+    {
+        friend class CdfQueryBatch;
+        std::map<std::pair<bool,std::vector<double>>,StateValidationResult> m_valid;
+    };
     // Private to ONE repair of an immutable scene. No quantization, wrapped keys,
     // global cache, or mutable collision runtime shared between workers.
     class CdfQueryBatch
@@ -31,7 +41,8 @@ namespace motion_planning::detail
         std::vector<CdfLinearization> linearizations(const std::vector<std::vector<double>>& path,
             double margin, double horizon, double step, ProjectCdfQpRepairStatistics& statistics);
         std::vector<StateValidationResult> motions(const std::vector<std::vector<double>>& path,
-            const MotionValidationOptions& options, bool useCache = true);
+            const MotionValidationOptions& options, bool useCache = true,
+            const std::function<void(std::size_t,std::size_t)>& progress = {});
         bool pathValid(const std::vector<std::vector<double>>& path, const MotionValidationOptions& options);
         // Exact independent state queries; every worker owns its mutable scene.
         struct StateCheck {StateValidationResult validation; double penetration=std::numeric_limits<double>::quiet_NaN();};
@@ -41,11 +52,17 @@ namespace motion_planning::detail
         PlanningSceneQueryCounts additionalQueryCounts() const;
         std::string summary() const;
         std::size_t workerCount() const { return m_scenes.size(); }
+        void setCartesianMotion(std::shared_ptr<const CartesianMotionSampler> sampler) {if(m_cartesianMotion!=sampler){m_cartesianMotion=std::move(sampler);m_motions.clear();}}
+        void setMotionCertificates(std::shared_ptr<CdfMotionCertificates> values) {m_motionCertificates=std::move(values);}
 
     private:
         struct StateHash { std::size_t operator()(const std::vector<double>& values) const; };
         StateValidationResult singleMotion(const std::vector<double>& from,
             const std::vector<double>& to, const MotionValidationOptions& options);
+        StateValidationResult motion(std::size_t worker,const std::vector<double>& from,
+            const std::vector<double>& to,const MotionValidationOptions& options);
+        std::shared_ptr<const CartesianMotionSampler> m_cartesianMotion;
+        std::shared_ptr<CdfMotionCertificates> m_motionCertificates;
         void parallelFor(std::size_t count, const std::function<void(std::size_t, std::size_t)>& work);
         void rememberDistance(const std::vector<double>& key, const SignedDistanceSample& sample);
         void workerLoop(std::size_t worker);
@@ -57,6 +74,7 @@ namespace motion_planning::detail
         bool m_cacheEnabled = true;
         std::function<bool()> m_cancelled;
         std::size_t m_distanceHits = 0, m_motionHits = 0;
+        std::size_t m_pipelineMotionHits = 0;
         double m_distanceSeconds = 0, m_gradientSeconds = 0, m_motionSeconds = 0;
         // Each thread has exclusive access to the same private scene for the
         // lifetime of this repair. Every batch joins before the next APF/QP step.
