@@ -177,3 +177,28 @@ target_link_libraries(ProjectMotionPlanning-WholeTrajectoryCheck PRIVATE ${PACKA
 target_compile_features(ProjectMotionPlanning-WholeTrajectoryCheck PRIVATE cxx_std_17)
 set_target_properties(ProjectMotionPlanning-WholeTrajectoryCheck PROPERTIES FOLDER "Regression/SMRobotMotionPlanning")
 copy_runtime_dlls(ProjectMotionPlanning-WholeTrajectoryCheck)
+
+if(BuildTests)
+    add_executable(ProjectMotionPlanning-XyzrTests XyzrKinematicsTests.cpp)
+    target_link_libraries(ProjectMotionPlanning-XyzrTests PRIVATE ${PACKAGE_NAME}::ProjectMotionPlanning)
+    target_compile_features(ProjectMotionPlanning-XyzrTests PRIVATE cxx_std_17)
+    target_compile_definitions(ProjectMotionPlanning-XyzrTests PRIVATE XYZR_SOURCE_ROOT="${CMAKE_SOURCE_DIR}")
+    set_target_properties(ProjectMotionPlanning-XyzrTests PROPERTIES FOLDER "Regression/SMRobotMotionPlanning")
+    copy_runtime_dlls(ProjectMotionPlanning-XyzrTests)
+    add_test(NAME ProjectMotionPlanningXyzr COMMAND $<TARGET_FILE:ProjectMotionPlanning-XyzrTests>)
+    set_tests_properties(ProjectMotionPlanningXyzr PROPERTIES TIMEOUT 180
+        LABELS "SMRobotMotionPlanning;ProjectMotionPlanning;Regression"
+        WORKING_DIRECTORY $<TARGET_FILE_DIR:ProjectMotionPlanning-XyzrTests>)
+endif()
+
+if(BuildTests)
+    add_executable(ProjectMotionPlanning-FanucTests FanucKinematicsTests.cpp)
+    target_link_libraries(ProjectMotionPlanning-FanucTests PRIVATE ${PACKAGE_NAME}::ProjectMotionPlanning)
+    target_compile_features(ProjectMotionPlanning-FanucTests PRIVATE cxx_std_17)
+    target_compile_definitions(ProjectMotionPlanning-FanucTests PRIVATE FANUC_SOURCE_ROOT="${CMAKE_SOURCE_DIR}")
+    set_target_properties(ProjectMotionPlanning-FanucTests PROPERTIES FOLDER "Regression/SMRobotMotionPlanning")
+    copy_runtime_dlls(ProjectMotionPlanning-FanucTests)
+    add_test(NAME ProjectMotionPlanningFanuc COMMAND $<TARGET_FILE:ProjectMotionPlanning-FanucTests>)
+    set_tests_properties(ProjectMotionPlanningFanuc PROPERTIES TIMEOUT 180
+        WORKING_DIRECTORY $<TARGET_FILE_DIR:ProjectMotionPlanning-FanucTests>)
+endif()
