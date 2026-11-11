@@ -526,8 +526,36 @@ namespace motion_planning
             return nullptr;
         }
 
+        simulation_project::ProjectDocument selectedDetectorDocument = document;
+        auto& selectedDetectors = selectedDetectorDocument.collision.detectors;
+        selectedDetectors.erase(
+            std::remove_if(
+                selectedDetectors.begin(),
+                selectedDetectors.end(),
+                [&](const simulation_project::CollisionDetectorDesc& detector) {
+                    return std::find(
+                        request.collisionDetectorIds.begin(),
+                        request.collisionDetectorIds.end(),
+                        detector.id) == request.collisionDetectorIds.end();
+                }),
+            selectedDetectors.end());
+        const simulation_runtime::CollisionDetectorBuildPlan buildPlan =
+            simulation_runtime::ProjectCollisionDetectorBuilder::collectBuildPlan(selectedDetectorDocument);
+        // The packaged runtime gates attachment geometry on visual visibility.
+        // A headless planning snapshot must still collide enabled hidden tools.
+        // Change only this private runtime input, never the user's document.
+        auto collisionDocument = document;
+        for(auto& attachment : collisionDocument.mountedAttachments) {
+            const auto asset = std::find_if(collisionDocument.attachmentAssets.begin(), collisionDocument.attachmentAssets.end(),
+                [&](const auto& value) { return value.id == attachment.assetId; });
+            if(!attachment.enabled || asset == collisionDocument.attachmentAssets.end() ||
+                !buildPlan.requiresAttachment(attachment.id, attachment.name, asset->assetKind)) continue;
+            attachment.visible = true;
+            asset->visible = true;
+        }
+
         auto impl = std::make_unique<ProjectPlanningSceneSnapshot::Impl>();
-        simulation_runtime::Result runtimeResult = impl->simulation.loadProject(document, projectBasePath);
+        simulation_runtime::Result runtimeResult = impl->simulation.loadProject(collisionDocument, projectBasePath);
         if (!runtimeResult.success)
         {
             setError(errorMessage, runtimeResult.message);
@@ -604,21 +632,6 @@ namespace motion_planning
             impl->detectorIds.push_back(detectorId);
         }
 
-        simulation_project::ProjectDocument selectedDetectorDocument = document;
-        auto& selectedDetectors = selectedDetectorDocument.collision.detectors;
-        selectedDetectors.erase(
-            std::remove_if(
-                selectedDetectors.begin(),
-                selectedDetectors.end(),
-                [&](const simulation_project::CollisionDetectorDesc& detector) {
-                    return std::find(
-                        request.collisionDetectorIds.begin(),
-                        request.collisionDetectorIds.end(),
-                        detector.id) == request.collisionDetectorIds.end();
-                }),
-            selectedDetectors.end());
-        const simulation_runtime::CollisionDetectorBuildPlan buildPlan =
-            simulation_runtime::ProjectCollisionDetectorBuilder::collectBuildPlan(selectedDetectorDocument);
         // A selected mounted tool moves with its owning robot even when no
         // robot link is selected. Use resolved runtime ownership (also handles
         // legacy/synthetic mounts); keep the user's exact detector selection.
@@ -651,6 +664,13 @@ namespace motion_planning
             }
         }
 
+        for(const auto& detectorId : impl->detectorIds) {
+            const auto pairs = impl->collision.pairDiagnostics(detectorId);
+            if(!std::any_of(pairs.begin(), pairs.end(), [](const auto& pair) { return pair.effective; })) {
+                setError(errorMessage, "Selected collision detector has no effective collision pairs: " + detectorId);
+                return nullptr;
+            }
+        }
         impl->baffles.build(impl->simulation);
         setError(errorMessage, std::string());
         return std::unique_ptr<ProjectPlanningSceneSnapshot>(

@@ -112,6 +112,102 @@ namespace motion_planning
                 });
         }
 
+        std::vector<const simulation_project::MountedAttachmentDesc*> robotAttachments(
+            const simulation_project::ProjectDocument& document, const std::string& robotId)
+        {
+            std::vector<const simulation_project::MountedAttachmentDesc*> result;
+            for(const auto& attachment : document.mountedAttachments) {
+                if(attachment.enabled && std::any_of(document.robotMounts.begin(), document.robotMounts.end(),
+                    [&](const auto& mount) { return mount.id == attachment.mountFrameId && mount.robotId == robotId; }))
+                    result.push_back(&attachment);
+            }
+            return result;
+        }
+
+        bool coversAttachments(const simulation_project::ProjectDocument& document,
+            const simulation_runtime::CollisionDetectorBuildPlan& plan, const std::string& robotId)
+        {
+            for(const auto* attachment : robotAttachments(document, robotId)) {
+                const auto asset = std::find_if(document.attachmentAssets.begin(), document.attachmentAssets.end(),
+                    [&](const auto& value) { return value.id == attachment->assetId; });
+                const auto kind = asset == document.attachmentAssets.end() ? std::string("tool") : asset->assetKind;
+                if(!plan.requiresAttachment(attachment->id, attachment->name, kind)) return false;
+            }
+            return true;
+        }
+
+        simulation_runtime::CollisionDetectorBuildPlan selectedBuildPlan(
+            const simulation_project::ProjectDocument& document, const std::vector<std::string>& ids)
+        {
+            auto selected = document;
+            auto& detectors = selected.collision.detectors;
+            detectors.erase(std::remove_if(detectors.begin(), detectors.end(), [&](const auto& detector) {
+                return std::find(ids.begin(), ids.end(), detector.id) == ids.end();
+            }), detectors.end());
+            return simulation_runtime::ProjectCollisionDetectorBuilder::collectBuildPlan(selected);
+        }
+
+        std::string storePlanningSelectionSet(simulation_project::ProjectDocument& document,
+            const std::string& detectorId, const std::string& suffix, const std::string& previousId,
+            std::vector<simulation_project::CollisionSelectionSetMemberDesc> members)
+        {
+            auto& sets = document.collision.selectionSets;
+            const auto exists = [&](const std::string& id) {
+                return std::any_of(sets.begin(), sets.end(), [&](const auto& set) { return set.id == id; });
+            };
+            // Reuse only this detector's private set; shared user sets remain intact.
+            std::string id = previousId;
+            const bool shared = std::any_of(document.collision.detectors.begin(), document.collision.detectors.end(),
+                [&](const auto& other) { return other.id != detectorId &&
+                    (other.selectionSetAId == id || other.selectionSetBId == id); });
+            if(id.empty() || shared || !exists(id)) {
+                const auto base = detectorId + suffix;
+                id = base;
+                for(int index = 2; exists(id); ++index) id = base + "_" + std::to_string(index);
+            }
+            simulation_project::CollisionSelectionSetDesc set;
+            set.id = id; set.name = id; set.members = std::move(members);
+            const auto found = std::find_if(sets.begin(), sets.end(), [&](const auto& value) { return value.id == id; });
+            if(found == sets.end()) sets.push_back(std::move(set));
+            else *found = std::move(set);
+            return id;
+        }
+
+        void includeMountedAttachments(simulation_project::ProjectDocument& document,
+            simulation_project::CollisionDetectorDesc& detector, const std::string& robotId,
+            const std::string& obstacleId, bool obstacleIsRobot)
+        {
+            const auto robotTools = robotAttachments(document, robotId);
+            const auto obstacleTools = obstacleIsRobot ? robotAttachments(document, obstacleId)
+                : std::vector<const simulation_project::MountedAttachmentDesc*>{};
+            const auto previous = std::find_if(document.collision.detectors.begin(), document.collision.detectors.end(),
+                [&](const auto& value) { return value.id == detector.id; });
+            const auto previousA = previous == document.collision.detectors.end() ? std::string{} : previous->selectionSetAId;
+            const auto previousB = previous == document.collision.detectors.end() ? std::string{} : previous->selectionSetBId;
+            if(robotTools.empty() && obstacleTools.empty() && previousA.empty() && previousB.empty()) return;
+
+            const auto robotMembers = [](const std::string& id, const auto& tools) {
+                std::vector<simulation_project::CollisionSelectionSetMemberDesc> members(1);
+                members.front().robotId = id;
+                for(const auto* tool : tools) {
+                    simulation_project::CollisionSelectionSetMemberDesc member;
+                    member.attachmentId = tool->id; members.push_back(std::move(member));
+                }
+                return members;
+            };
+            auto targetMembers = robotMembers(obstacleId, obstacleTools);
+            if(!obstacleIsRobot) {
+                targetMembers.front().robotId.clear(); targetMembers.front().objectId = obstacleId;
+            }
+            detector.type = "SelectedObjects"; detector.queryPolicy = "BetweenSets";
+            detector.targets.clear(); detector.pairGenerators.clear();
+            detector.selectionSetAId = storePlanningSelectionSet(document, detector.id, "_robot", previousA,
+                robotMembers(robotId, robotTools));
+            detector.selectionSetBId = storePlanningSelectionSet(document, detector.id, "_obstacle",
+                previousB == previousA ? std::string{} : previousB,
+                std::move(targetMembers));
+        }
+
         simulation_project::CollisionDetectorDesc makeRobotRobotDetector(
             const std::string& detectorId,
             const std::string& planningRobotId,
@@ -1606,11 +1702,34 @@ namespace motion_planning
         const ProjectCdfQpRepairOptions& options)
     {
         if(!document.collision.query.enabled || !findRobot(document,robotId))return false;
+        if(!options.detectorIds.empty()) {
+            const auto available = distanceDetectorIds(document, robotId);
+            const bool valid = std::all_of(options.detectorIds.begin(), options.detectorIds.end(), [&](const auto& id) {
+                return std::find(available.begin(), available.end(), id) != available.end();
+            });
+            return valid && coversAttachments(document, selectedBuildPlan(document, options.detectorIds), robotId);
+        }
         const auto object=std::find_if(document.objects.begin(),document.objects.end(),
             [&](const auto& o){return o.id==options.obstacleId;});
         if(object==document.objects.end() && !findRobot(document,options.obstacleId))return false;
         for(const auto& d:document.collision.detectors) {
             if(d.id!=options.detectorId || !d.enabled || !d.distance || !d.nearestPoints)continue;
+            const auto plan = selectedBuildPlan(document, {d.id});
+            if(!coversAttachments(document, plan, robotId) ||
+                (findRobot(document, options.obstacleId) && !coversAttachments(document, plan, options.obstacleId)))
+                continue;
+            if(d.queryPolicy == "BetweenSets") {
+                const auto setHas = [&](const std::string& setId, const std::string& id) {
+                    return std::any_of(document.collision.selectionSets.begin(), document.collision.selectionSets.end(),
+                        [&](const auto& set) { return set.enabled && set.id == setId &&
+                            std::any_of(set.members.begin(), set.members.end(), [&](const auto& member) {
+                                return member.robotId == id || member.objectId == id;
+                            }); });
+                };
+                if((setHas(d.selectionSetAId, robotId) && setHas(d.selectionSetBId, options.obstacleId)) ||
+                    (setHas(d.selectionSetBId, robotId) && setHas(d.selectionSetAId, options.obstacleId))) return true;
+                continue;
+            }
             const auto target=[&](const std::string& id) {return std::any_of(d.targets.begin(),d.targets.end(),
                 [&](const auto& t){return t.robotId==id || t.objectId==id;});};
             if(!target(robotId) || !target(options.obstacleId))continue;
@@ -1628,19 +1747,16 @@ namespace motion_planning
     {
         std::vector<std::string> ids;
         if(!document.collision.query.enabled)return ids;
+        auto selected = document;
+        selected.collision.detectors.clear();
         for(const auto& d:document.collision.detectors) {
             if(!d.enabled || !d.distance || !d.nearestPoints)continue;
-            const auto setTargetsRobot=[&](const std::string& setId) {
-                return std::any_of(document.collision.selectionSets.begin(),document.collision.selectionSets.end(),[&](const auto& set) {
-                    return set.enabled && set.id==setId && std::any_of(set.members.begin(),set.members.end(),
-                        [&](const auto& member){return member.robotId==robotId;});
-                });
-            };
-            const bool target=std::any_of(d.targets.begin(),d.targets.end(),[&](const auto& t){return t.robotId==robotId;});
-            const bool pair=std::any_of(d.pairGenerators.begin(),d.pairGenerators.end(),[&](const auto& g) {
-                return g.robotId==robotId || g.robotA==robotId || g.robotB==robotId;
-            });
-            if(target || pair || setTargetsRobot(d.selectionSetAId) || setTargetsRobot(d.selectionSetBId))ids.push_back(d.id);
+            selected.collision.detectors = {d};
+            const auto plan = simulation_runtime::ProjectCollisionDetectorBuilder::collectBuildPlan(selected);
+            const auto tools = robotAttachments(document, robotId);
+            if(plan.requiresRobot(robotId) || std::any_of(tools.begin(), tools.end(), [&](const auto* tool) {
+                return plan.attachmentIds.count(tool->id) != 0;
+            })) ids.push_back(d.id);
         }
         return ids;
     }
@@ -1662,15 +1778,10 @@ namespace motion_planning
         }
 
         if(!options.detectorIds.empty()) {
-            if(!document.collision.query.enabled) {
-                addDiagnostic(diagnostics,"cdf_collision_disabled","Global collision queries are disabled."); return false;
-            }
-            for(const auto& id:options.detectorIds) {
-                const auto it=std::find_if(document.collision.detectors.begin(),document.collision.detectors.end(),
-                    [&](const auto& d){return d.id==id && d.enabled;});
-                if(it==document.collision.detectors.end()) {
-                    addDiagnostic(diagnostics,"cdf_detector_missing","Selected enabled detector not found: "+id); return false;
-                }
+            if(!collisionSetupConfigured(document, robotId, options)) {
+                addDiagnostic(diagnostics, "cdf_detector_invalid",
+                    "Selected detectors must be enabled, include the planning robot and all its enabled mounted attachments, and provide distance and nearest points. Enable global collision queries.");
+                return false;
             }
             if(detectorId) *detectorId=options.detectorIds.front();
             return true;
@@ -1698,6 +1809,9 @@ namespace motion_planning
             obstacleRobot != nullptr
                 ? makeRobotRobotDetector(selectedDetectorId, robotId, obstacleRobot->id, options)
                 : makeRobotObjectDetector(selectedDetectorId, robotId, obstacleObject->id, options);
+
+        includeMountedAttachments(document, detector, robotId,
+            obstacleRobot ? obstacleRobot->id : obstacleObject->id, obstacleRobot != nullptr);
 
         const auto detectorIt = std::find_if(
             document.collision.detectors.begin(),
@@ -1768,6 +1882,10 @@ namespace motion_planning
             }
         }
 
+        if(!options.detectorIds.empty() && !collisionSetupConfigured(document, robotId, options)) {
+            addDiagnostic(&result.diagnostics, "cdf_detector_invalid", "Selected distance detectors are unavailable for the planning robot.");
+            return result;
+        }
         const std::string detectorId = options.detectorId.empty()
             ? std::string("cdf_abb4600_burnner_detector")
             : options.detectorId;
