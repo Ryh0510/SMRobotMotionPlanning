@@ -9,6 +9,7 @@
 #include <fstream>
 #include <random>
 #include <chrono>
+#include <limits>
 using Baffle=ModelTrajPlan::VirtualBaffle;
 using V3=Eigen::Vector3d;
 using motion_planning::detail::GpuBaffleTask;
@@ -53,6 +54,26 @@ nlohmann::json ikRegression(){
     if(!solver.solve(targets,seeds,roots))throw std::runtime_error(solver.status().dump());
     int solved=0;double error=0;for(std::size_t i=0;i<roots.size();++i)if(!roots[i].empty()){++solved;for(const auto& c:roots[i])error=std::max(error,(options.model.worldForwardKinematics(c.joints).matrix()-targets[i].matrix()).norm());}
     if(solved!=96 || error>2e-6)throw std::runtime_error("GPU IK reachable-target regression failed: "+std::to_string(solved));
+    auto linearEnd=seed;for(int j=0;j<6;++j)linearEnd[j]+=.02*std::sin(j+1.);
+    std::vector<std::vector<double>> linear;
+    if(!solver.linearSamples(seed,linearEnd,256,linear) || linear.size()!=257 || linear.front()!=seed || linear.back()!=linearEnd)
+        throw std::runtime_error("GPU MoveL must preserve exact endpoint encoders");
+    const auto linearA=options.model.worldForwardKinematics(seed),linearB=options.model.worldForwardKinematics(linearEnd);
+    for(std::size_t i=0;i<linear.size();++i) {
+        const double f=double(i)/(linear.size()-1);const auto actual=options.model.worldForwardKinematics(linear[i]);
+        if((actual.translation()-((1-f)*linearA.translation()+f*linearB.translation())).norm()>1e-10 ||
+            Eigen::Quaterniond(actual.linear()).angularDistance(Eigen::Quaterniond(linearA.linear()).slerp(f,Eigen::Quaterniond(linearB.linear())))>1e-10)
+            throw std::runtime_error("GPU MoveL disagrees with independent CPU FK line/slerp");
+    }
+    std::vector<std::vector<double>> cancelledSamples;
+    if(solver.linearSamples(seed,linearEnd,256,cancelledSamples,[](){return true;}) || !cancelledSamples.empty())
+        throw std::runtime_error("GPU MoveL cancellation must discard partial proposals");
+    auto unboundedOptions=options;unboundedOptions.lower.assign(6,-std::numeric_limits<double>::infinity());
+    unboundedOptions.upper.assign(6,std::numeric_limits<double>::infinity());
+    GpuSerialIk unbounded;auto turnsA=seed,turnsB=linearEnd;turnsA.back()+=4*std::acos(-1.);turnsB.back()+=4*std::acos(-1.);
+    if(!unbounded.configure(model,names,"l6",unboundedOptions) || !unbounded.linearSamples(turnsA,turnsB,64,linear) ||
+        linear.front()!=turnsA || linear.back()!=turnsB || linear[32].back()<4*std::acos(-1.)-1)
+        throw std::runtime_error("GPU MoveL must retain raw multi-turn encoders under the explicit unbounded policy");
     auto unreachable=home;unreachable.translation()=V3(100,100,100);
     if(!solver.solve({unreachable},seeds,roots) || !roots.front().empty())throw std::runtime_error("GPU IK accepted unreachable target");
     GpuSerialIk unsupported;model.joints.back().isLoop=true;if(unsupported.configure(model,names,"l6",options))throw std::runtime_error("GPU IK accepted loop chain");
@@ -132,5 +153,15 @@ int main(int argc,char** argv){try{
     sparse.triangleIndices={0};
     if(!gpu.evaluate({sparse},sparseScore) || std::abs(sparseScore[0]-reference(b,triangles[0],0)+.001*(reference(b,triangles[0],0)>=.001?1.:0.)*(1.-1./triangles.size()))>1e-10)throw std::runtime_error("Sparse GPU merit must retain original full-mesh denominator");
 
+    {
+        GpuBaffleSearch independent;independent.configure(mesh,edges);
+        auto remote=base;remote.geometry[11]=10.;std::vector<double> remoteScores;
+        if(!independent.evaluate({remote},remoteScores) || remoteScores.size()!=1 || remoteScores[0]!=0. ||
+            !independent.status().value("compilation_cache_hit",false))
+            throw std::runtime_error("Compiled CUDA reuse must keep private geometry and query buffers");
+    }
+    std::vector<double> survivingScores;
+    if(!gpu.evaluate({base},survivingScores) || survivingScores!=combined)
+        throw std::runtime_error("Releasing another CUDA owner changed the surviving scene");
     std::cout<<nlohmann::json{{"cases",cases},{"max_error",maxError},{"elapsed_s",std::chrono::duration<double>(std::chrono::steady_clock::now()-began).count()},{"gpu",gpu.status()},{"ik_regression",ikRegression()}}.dump(2)<<'\n';return 0;
 }catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}

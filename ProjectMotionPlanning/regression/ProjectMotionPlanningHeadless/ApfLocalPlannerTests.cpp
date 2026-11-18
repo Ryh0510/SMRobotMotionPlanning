@@ -12,6 +12,18 @@ using namespace motion_planning::detail;
 
 int main()
 {
+    {
+        ApfOracle bounded;bounded.distance=[](const auto&){return 1.;};
+        bounded.motionValid=[](const auto&,const auto&){return false;};
+        bounded.iterationBudget=1;bounded.fieldAttempts=2;
+        int fields=0;bounded.failedStation=[&](int,std::size_t,const auto&){++fields;};
+        ApfPath rejected{{99}};
+        if(planApfPath({{-1},{0},{1}},{-2},{2},bounded,.01,&rejected) || !rejected.empty() || fields!=2)return 61;
+        fields=0;bounded.fieldAttempts=0;
+        if(planApfPath({{-1},{0},{1}},{-2},{2},bounded,.01,&rejected) || !rejected.empty() || fields!=4)return 62;
+        fields=0;bounded.fieldAttempts=-1;
+        if(planApfPath({{-1},{0},{1}},{-2},{2},bounded,.01,&rejected) || !rejected.empty() || fields!=0)return 63;
+    }
     // Equal TCP positions can hide a reversed tool normal. The process gate
     // must inspect intermediate joint states, rather than just safe endpoints.
     ApfGuidance processGuide;
@@ -65,6 +77,18 @@ int main()
     for(std::size_t i = 0; i + 1 < path.size(); ++i)
         if(!oracle.motionValid(path[i], path[i + 1])) return 3;
     if(!planApfPath(reference, lower, upper, oracle, 0.02, &repeat) || repeat != path) return 4;
+    // Only the lower side of this obstacle is reachable on the process manifold.
+    // An unreachable upper perturbation must not suppress the later lower field.
+    ApfGuidance oneSided;oneSided.position=[](const auto& q){return q;};
+    oneSided.positions=reference;oneSided.maxDeviation=.6;
+    oneSided.projectStation=[](auto& q,std::size_t){return q[1]<=0.;};
+    if(!planApfPath(reference,lower,upper,oracle,.02,&repeat,&oneSided) ||
+        repeat.front()!=reference.front() || repeat.back()!=reference.back() ||
+        !followsApfPath(repeat,oneSided)) {
+        std::cerr<<"An unreachable perturbation suppressed a feasible opposite field\n";return 48;
+    }
+    for(std::size_t i=1;i<repeat.size();++i)
+        if(!oracle.motionValid(repeat[i-1],repeat[i]) || repeat[i][1]>0)return 49;
     ApfOracle batched = oracle;
     std::size_t batchCalls = 0;
     batched.distances = [&](const ApfPath& points) {
@@ -234,6 +258,33 @@ int main()
         ordered.orderedStateAdmissible=[](const auto& q,double station){return std::abs(q[0]-station*station)<.01;};
         if(followsApfPath({{0,0},{1,0}},ordered))return 44;
     }
-    std::cout << "PASS APF: free path, obstacle, fixed anchors, deterministic escape, blocked corridor, invalid oracle, ordered zigzag, turn preservation, hard TCP corridor, nonlinear FK segment, time-aware smoothing\n";
+    {
+        ApfGuidance continuous;continuous.maxDeviation=1e-6;
+        continuous.position=[](const auto& q){return ApfState{q[0],q[1]-q[0]*q[0]};};
+        continuous.sampleMotion=[](const auto& a,const auto& b,double t,auto& q) {
+            q={t,t*t,(1-t)*a[2]+t*b[2]};return true;
+        };
+        std::vector<ApfState> observed;
+        continuous.orderedStateAdmissible=[&](const auto& q,double station) {
+            observed.push_back(q);
+            return std::abs(q[0]-station)<1e-12 && std::abs(q[2]-(6.4+.1*station))<1e-12;
+        };
+        const ApfState a{0,0,6.4},b{1,1,6.5};
+        if(!followsApfGuide(a,b,{0,0},{1,0},continuous,.01,0,1))return 45;
+        const auto expected=observed;observed.clear();std::size_t batches=0;
+        continuous.sampleMotionBatch=[&](const auto& from,const auto& to,std::size_t intervals,auto& values) {
+            ++batches;values.resize(intervals+1);
+            for(std::size_t k=0;k<=intervals;++k)if(!continuous.sampleMotion(from,to,double(k)/intervals,values[k]))return false;
+            return true;
+        };
+        if(!followsApfGuide(a,b,{0,0},{1,0},continuous,.01,0,1) || batches!=1 || observed!=expected || expected.size()!=101)return 46;
+        continuous.orderedStateAdmissible=[](const auto&,double station){return std::abs(station-.5)>.001;};
+        if(followsApfGuide(a,b,{0,0},{1,0},continuous,.01,0,1))return 47;
+        continuous.sampleMotionBatch=[](const auto&,const auto&,std::size_t,auto&){return false;};
+        if(followsApfGuide(a,b,{0,0},{1,0},continuous,.01,0,1))return 48;
+        continuous.sampleMotionBatch=[](const auto&,const auto&,std::size_t,auto& v){v={{0,0,6.4}};return true;};
+        if(followsApfGuide(a,b,{0,0},{1,0},continuous,.01,0,1))return 49;
+    }
+    std::cout << "PASS APF: free path, obstacle, fixed anchors, deterministic escape, blocked corridor, invalid oracle, ordered zigzag, turn preservation, hard TCP corridor, nonlinear FK segment, time-aware smoothing, equivalent batched motion samples\n";
     return 0;
 }

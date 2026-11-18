@@ -973,6 +973,7 @@ namespace motion_planning
                     oracle.influenceDistance=options.apfInfluenceDistance;
                     oracle.repulsionGain=options.apfRepulsionGain;
                     oracle.iterationBudget=options.apfIterationBudget;
+                    oracle.fieldAttempts=options.apfFieldAttempts;
                     detail::ApfGuidance localGuide;
                     if(guidance) {
                         localGuide = *guidance;
@@ -1852,6 +1853,10 @@ namespace motion_planning
             result.cancelled=true; addDiagnostic(&result.diagnostics,"cdf_cancelled","Planning cancelled."); return result;
         }
         result.statistics.inputWaypointCount = static_cast<int>(seedTrajectory.points.size());
+        if(!std::isfinite(options.selectiveSupportMaxJointStep) || options.selectiveSupportMaxJointStep < 0.0) {
+            addDiagnostic(&result.diagnostics,"apf_support_step_invalid","Support joint step must be finite and nonnegative; zero disables it.");
+            return result;
+        }
         if(!std::isfinite(options.apfMaxTcpDeviation) || options.apfMaxTcpDeviation < 0.0 ||
             (options.apfMaxTcpDeviation > 0.0 && !options.worldForwardKinematics)) {
             addDiagnostic(&result.diagnostics, "apf_tcp_model_missing", "A finite TCP deviation limit requires actual calibrated world TCP forward kinematics; no unbounded fallback was run.");
@@ -2050,6 +2055,9 @@ namespace motion_planning
                     else for(std::size_t j=0;j<q.size();++j)q[j]+=f*(b.q[j]-a.q[j]);
                     direct=direct && options.processStateAdmissible(q,a.time+f*(b.time-a.time));
                 }
+                if(direct && options.selectiveSupportMaxJointStep>0)
+                    for(std::size_t j=0;j<a.q.size();++j)
+                        if(std::abs(b.q[j]-a.q[j])>options.selectiveSupportMaxJointStep) {direct=false;break;}
                 if(!direct) {
                     ++blocked;
                     for(int k=1;k<=4;++k) {
@@ -2070,7 +2078,7 @@ namespace motion_planning
                 denseSeedTrajectory.push_back(b);correspondence.push_back({edge,1});
             }
             addDiagnostic(&result.diagnostics,"apf_selective_support","Retained "+std::to_string(seedTrajectory.points.size())+
-                " original controls; added four knots only in "+std::to_string(blocked)+" inadmissible direct intervals (collision, IK or process). Each original interval has at most four intermediate knots; unresolved connections return to GA. Collision samples remain internal.");
+                " original controls; added four knots only in "+std::to_string(blocked)+" inadmissible direct intervals (collision, IK, process or output joint step). Each original interval has at most four intermediate knots; unresolved connections return to GA. Collision samples remain internal.");
         }
         result.statistics.inputWaypointCount = static_cast<int>(denseSeedTrajectory.size());
 
@@ -2086,6 +2094,9 @@ namespace motion_planning
         detail::ApfGuidance tcpGuide;
         if(options.cartesianMotion)tcpGuide.sampleMotion=[sampler=options.cartesianMotion](const auto& a,const auto& b,double f,auto& q) {
             std::string error;return sampler->sample(a,b,f,q,error);
+        };
+        if(options.cartesianMotion)tcpGuide.sampleMotionBatch=[sampler=options.cartesianMotion,cancelled=options.cancelled](const auto& a,const auto& b,std::size_t steps,auto& q) {
+            std::string error;return sampler->uniformSamples(a,b,steps,q,error,cancelled);
         };
         const bool constrainTcp = options.apfMaxTcpDeviation > 0.0;
         if((options.tcpStateAdmissible || options.surfaceProject) && (!constrainTcp || !options.worldForwardKinematics)) {
@@ -2133,9 +2144,9 @@ namespace motion_planning
                 // Exact endpoint joints remain immutable, including shared scan boundaries.
                 if(begin+i==0 || begin+i+1==path.size())continue;
                 if(!tcpGuide.projectStation(candidate[i],begin+i)) {
-                    if(options.selectiveSupport && begin+i<correspondence.size()) {
+                    if(begin+i<correspondence.size()) {
                         const auto edge=std::min(seedTrajectory.points.size()-2,correspondence[begin+i].first);
-                        result.apfConnectionFailures.push_back({seedTrajectory.points[edge].time,seedTrajectory.points[edge+1].time,!originalCollisionEdges[edge]});
+                        result.apfConnectionFailures.push_back({seedTrajectory.points[edge].time,seedTrajectory.points[edge+1].time,options.selectiveSupport && !originalCollisionEdges[edge]});
                     }
                     return false;
                 }
@@ -2301,7 +2312,7 @@ namespace motion_planning
                     const auto edge=std::min(seedTrajectory.points.size()-2,upper==seedTrajectory.points.begin()?std::size_t(0):
                         std::size_t(upper-seedTrajectory.points.begin()-1));
                     if(reported.insert(edge).second)result.apfConnectionFailures.push_back({seedTrajectory.points[edge].time,
-                        seedTrajectory.points[edge+1].time,!originalCollisionEdges[edge]});
+                        seedTrajectory.points[edge+1].time,options.selectiveSupport && !originalCollisionEdges[edge]});
                 }
             }
             captureStage("APF (incomplete)", path, apfMinimumPhi, result.statistics.invalidSegmentCount);
@@ -2315,7 +2326,6 @@ namespace motion_planning
             "All trajectory segments passed collision and configured TCP corridor validation before QP/CDF.");
 
         result.statistics.finalMinimumPhi = apfMinimumPhi;
-        if(options.stage != ProjectCdfQpRepairOptions::Stage::ApfOnly) {
         // Optimize geometry independently of duplicate/dwell source timestamps.
         const auto knotTimes = constrainTcp ? jointPathParameters(tcpGuide.positions, 0.01) : jointPathParameters(path);
         const double smoothingStep = options.postSmoothingStep /
@@ -2395,6 +2405,7 @@ namespace motion_planning
         captureStage("APF (refined, before QP)", path, evaluatePathMinimum(path), 0);
         seedPath = path;
 
+        if(options.stage != ProjectCdfQpRepairOptions::Stage::ApfOnly) {
         // The complete path has passed the gate above. QP candidates and the
         // final output retain their existing collision acceptance checks.
         for(int iteration = 0; iteration < maxIterations; ++iteration) {
@@ -2800,10 +2811,10 @@ namespace motion_planning
             return result;
         }
 
-        } // optional CDF/QP; APF-only proceeds directly to fresh final validation.
+        } // optional CDF/QP; APF-only retains validated pre-QP smoothing.
 
-        // The trajectory player linearly interpolates raw joint values. Output
-        // the same continuous chart used by shortest-arc motion validation, even
+        // Keep the continuous encoder chart used by the execution sampler
+        // and motion validation, even
         // when smoothing is disabled or the trajectory has only two points.
         path = unwrapContinuousPath(path, scene->jointBounds());
         if(options.stage == ProjectCdfQpRepairOptions::Stage::ApfOnly && options.selectiveSupport &&

@@ -108,11 +108,15 @@ namespace motion_planning::detail
         double maximumDelta = 0.0;
         for(std::size_t j = 0; j < from.size(); ++j) maximumDelta = std::max(maximumDelta, std::abs(to[j] - from[j]));
         const auto steps = std::max<std::size_t>(1, static_cast<std::size_t>(std::ceil(maximumDelta / jointStep)));
+        ApfPath sampled;
+        if(guidance.sampleMotionBatch && (!guidance.sampleMotionBatch(from,to,steps,sampled) || sampled.size()!=steps+1))return false;
         for(std::size_t i = 0; i <= steps; ++i) {
             const double t = static_cast<double>(i) / steps;
             auto q = from, target = guideFrom;
-            if(guidance.sampleMotion) {if(!guidance.sampleMotion(from,to,t,q))return false;}
+            if(guidance.sampleMotionBatch)q=sampled[i];
+            else if(guidance.sampleMotion) {if(!guidance.sampleMotion(from,to,t,q))return false;}
             else for(std::size_t j = 0; j < q.size(); ++j) q[j] += t * (to[j] - from[j]);
+            if(!finite(q,from.size()))return false;
             for(std::size_t j = 0; j < target.size(); ++j) target[j] += t * (guideTo[j] - guideFrom[j]);
             const auto p = guidance.position(q);
             if(!finite(p, target.size()) || norm(difference(p, target)) > guidance.maxDeviation + 1e-9) return false;
@@ -161,7 +165,7 @@ namespace motion_planning::detail
         const auto metricReference = guidance ? guidance->positions : reference;
         const double tube = guidance ? guidance->maxDeviation : 0.45;
         if(!std::isfinite(oracle.stepSize) || oracle.stepSize<=0 || !std::isfinite(oracle.influenceDistance) || oracle.influenceDistance<=0 ||
-            !std::isfinite(oracle.repulsionGain) || oracle.repulsionGain<=0 || oracle.iterationBudget<1)return false;
+            !std::isfinite(oracle.repulsionGain) || oracle.repulsionGain<=0 || oracle.iterationBudget<1 || oracle.fieldAttempts<0)return false;
         const double influence = std::max(oracle.influenceDistance, 5.0 * clearance);
         const double startDistance = oracle.distance(reference.front()), goalDistance = oracle.distance(reference.back());
         if(!std::isfinite(startDistance) || !std::isfinite(goalDistance) || startDistance < 0.0 || goalDistance < 0.0) return false;
@@ -174,13 +178,15 @@ namespace motion_planning::detail
 
         // Visit ALL reference stations in order. A collision-free chord to the
         // final anchor must never skip the intervening zigzag or returning stroke.
-        const int attempts = 2 + static_cast<int>(dimension) * 2;
+        const int fullAttempts = 2 + static_cast<int>(dimension) * 2;
+        const int attempts = oracle.fieldAttempts>0?std::min(fullAttempts,oracle.fieldAttempts):fullAttempts;
         for(int attempt = 0; attempt < attempts; ++attempt) {
             const bool reverse = attempt % 2 != 0;
             const auto index = [&](std::size_t i) { return reverse ? reference.size() - 1 - i : i; };
             // Smooth deterministic early detours explore both sides of each
             // joint direction. Both boundary configurations remain exactly fixed.
             ApfPath fieldReference=reference;
+            bool fieldProjected=true;
             if(attempt>=2)for(std::size_t i=1;i+1<reference.size();++i) {
                 const auto axis=static_cast<std::size_t>((attempt-2)/2);
                 const double t=static_cast<double>(i)/(reference.size()-1);
@@ -195,8 +201,9 @@ namespace motion_planning::detail
                 fieldReference[i][axis]=std::clamp(fieldReference[i][axis]+
                     (reverse?-0.55:0.55)*std::sin(3.14159265358979323846*t),lower[axis],upper[axis]);
                 if(guidance && !projectPosition(fieldReference[i],metricReference[i],lower,upper,*guidance,
-                    std::min(0.03,0.3*tube),60,i))return false;
+                    std::min(0.03,0.3*tube),60,i)){fieldProjected=false;break;}
             }
+            if(!fieldProjected)continue; // Only this perturbation failed its IK/projection.
             ApfPath path{reference[index(0)]};
             bool failed = false;
             int totalIterations = 0, reportedIteration = -1;
@@ -344,6 +351,9 @@ namespace motion_planning::detail
                         probes.push_back(std::move(plus)); probes.push_back(std::move(minus));
                     }
                     const double forecastDistance=forecast(q);
+                    // An unreachable projected preview rejects this field, not
+                    // the remaining reverse/perturbed fields. NaN still fails closed.
+                    if(forecastDistance==-std::numeric_limits<double>::infinity())break;
                     if(!std::isfinite(forecastDistance))return false;
                     const bool imminent=distance<0.02;
                     const double potentialDistance=imminent?distance:std::min(distance,forecastDistance);
@@ -351,21 +361,35 @@ namespace motion_planning::detail
                     if(potentialDistance < influence) {
                         std::vector<double> distances;
                         ApfPath previewProbes;
+                        std::vector<std::size_t> previewSlots;
                         const auto gradientPreview=imminent?std::vector<std::size_t>{station}:preview;
-                        for(const auto& probe:probes) for(auto next:gradientPreview) {
-                            auto trial=probe;
+                        for(std::size_t k=0;k<probes.size();++k)for(std::size_t f=0;f<gradientPreview.size();++f) {
+                            const auto next=gradientPreview[f];auto trial=probes[k];
                             for(std::size_t j=0;j<dimension;++j)
-                                trial[j]=std::clamp(probe[j]+fieldReference[index(next)][j]-target[j],lower[j],upper[j]);
-                            if(guidance && guidance->projectStation && !guidance->projectStation(trial,index(next))) return false;
+                                trial[j]=std::clamp(probes[k][j]+fieldReference[index(next)][j]-target[j],lower[j],upper[j]);
+                            // A one-sided process/IK boundary can reject one finite
+                            // difference probe. Keep the opposite derivative; never
+                            // query an invalid pose or abort the other APF fields.
+                            if(guidance && guidance->projectStation && !guidance->projectStation(trial,index(next)))continue;
+                            previewSlots.push_back(k*gradientPreview.size()+f);
                             previewProbes.push_back(std::move(trial));
                         }
-                        std::vector<double> observed;
-                        if(oracle.distances)observed=oracle.distances(previewProbes);
-                        else for(const auto& probe:previewProbes)observed.push_back(oracle.distance(probe));
-                        if(observed.size()!=previewProbes.size())return false;
+                        std::vector<double> evaluated;
+                        if(oracle.distances)evaluated=oracle.distances(previewProbes);
+                        else for(const auto& probe:previewProbes)evaluated.push_back(oracle.distance(probe));
+                        if(evaluated.size()!=previewProbes.size())return false;
+                        std::vector<double> observed(probes.size()*gradientPreview.size(),std::numeric_limits<double>::quiet_NaN());
+                        for(std::size_t k=0;k<evaluated.size();++k) {
+                            if(!std::isfinite(evaluated[k]))return false;
+                            observed[previewSlots[k]]=evaluated[k];
+                        }
                         for(std::size_t k=0;k<probes.size();++k) {
                             double value=std::numeric_limits<double>::infinity();
-                            for(std::size_t f=0;f<gradientPreview.size();++f){const double d=observed[k*gradientPreview.size()+f];if(!std::isfinite(d))return false;value=std::min(value,d);}
+                            for(std::size_t f=0;f<gradientPreview.size();++f) {
+                                const double d=observed[k*gradientPreview.size()+f];
+                                if(!std::isfinite(d)){value=d;break;}
+                                value=std::min(value,d);
+                            }
                             distances.push_back(value);
                         }
                         if(distances.size() != probes.size()) return false;
@@ -374,8 +398,8 @@ namespace motion_planning::detail
                             const double hp = probes[2*j][j] - q[j], hm = q[j] - probes[2*j+1][j];
                             if(std::isfinite(dp) && std::isfinite(dm) && hp + hm > 0)
                                 gradient[j] = (dp - dm) / (hp + hm);
-                            else if(std::isfinite(dp) && dp >= 0 && hp > 0) gradient[j] = (dp - distance) / hp;
-                            else if(std::isfinite(dm) && dm >= 0 && hm > 0) gradient[j] = (distance - dm) / hm;
+                            else if(std::isfinite(dp) && dp >= 0 && hp > 0) gradient[j] = (dp - potentialDistance) / hp;
+                            else if(std::isfinite(dm) && dm >= 0 && hm > 0) gradient[j] = (potentialDistance - dm) / hm;
                         }
                         normalize(gradient);
                     }

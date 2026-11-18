@@ -155,5 +155,39 @@ bool GpuSerialIk::solve(const std::vector<Eigen::Isometry3d>& targets,const std:
     }
     return true;
 }
+bool GpuSerialIk::linearSamples(const std::vector<double>& from,const std::vector<double>& to,
+    std::size_t intervals,std::vector<std::vector<double>>& samples,const std::function<bool()>& cancelled) const
+{
+    samples.clear();
+    if(!configured_ || from.size()!=6 || to.size()!=6 || intervals<32 || intervals>1000000)return false;
+    for(int j=0;j<6;++j)if(!std::isfinite(from[j]) || !std::isfinite(to[j]) ||
+        from[j]<options_.lower[j] || from[j]>options_.upper[j] || to[j]<options_.lower[j] || to[j]>options_.upper[j])return false;
+    const auto a=forward(from),b=forward(to);
+    const Eigen::Quaterniond rotationA(a.linear()),rotationB(b.linear());
+    std::vector<std::vector<double>> checked(intervals+1);checked.front()=from;checked.back()=to;
+    for(std::size_t first=1;first<intervals;first+=4096) {
+        if(cancelled && cancelled())return false;
+        const auto end=std::min(intervals,first+4096);
+        std::vector<GpuIkTask> tasks;tasks.reserve(end-first);
+        for(std::size_t k=first;k<end;++k) {
+            const double f=double(k)/intervals;Eigen::Isometry3d pose=Eigen::Isometry3d::Identity();
+            pose.translation()=(1-f)*a.translation()+f*b.translation();pose.linear()=rotationA.slerp(f,rotationB).toRotationMatrix();
+            GpuIkTask task;for(int row=0;row<3;++row)for(int col=0;col<4;++col)task.target[4*row+col]=pose.matrix()(row,col);
+            for(int j=0;j<6;++j)task.seed[j]=(1-f)*from[j]+f*to[j];tasks.push_back(task);
+        }
+        std::vector<GpuIkRoot> roots;
+        if(!gpu_.solveIk(model_,tasks,roots,40,2e-11,2e-11,1e-6,1.) || roots.size()!=tasks.size())return false;
+        for(std::size_t k=first;k<end;++k) {
+            const auto& root=roots[k-first];if(!root.converged)return false;
+            auto& q=checked[k];q.resize(6);
+            for(int j=0;j<6;++j){q[j]=root.joints[j];if(!std::isfinite(q[j]) || q[j]<options_.lower[j] || q[j]>options_.upper[j])return false;}
+            const double f=double(k)/intervals;const auto pose=forward(q);
+            if((pose.translation()-((1-f)*a.translation()+f*b.translation())).norm()>=1e-10 ||
+                Eigen::Quaterniond(pose.linear()).angularDistance(rotationA.slerp(f,rotationB))>=1e-10)return false;
+        }
+    }
+    if(cancelled && cancelled())return false;
+    samples=std::move(checked);return true;
+}
 nlohmann::json GpuSerialIk::status()const{auto out=gpu_.status();out["model_verified"]=configured_;out["model_error"]=modelError_;out["model_fk_error_max"]=modelErrorMax_;out["cpu_fk_rejected"]=cpuFkRejected_;out["cpu_fk_verified_roots"]=verifiedRoots_;out["spherical_wrist_reach_bound"]=reachBoundReady_;out["geometrically_unreachable_targets"]=reachRejectedTargets_;return out;}
 }}

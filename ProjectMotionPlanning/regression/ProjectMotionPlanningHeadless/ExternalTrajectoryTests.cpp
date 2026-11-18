@@ -1,5 +1,6 @@
 #include <ProjectMotionPlanning/GaApfCdfPipeline.h>
 #include <ProjectMotionPlanning/CartesianMotion.h>
+#include <ProjectMotionPlanning/CartesianPathRefinement.h>
 #include <ProjectMotionPlanning/TrajectoryImport.h>
 #include <ProjectMotionPlanning/CdfJointAngleImport.h>
 #include <ProjectMotionPlanning/TrajectoryControlPointEditing.h>
@@ -322,8 +323,13 @@ int main()
         for(int i=0;i<121;++i){auto control=point;control.time=i;budgetRequest.plan.cartesianControlPoints.points.push_back(control);
             auto joint=evaluated.plan.trajectory.points.front();joint.time=i;budgetRequest.plan.trajectory.points.push_back(joint);}
         auto budgetDocument=document;budgetDocument.objects.push_back(part);
+        auto staleTarget=point.tcpPose;staleTarget.translation().x()+=.02;
+        budgetRequest.cdfOptions.cartesianTargets.assign(121,staleTarget);
         const auto softBudget=runGaApfCdfPipeline(budgetDocument,dir,budgetRequest,false);
         check(softBudget.success && softBudget.plan.trajectory.points.size()==121,"100-point target is soft: all 121 original controls remain valid instead of failing or being discarded");
+        check(softBudget.success && std::none_of(softBudget.diagnostics.begin(),softBudget.diagnostics.end(),
+            [](const auto& d){return d.code=="apf_cartesian_seed_stale";}),
+            "GA/APF uses immutable surface controls instead of stale imported exact-pose targets");
         check(std::none_of(softBudget.stages.begin(),softBudget.stages.end(),[](const auto& stage){return stage.name.find("CDF accepted")!=std::string::npos;}),"Default GA/APF path does not run optional CDF/QP");
         auto storedReference=softBudget.plan;
         check(!storedReference.optimizationMetadata.empty() &&
@@ -341,6 +347,24 @@ int main()
             [](const auto& d){return d.code=="pipeline_initial_top1";}) &&
             budgetDocument.robots.front().initialJoints.size()==initialJointsBefore,
             "Raw Cartesian pipeline performs physical all-IK and Top-1 initialization without mutating the caller project");
+        auto exhaustedFast=raw;exhaustedFast.cdfOptions.targetClearance=100.;
+        exhaustedFast.gaInitialPostures=24;exhaustedFast.gaGenerations=1;exhaustedFast.gaPointEvaluations=48;
+        exhaustedFast.gaGpuIkEnabled=false;exhaustedFast.ik.seedCount=1;
+        // This fixture observes restart policy, not difficult IK convergence.
+        exhaustedFast.ik.maxIterations=64;exhaustedFast.ik.model.maxIterations=64;
+        GaSurfaceSearchOptions fast;fast.latencyOptimized=true;fast.maxConnectionFeedbackRounds=0;
+        const auto hasFallback=[](const auto& r){return std::count_if(r.diagnostics.begin(),r.diagnostics.end(),
+            [](const auto& d){return d.code=="pipeline_full_search_fallback";});};
+        const auto retried=runGaApfCdfPipeline(budgetDocument,dir,exhaustedFast,false,fast);
+        check(!retried.success && !retried.cancelled && hasFallback(retried)==1,
+            "Fast search exhaustion performs exactly one complete CPU search before reporting failure");
+        auto invalidFast=exhaustedFast;invalidFast.gaPointWorkers=0;
+        check(hasFallback(runGaApfCdfPipeline(budgetDocument,dir,invalidFast,false,fast))==0,
+            "Invalid search input does not restart a full search");
+        auto cancelledFast=exhaustedFast;cancelledFast.cancelled=[](){return true;};
+        const auto stoppedFast=runGaApfCdfPipeline(budgetDocument,dir,cancelledFast,false,fast);
+        check(stoppedFast.cancelled && hasFallback(stoppedFast)==0,
+            "User cancellation never launches the complete-search fallback");
         runtime.setRobotJointValues("robot",request.plan.jointNames,request.ik.model.seedJoints);
         auto adaptive=request;adaptive.pipelineStage="posture";adaptive.controlPointsOnly=true;adaptive.returnCandidates=true;
         adaptive.postureOptions.pointEvaluations=24;adaptive.postureOptions.graphRefinementRounds=0;
@@ -480,6 +504,42 @@ int main()
                 check(continuous && std::abs(midpoint[5] - (a[5] + .05)) < 1e-7,
                     "MoveL supports actual continuous wrists and retains unwrapped encoder turns beyond a full revolution");
             }
+            {
+                auto relaxedSetup=setup;relaxedSetup.enforceJointPositionLimits=false;
+                auto relaxedScene=ProjectPlanningSceneBuilder::build(moveLDocument,dir,relaxedSetup,&error);
+                auto relaxedSampler=relaxedScene?CartesianMotionSampler::create(*relaxedScene,"l5",Eigen::Isometry3d::Identity(),error):nullptr;
+                auto a=request.ik.model.seedJoints,b=a;a[5]=2*std::acos(-1.)+.1;b[5]=a[5]+.1;
+                std::vector<double> midpoint;std::vector<std::vector<double>> samples;
+                check(scene && scene->enforcesJointPositionLimits() && !scene->validateState(a).valid &&
+                    sampler && !sampler->sample(a,b,.5,midpoint,error),
+                    "Default planning scenes and MoveL samplers still reject out-of-limit encoders");
+                const bool unbounded=relaxedScene && !relaxedScene->enforcesJointPositionLimits() &&
+                    relaxedScene->validateState(a).valid && relaxedSampler &&
+                    relaxedSampler->connection(a,b,.005,10000,samples,error);
+                check(unbounded && samples.front()==a && samples.back()==b &&
+                    std::abs(samples[samples.size()/2][5]-(a[5]+.05))<.0051,
+                    "Explicit unbounded playback retains multi-turn encoders and samples continuous MoveL");
+                if(relaxedSampler) {
+                    const auto from=relaxedSampler->forward(a),to=relaxedSampler->forward(b);
+                    const bool solved=relaxedSampler->sample(a,b,.5,midpoint,error);
+                    const auto pose=solved?relaxedSampler->forward(midpoint):Eigen::Isometry3d::Identity();
+                    check(solved && (pose.translation()-.5*(from.translation()+to.translation())).norm()<1e-8 &&
+                        Eigen::Quaterniond(pose.linear()).angularDistance(Eigen::Quaterniond(from.linear()).slerp(.5,Eigen::Quaterniond(to.linear())))<1e-8,
+                        "Ignoring position limits still preserves the TCP straight line and quaternion interpolation");
+                    auto contactDocument=moveLDocument;
+                    const auto position=from.translation();
+                    contactDocument.objects.back().transform.x=position.x();
+                    contactDocument.objects.back().transform.y=position.y();
+                    contactDocument.objects.back().transform.z=position.z();
+                    auto contactScene=ProjectPlanningSceneBuilder::build(contactDocument,dir,relaxedSetup,&error);
+                    const auto collision=contactScene?contactScene->validateState(a):StateValidationResult{};
+                    check(contactScene && !collision.valid && collision.diagnosticCode=="state_in_collision",
+                        "Unbounded playback still detects real mesh collisions at out-of-limit encoder states");
+                    a[0]=std::numeric_limits<double>::quiet_NaN();
+                    check(!relaxedScene->validateState(a).valid && !relaxedSampler->sample(a,b,.5,midpoint,error),
+                        "Unbounded playback still rejects non-finite joint values");
+                }
+            }
             if(sampler) {
                 auto a=request.ik.model.seedJoints,b=a;b[0]+=.2;b[1]+=.03;b[3]+=.05;
                 const auto from=sampler->forward(a),to=sampler->forward(b);
@@ -501,6 +561,26 @@ int main()
                 for(std::size_t i=1;i<internal.size();++i)for(std::size_t j=0;j<6;++j)bounded &= std::abs(internal[i][j]-internal[i-1][j])<=.00200001;
                 check(bounded && internal.size()>2 && internal.front()==a && internal.back()==b,
                     "MoveL internal IK sampling preserves exact endpoint turns and the requested actual joint-step bound");
+                bool uniformValid=true;
+                for(std::size_t intervals:{1,8,64,257}) {
+                    std::vector<std::vector<double>> uniform;
+                    uniformValid &= sampler->uniformSamples(a,b,intervals,uniform,error) && uniform.size()==intervals+1;
+                    if(uniform.size()!=intervals+1)continue;
+                    uniformValid &= uniform.front()==a && uniform.back()==b;
+                    for(std::size_t k=0;k<uniform.size();++k) {
+                        std::vector<double> reference;const double f=double(k)/intervals;
+                        uniformValid &= sampler->sample(a,b,f,reference,error);
+                        if(reference.size()!=6){uniformValid=false;continue;}
+                        const auto actual=sampler->forward(uniform[k]);
+                        uniformValid &= (actual.translation()-((1-f)*from.translation()+f*to.translation())).norm()<1e-10 &&
+                            Eigen::Quaterniond(actual.linear()).angularDistance(Eigen::Quaterniond(from.linear()).slerp(f,Eigen::Quaterniond(to.linear())))<1e-10;
+                        for(int j=0;j<6;++j)uniformValid &= std::abs(reference[j]-uniform[k][j])<1e-7;
+                    }
+                }
+                check(uniformValid,"Batched MoveL retains all exact fractions, physical FK, endpoint turns and the CPU-selected branch");
+                check(!sampler->uniformSamples(a,b,64,internal,error,[](){return true;}) && internal.empty() &&
+                    !sampler->uniformSamples(a,b,0,internal,error) && internal.empty(),
+                    "Batched MoveL rejects cancellation and invalid budgets without partial accepted samples");
                 check(!sampler->connection(a,b,.00025,2,internal,error) && internal.empty(),"MoveL cannot turn a sample-budget failure into a safe connection");
                 check(!sampler->connection(a,b,.002,10000,internal,error,[](){return true;}) && internal.empty(),"MoveL respects cancellation before any accepted path");
                 StoredMotionPlan moveLPlan;moveLPlan.robotId="robot";moveLPlan.jointNames=request.plan.jointNames;
@@ -508,6 +588,87 @@ int main()
                 for(int k=0;k<2;++k) {
                     robottrajectory::TimedJointPoint p;p.time=k;p.q=k?b:a;moveLPlan.trajectory.points.push_back(p);
                     robottrajectory::TimedCartesianPoint tcp;tcp.time=k;tcp.tcpPose=sampler->forward(p.q);moveLPlan.cartesianControlPoints.points.push_back(tcp);
+                }
+                {
+                    auto noisy=moveLPlan;noisy.trajectory.points.clear();noisy.cartesianControlPoints.points.clear();
+                    std::vector<std::vector<double>> originalPath;
+                    for(int k=0;k<=8;++k) {
+                        robottrajectory::TimedJointPoint p;p.time=k;p.q=a;
+                        for(int j=0;j<6;++j)p.q[j]+=(b[j]-a[j])*k/8.;
+                        if(k && k<8)p.q[5]+=(k%2?.06:-.06);
+                        p.qd.assign(6,1.);p.qdd.assign(6,2.);
+                        originalPath.push_back(p.q);noisy.trajectory.points.push_back(p);
+                    }
+                    const auto parameters=jointPathParameters(originalPath);
+                    auto before=noisy.trajectory;
+                    const auto beforeQuality=evaluateTrajectoryQuality(before,scene->jointBounds(),1.,2.,parameters);
+                    CartesianPathRefinementOptions fair;fair.collisionDetectorIds={"check"};fair.queryWorkers=2;
+                    fair.tcpLinkName="l5";
+                    fair.maximumPositionDeviation=.001;fair.maximumOrientationDeviation=.12;
+                    fair.validationJointStep=.001;
+                    const auto refined=ProjectCartesianPathRefinementService{}.refine(moveLDocument,dir,noisy,fair);
+                    check(refined.success && refined.plan.trajectory.points.size()==9 &&
+                        std::all_of(refined.plan.trajectory.points.begin(),refined.plan.trajectory.points.end(),
+                            [](const auto& p){return p.qd.empty() && p.qdd.empty();}) &&
+                        refined.plan.trajectory.points.front().q==noisy.trajectory.points.front().q &&
+                        refined.plan.trajectory.points.back().q==noisy.trajectory.points.back().q,
+                        "Collision-constrained pose fairing retains every station and exact endpoint encoders");
+                    if(refined.success) {
+                        auto after=refined.plan.trajectory;
+                        const auto quality=evaluateTrajectoryQuality(after,scene->jointBounds(),1.,2.,parameters);
+                        bool corridor=CartesianMotionSampler::isMoveL(refined.plan);std::vector<std::vector<double>> refinedPath;
+                        for(std::size_t i=0;i<after.points.size();++i) {
+                            const auto originalPose=sampler->forward(noisy.trajectory.points[i].q),pose=sampler->forward(after.points[i].q);
+                            corridor &= after.points[i].time==noisy.trajectory.points[i].time &&
+                                (originalPose.translation()-pose.translation()).norm()<=.00100001 &&
+                                Eigen::Quaterniond(originalPose.linear()).angularDistance(Eigen::Quaterniond(pose.linear()))<=.12000001;
+                            refinedPath.push_back(after.points[i].q);
+                        }
+                        detail::CdfQueryBatch independent(*scene,moveLDocument,dir,setup,2,false);independent.setCartesianMotion(sampler);
+                        MotionValidationOptions fine;fine.maxJointStep=.001;fine.preserveJointTurns=true;
+                        const auto verified=independent.motions(refinedPath,fine,false);
+                        check(corridor && quality.jointLength<beforeQuality.jointLength && quality.bendingCost<beforeQuality.bendingCost &&
+                            std::all_of(verified.begin(),verified.end(),[](const auto& r){return r.valid;}),
+                            "Pose fairing reduces comparable length/bending inside the ordered pose corridor and passes fresh MoveL collision replay");
+                    }
+                    auto level=fair;level.horizontalAxisWeight=10000.;level.preserveEndpointEncoders=false;
+                    level.maximumPositionDeviation=0.;level.maximumOrientationDeviation=.2;level.bendingWeight=.1;
+                    const auto horizontal=ProjectCartesianPathRefinementService{}.refine(moveLDocument,dir,noisy,level);
+                    bool horizontalInvariant=horizontal.success;double tiltBefore=0.,tiltAfter=0.;
+                    std::vector<std::vector<double>> levelPath;
+                    if(horizontal.success)for(std::size_t i=0;i<noisy.trajectory.points.size();++i) {
+                        const auto source=sampler->forward(noisy.trajectory.points[i].q);
+                        const auto& point=horizontal.plan.trajectory.points[i];const auto pose=sampler->forward(point.q);
+                        const double beforeTilt=std::asin(std::clamp(std::abs(source.linear()(2,2)),0.,1.));
+                        const double afterTilt=std::asin(std::clamp(std::abs(pose.linear()(2,2)),0.,1.));
+                        horizontalInvariant &= (source.translation()-pose.translation()).norm()<1e-8 &&
+                            point.time==noisy.trajectory.points[i].time && afterTilt<=beforeTilt+1e-8;
+                        tiltBefore+=beforeTilt;tiltAfter+=afterTilt;levelPath.push_back(point.q);
+                    }
+                    if(horizontal.success) {
+                        detail::CdfQueryBatch independent(*scene,moveLDocument,dir,setup,2,false);independent.setCartesianMotion(sampler);
+                        MotionValidationOptions fine;fine.maxJointStep=.001;fine.preserveJointTurns=true;
+                        const auto verified=independent.motions(levelPath,fine,false);
+                        horizontalInvariant &= std::all_of(verified.begin(),verified.end(),[](const auto& r){return r.valid;});
+                    }
+                    check(horizontalInvariant && tiltAfter<tiltBefore-1e-4,
+                        "Horizontal preference reduces tilt without moving TCP, worsening any station, skipping times or bypassing full MoveL collision checks");
+                    auto invalidLevel=level;invalidLevel.worldUp.setZero();
+                    const auto invalidHorizontal=ProjectCartesianPathRefinementService{}.refine(moveLDocument,dir,noisy,invalidLevel);
+                    check(!invalidHorizontal.success && invalidHorizontal.plan.trajectory.empty(),
+                        "Horizontal preference rejects an invalid up axis without returning an accepted plan");
+                    auto cancelledFair=fair;cancelledFair.cancelled=[](){return true;};
+                    const auto cancelledRefinement=ProjectCartesianPathRefinementService{}.refine(moveLDocument,dir,noisy,cancelledFair);
+                    check(!cancelledRefinement.success && cancelledRefinement.plan.trajectory.empty(),
+                        "Cancelled pose refinement never returns a provisional path as accepted");
+                    auto blockedDocument=moveLDocument;
+                    const auto endpoint=sampler->forward(a).translation().eval();
+                    blockedDocument.objects.front().transform.x=endpoint.x()-.015;
+                    blockedDocument.objects.front().transform.y=endpoint.y()-.015;
+                    blockedDocument.objects.front().transform.z=endpoint.z()-.015;
+                    const auto blockedRefinement=ProjectCartesianPathRefinementService{}.refine(blockedDocument,dir,noisy,fair);
+                    check(!blockedRefinement.success && blockedRefinement.plan.trajectory.empty(),
+                        "A colliding fixed endpoint cannot be hidden by pose smoothing or an incomplete graph");
                 }
                 {
                     ProjectCdfQpRepairOptions preflight;
@@ -701,7 +862,28 @@ int main()
         const auto sparseClear=ProjectCdfQpTrajectoryRepairService{}.repair(clearDocument,dir,"robot",request.plan.jointNames,same,sparseEffort);
         check(sparseClear.success && sparseClear.plan.trajectory.points.size()==2 && sparseClear.statistics.inputWaypointCount==2,
             "A directly safe motion retains exactly its two original controls without post-optimization downsampling");
+        auto bent=crossed;
+        auto middle=bent.points.front();middle.time=5.;
+        for(std::size_t j=0;j<middle.q.size();++j)middle.q[j]=.5*(bent.points.front().q[j]+bent.points.back().q[j]);
+        middle.q[1]+=.03;bent.points.insert(bent.points.begin()+1,middle);
+        const auto fairApf=ProjectCdfQpTrajectoryRepairService{}.repair(clearDocument,dir,"robot",
+            request.plan.jointNames,bent,sparseEffort);
+        check(fairApf.success && fairApf.statistics.qpIterations==0 && fairApf.plan.trajectory.points.size()==3 &&
+            fairApf.plan.trajectory.points.front().q==bent.points.front().q &&
+            fairApf.plan.trajectory.points.back().q==bent.points.back().q &&
+            std::abs(fairApf.plan.trajectory.points[1].q[1]-(middle.q[1]-.03))<.03,
+            "APF-only restores collision-validated fairing with fixed endpoints and no QP");
         auto curved=same;curved.points.back().q[0]+=.01;
+        auto jumpSupport=sparseEffort;jumpSupport.selectiveSupportMaxJointStep=.0025;
+        const auto supportedJump=ProjectCdfQpTrajectoryRepairService{}.repair(clearDocument,dir,"robot",
+            request.plan.jointNames,curved,jumpSupport);
+        bool boundedJump=supportedJump.success && supportedJump.plan.trajectory.points.size()==6;
+        if(boundedJump)for(std::size_t i=1;i<supportedJump.plan.trajectory.points.size();++i)
+            for(std::size_t j=0;j<curved.points.front().q.size();++j)
+                boundedJump &= std::abs(supportedJump.plan.trajectory.points[i].q[j]-supportedJump.plan.trajectory.points[i-1].q[j])<=.0025;
+        check(boundedJump && supportedJump.plan.trajectory.points.front().q==curved.points.front().q &&
+            supportedJump.plan.trajectory.points.back().q==curved.points.back().q,
+            "Safe sparse controls get bounded APF supports when their output joint jump is too large, retaining exact endpoints");
         auto curvedEffort=sparseEffort;curvedEffort.retimeOutput=false;curvedEffort.apfMaxTcpDeviation=1.;
         curvedEffort.validationMaxJointStep=.00025;
         const double origin=curved.points.front().q[0];
@@ -762,6 +944,17 @@ int main()
             [](const auto& text){const auto r=nlohmann::json::parse(text);return r.value("apf_feedback",false) &&
                 r.value("feedback_sequence",0)==1 && r.value("initial_pool_completed",0)==128 && r.value("generations_completed",0)==2 && r.value("feedback_local_offspring",0)==48;}),
             "Feedback keeps original surface anchors and runs a fresh complete initial pool and offspring schedule only at requested controls");
+        auto quickFeedback=feedback;quickFeedback.gaFeedbackPostureLimit=2;
+        const auto quick=ProjectExternalTrajectoryEvaluator::evaluate(document,dir,quickFeedback);
+        check(quick.success && quick.plan.trajectory.points.front().q==feedback.optimizationSeed.points.front().q &&
+            quick.plan.trajectory.points.back().q==feedback.optimizationSeed.points.back().q && quick.pointSearchReports.size()==2 &&
+            std::all_of(quick.pointSearchReports.begin(),quick.pointSearchReports.end(),[](const auto& text){
+                const auto r=nlohmann::json::parse(text);return r.value("early_exit_on_safe",false) &&
+                    r.value("safe_postures",0)>=2 && r.value("stop_reason",std::string())=="connected_parent_quota";
+            }),"Feedback parent quota ends search effort while retaining a checked connected field and frozen exterior controls");
+        auto invalidQuota=feedback;invalidQuota.gaFeedbackPostureLimit=-1;
+        check(!ProjectExternalTrajectoryEvaluator::evaluate(document,dir,invalidQuota).success,
+            "Negative feedback parent quotas fail closed");
         auto directFeedback=feedback;directFeedback.gaRejectedConnections.front().requiresDirectProcess=true;
         const auto directRenewed=ProjectExternalTrajectoryEvaluator::evaluate(document,dir,directFeedback);
         bool directSamples=directRenewed.success;
@@ -1036,7 +1229,9 @@ int main()
         const auto collisionRejected=ProjectExternalTrajectoryEvaluator::evaluate(document,dir,bad);
         check(!collisionRejected.success && collisionRejected.retryWorkpiecePose,"Colliding external workpiece rejects all endpoint candidates");
         auto pointSearch=bad;pointSearch.controlPointsOnly=true;pointSearch.independentPointsOnly=true;
-        pointSearch.pointSearchAttempts=16;pointSearch.pointSearchSeconds=2;
+        // This fixture tests the attempt cap; deadline exhaustion is tested
+        // independently below. Allow slow Debug IK probes to finish under load.
+        pointSearch.pointSearchAttempts=16;pointSearch.pointSearchSeconds=30;
         pointSearch.plan.cartesianControlPoints.points.resize(1);
         const auto searchedPoint=ProjectExternalTrajectoryEvaluator::evaluate(document,dir,pointSearch);
         check(!searchedPoint.pointSearchReports.empty(),"Colliding point receives an inner feedback search instead of one proposal");
@@ -1222,6 +1417,24 @@ int main()
                 "Eight isolated motion workers retain ordered exact verdicts and monotonic completed-edge progress");
             lastCompleted=lastTotal=0;eightWorkers.motions(progressPath,options,true,observe);
             check(progressOrdered && lastCompleted==observed.size(),"Cached motion batches still report complete monotonic progress");
+            const std::vector<std::pair<std::vector<double>,std::vector<double>>> independentEdges={
+                {{0},{.001}},{{0},{6.283185307179586}},{{1},{0}},{{0},{.002}}};
+            const auto independentResults=eightWorkers.independentMotions(independentEdges,options,false);
+            bool independentExact=independentResults.size()==independentEdges.size();
+            for(std::size_t i=0;i<independentResults.size();++i) {
+                const auto expected=turnScene->validateMotion(independentEdges[i].first,independentEdges[i].second,options);
+                independentExact &= expected.valid==independentResults[i].valid &&
+                    expected.diagnosticCode==independentResults[i].diagnosticCode && expected.message==independentResults[i].message;
+            }
+            check(independentExact,"Independent candidate pairs preserve ordered serial verdicts without inserting connecting motions");
+            auto independentCancelled=options;independentCancelled.cancelled=[](){return true;};
+            const auto stoppedPairs=eightWorkers.independentMotions(independentEdges,independentCancelled);
+            check(stoppedPairs.size()==independentEdges.size() && std::all_of(stoppedPairs.begin(),stoppedPairs.end(),
+                [](const auto& r){return !r.valid && r.diagnosticCode=="cancelled";}),
+                "Cancelled independent pair batches cannot return cached accepted motions");
+            auto independentCapped=options;independentCapped.maxSamples=2;
+            check(!eightWorkers.independentMotions({{{0},{1}}},independentCapped).front().valid,
+                "Independent pair certificates preserve each motion's sample budget");
             auto cancelledOptions=options;cancelledOptions.cancelled=[](){return true;};
             check(sampleParallel.motions({{0},{1}},cancelledOptions).front().diagnosticCode=="cancelled" &&
                 !sampleParallel.pathValid({{0},{1}},cancelledOptions),"Single-edge sample batches respect cancellation");

@@ -157,6 +157,7 @@ namespace motion_planning
         std::vector<JointBound> jointBounds;
         std::vector<std::string> detectorIds;
         bool conservativeMotion = false;
+        bool enforceJointPositionLimits = true;
         collision::MotionQueryRequest motionRequest;
         std::vector<std::string> collisionFreeLinks;
         mutable PlanningSceneQueryCounts queries;
@@ -170,11 +171,12 @@ namespace motion_planning
             std::vector<double> runtimeJointValues = jointValues;
             for (std::size_t index = 0; index < jointValues.size(); ++index)
             {
-                const double value = normalizedJointValueForBounds(jointValues[index], jointBounds[index]);
+                const double value = enforceJointPositionLimits
+                    ? normalizedJointValueForBounds(jointValues[index], jointBounds[index]) : jointValues[index];
                 const JointBound& bound = jointBounds[index];
                 if (!std::isfinite(jointValues[index]) || !std::isfinite(value))
                     return StateValidationResult::failure("non_finite_state", "Joint state contains a non-finite value.");
-                if (value < bound.lower || value > bound.upper)
+                if (enforceJointPositionLimits && (value < bound.lower || value > bound.upper))
                     return StateValidationResult::failure("state_out_of_bounds", "Joint state is outside the configured bounds.");
                 runtimeJointValues[index] = value;
             }
@@ -247,13 +249,13 @@ namespace motion_planning
             for (std::size_t i=0;i<from.size();++i) {
                 const auto& bound=m_impl->jointBounds[i];
                 if (!std::isfinite(from[i]) || !std::isfinite(to[i]) ||
-                    (!bound.continuous && (std::min(from[i],to[i])<bound.lower || std::max(from[i],to[i])>bound.upper)))
+                    (m_impl->enforceJointPositionLimits && !bound.continuous && (std::min(from[i],to[i])<bound.lower || std::max(from[i],to[i])>bound.upper)))
                     return StateValidationResult::failure("motion_out_of_bounds", "Invalid joint segment.");
                 const auto* joint=findJoint(robot->model,m_impl->jointNames[i]);
                 if (!joint || joint->dofIndex<0 || static_cast<std::size_t>(joint->dofIndex)>=fullFrom.size())
                     return StateValidationResult::failure("motion_joint_mapping", "Invalid joint mapping.");
                 fullFrom[joint->dofIndex]=from[i];
-                fullTo[joint->dofIndex]=bound.continuous && !options.preserveJointTurns
+                fullTo[joint->dofIndex]=m_impl->enforceJointPositionLimits && bound.continuous && !options.preserveJointTurns
                     ? from[i]+shortestContinuousDelta(from[i],to[i]) : to[i];
             }
             auto motionRequest=m_impl->motionRequest;
@@ -290,7 +292,7 @@ namespace motion_planning
             const JointBound& bound = m_impl->jointBounds[index];
             if(!std::isfinite(from[index]) || !std::isfinite(to[index]))
                 return StateValidationResult::failure("non_finite_state", "Motion contains a non-finite endpoint.");
-            const double delta = bound.continuous && !options.preserveJointTurns
+            const double delta = m_impl->enforceJointPositionLimits && bound.continuous && !options.preserveJointTurns
                 ? shortestContinuousDelta(from[index], to[index])
                 : to[index] - from[index];
             maximumDelta = std::max(maximumDelta, std::abs(delta));
@@ -320,11 +322,11 @@ namespace motion_planning
             for (std::size_t index = 0; index < sample.size(); ++index)
             {
                 const JointBound& bound = m_impl->jointBounds[index];
-                const double delta = bound.continuous && !options.preserveJointTurns
+                const double delta = m_impl->enforceJointPositionLimits && bound.continuous && !options.preserveJointTurns
                     ? shortestContinuousDelta(from[index], to[index])
                     : to[index] - from[index];
                 sample[index] = from[index] + delta * ratio;
-                if (bound.continuous)
+                if (m_impl->enforceJointPositionLimits && bound.continuous)
                     sample[index] = wrapContinuousAngle(sample[index]);
             }
 
@@ -372,6 +374,11 @@ namespace motion_planning
     const std::vector<JointBound>& ProjectPlanningSceneSnapshot::jointBounds() const
     {
         return m_impl->jointBounds;
+    }
+
+    bool ProjectPlanningSceneSnapshot::enforcesJointPositionLimits() const
+    {
+        return m_impl->enforceJointPositionLimits;
     }
 
     const std::vector<std::string>& ProjectPlanningSceneSnapshot::collisionDetectorIds() const
@@ -580,6 +587,7 @@ namespace motion_planning
             return nullptr;
         }
 
+        impl->enforceJointPositionLimits = request.enforceJointPositionLimits;
         impl->robotId = request.robotId;
         impl->jointNames = request.jointNames.empty()
             ? movableJointNames(runtimeRobot->model)

@@ -43,6 +43,9 @@ namespace motion_planning::detail
         std::vector<StateValidationResult> motions(const std::vector<std::vector<double>>& path,
             const MotionValidationOptions& options, bool useCache = true,
             const std::function<void(std::size_t,std::size_t)>& progress = {});
+        std::vector<StateValidationResult> independentMotions(
+            const std::vector<std::pair<std::vector<double>,std::vector<double>>>& edges,
+            const MotionValidationOptions& options, bool useCache = true);
         bool pathValid(const std::vector<std::vector<double>>& path, const MotionValidationOptions& options);
         // Exact independent state queries; every worker owns its mutable scene.
         struct StateCheck {StateValidationResult validation; double penetration=std::numeric_limits<double>::quiet_NaN();};
@@ -57,6 +60,10 @@ namespace motion_planning::detail
 
     private:
         struct StateHash { std::size_t operator()(const std::vector<double>& values) const; };
+        std::vector<StateValidationResult> evaluateEdges(
+            const std::vector<std::pair<const std::vector<double>*,const std::vector<double>*>>& edges,
+            const MotionValidationOptions& options, bool useCache,
+            const std::function<void(std::size_t,std::size_t)>& progress);
         StateValidationResult singleMotion(const std::vector<double>& from,
             const std::vector<double>& to, const MotionValidationOptions& options);
         StateValidationResult motion(std::size_t worker,const std::vector<double>& from,

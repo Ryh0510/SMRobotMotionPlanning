@@ -45,7 +45,7 @@ namespace motion_planning::detail
         m_scenes.push_back(&primary);
         const int hardware = static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
         const int workers = requestedWorkers <= 0 ? std::min(8, std::max(1, hardware / 2)) :
-            std::clamp(requestedWorkers, 1, std::min(hardware, 8));
+            std::clamp(requestedWorkers, 1, std::min(hardware, 16));
         // Construct runtimes serially; all mutable FK/geometry/query state is private.
         for(int i = 1; i < workers; ++i) {
             try {
@@ -297,8 +297,26 @@ namespace motion_planning::detail
         const MotionValidationOptions& options, bool useCache,
         const std::function<void(std::size_t,std::size_t)>& progress)
     {
+        std::vector<std::pair<const std::vector<double>*,const std::vector<double>*>> edges;
+        for(std::size_t i=1;i<path.size();++i)edges.emplace_back(&path[i-1],&path[i]);
+        return evaluateEdges(edges,options,useCache,progress);
+    }
+
+    std::vector<StateValidationResult> CdfQueryBatch::independentMotions(
+        const std::vector<std::pair<std::vector<double>,std::vector<double>>>& input,
+        const MotionValidationOptions& options, bool useCache)
+    {
+        std::vector<std::pair<const std::vector<double>*,const std::vector<double>*>> edges;
+        for(const auto& edge:input)edges.emplace_back(&edge.first,&edge.second);
+        return evaluateEdges(edges,options,useCache,{});
+    }
+
+    std::vector<StateValidationResult> CdfQueryBatch::evaluateEdges(const std::vector<std::pair<const std::vector<double>*,const std::vector<double>*>>& edges,
+        const MotionValidationOptions& options, bool useCache,
+        const std::function<void(std::size_t,std::size_t)>& progress)
+    {
         const auto started = Clock::now();
-        const auto count = path.empty() ? 0 : path.size() - 1;
+        const auto count = edges.size();
         std::vector<StateValidationResult> values(count);
         if(options.cancelled && options.cancelled()) {
             std::fill(values.begin(),values.end(),StateValidationResult::failure("cancelled","Planning cancelled.")); return values;
@@ -309,10 +327,10 @@ namespace motion_planning::detail
         // original-edge geometry in the same immutable planning invocation.
         const bool cacheThisRequest = useCache && m_cacheEnabled;
         for(std::size_t i = 0; i < count; ++i) {
-            const auto found = m_motions.find(motionKey(path[i], path[i + 1], options));
+            const auto found = m_motions.find(motionKey(*edges[i].first, *edges[i].second, options));
             if(cacheThisRequest && found != m_motions.end()) { values[i] = found->second; ++m_motionHits; }
             else if(cacheThisRequest && m_motionCertificates) {
-                const auto key=std::make_pair(bool(m_cartesianMotion),motionKey(path[i],path[i+1],options));
+                const auto key=std::make_pair(bool(m_cartesianMotion),motionKey(*edges[i].first,*edges[i].second,options));
                 const auto saved=m_motionCertificates->m_valid.find(key);
                 if(saved!=m_motionCertificates->m_valid.end()) {
                     values[i]=saved->second;++m_motionHits;++m_pipelineMotionHits;
@@ -337,17 +355,17 @@ namespace motion_planning::detail
         };
         if(progress)progress(completed,count);
         if(missing.size() == 1 && m_scenes.size() > 1) {
-            const auto i = missing.front(); values[i] = singleMotion(path[i], path[i + 1], options);completedOne();
+            const auto i = missing.front(); values[i] = singleMotion(*edges[i].first, *edges[i].second, options);completedOne();
         } else parallelFor(missing.size(), [&](std::size_t worker, std::size_t offset) {
             const auto i = missing[offset];
-            values[i] = motion(worker,path[i],path[i + 1],options);completedOne();
+            values[i] = motion(worker,*edges[i].first,*edges[i].second,options);completedOne();
         });
         if(cacheThisRequest) {
             for(auto i : missing) {
                 if(m_motions.size() >= kCacheEntries) { m_motions.clear(); }
                 // Cache only reliable valid results, never a transient runtime failure.
                 if(values[i].valid) {
-                    const auto key=motionKey(path[i],path[i+1],options);
+                    const auto key=motionKey(*edges[i].first,*edges[i].second,options);
                     m_motions[key]=values[i];
                     if(m_motionCertificates) {
                         if(m_motionCertificates->m_valid.size()>=kCacheEntries)m_motionCertificates->m_valid.clear();

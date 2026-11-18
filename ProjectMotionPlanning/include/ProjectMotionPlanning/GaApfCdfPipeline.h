@@ -9,6 +9,8 @@ namespace motion_planning
         double sprayDistance = 0.10; // metres; UI displays millimetres
         // Finite feedback rounds, no single-point time deadline. Zero disables feedback.
         int maxConnectionFeedbackRounds = 8;
+        // Opt-in first attempt; exhaustion falls back to the complete search.
+        bool latencyOptimized = false;
     };
 
     // Resolve the one enabled saved tool TCP; never silently substitute the flange.
@@ -21,6 +23,9 @@ namespace motion_planning
     // GA checks control points only. APF connects them and independently replays
     // the returned joints. Optional CDF may retain the accepted APF on failure.
     // All joints at this boundary use actual runtime-model conventions.
+    // Full search preserves the CPU candidate portfolio and GPU MoveL sampling.
+    // Fast search failure retries that portfolio from the original input;
+    // cancellation, invalid requests and explicit stage budgets never restart.
     ProjectCdfQpRepairResult runGaApfCdfPipeline(
         const simulation_project::ProjectDocument& document,
         const std::filesystem::path& basePath,

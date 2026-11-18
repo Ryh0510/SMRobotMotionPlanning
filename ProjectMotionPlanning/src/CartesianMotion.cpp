@@ -10,6 +10,8 @@ namespace motion_planning {
 struct CartesianMotionSampler::Model {
     detail::GpuSerialIk chain;
     std::vector<double> lower, upper;
+    bool sampleInterior(const std::vector<double>& a,const std::vector<double>& b,
+        const Eigen::Isometry3d& from,const Eigen::Isometry3d& to,double fraction,std::vector<double>& q) const;
 };
 CartesianMotionSampler::CartesianMotionSampler() : m_model(std::make_unique<Model>()) {}
 CartesianMotionSampler::~CartesianMotionSampler() = default;
@@ -37,8 +39,8 @@ std::shared_ptr<const CartesianMotionSampler> CartesianMotionSampler::create(Pro
         return Eigen::Isometry3d(scene.linkWorldTransform(tcpLink)*linkFromTcp);
     };
     for(const auto& bound:scene.jointBounds()) {
-        options.lower.push_back(bound.continuous ? -std::numeric_limits<double>::infinity() : bound.lower);
-        options.upper.push_back(bound.continuous ? std::numeric_limits<double>::infinity() : bound.upper);
+        options.lower.push_back(!scene.enforcesJointPositionLimits() || bound.continuous ? -std::numeric_limits<double>::infinity() : bound.lower);
+        options.upper.push_back(!scene.enforcesJointPositionLimits() || bound.continuous ? std::numeric_limits<double>::infinity() : bound.upper);
     }
     if(!out->m_model->chain.configure(runtime->model,scene.jointNames(),tcpLink,options)) {
         error="MoveL actual-model verification failed: "+out->m_model->chain.status().dump();return {};
@@ -51,6 +53,7 @@ bool CartesianMotionSampler::isMoveL(const StoredMotionPlan& plan) {
     return value.is_object() && value.contains("motion") && value["motion"].is_string() && value["motion"]=="cartesian_linear";
 }
 Eigen::Isometry3d CartesianMotionSampler::forward(const std::vector<double>& q) const {return m_model->chain.forward(q);}
+Eigen::Matrix<double,6,6> CartesianMotionSampler::jacobian(const std::vector<double>& q) const {return m_model->chain.jacobian(q);}
 bool CartesianMotionSampler::sample(const std::vector<double>& a,const std::vector<double>& b,double f,
     std::vector<double>& q,std::string& error) const
 {
@@ -60,30 +63,57 @@ bool CartesianMotionSampler::sample(const std::vector<double>& a,const std::vect
         a[j]<m_model->lower[j]-1e-9 || a[j]>m_model->upper[j]+1e-9 ||
         b[j]<m_model->lower[j]-1e-9 || b[j]>m_model->upper[j]+1e-9) {error="MoveL encoder limit exceeded.";return false;}
     if(f==0) {q=a;return true;}if(f==1) {q=b;return true;}
-    const auto from=forward(a),to=forward(b);
+    if(m_model->sampleInterior(a,b,forward(a),forward(b),f,q))return true;
+    error="No continuous MoveL IK on the selected encoder branch.";return false;
+}
+bool CartesianMotionSampler::Model::sampleInterior(const std::vector<double>& a,const std::vector<double>& b,
+    const Eigen::Isometry3d& from,const Eigen::Isometry3d& to,double f,std::vector<double>& q) const
+{
     const Eigen::Vector3d position=(1-f)*from.translation()+f*to.translation();
     const Eigen::Matrix3d rotation=Eigen::Quaterniond(from.linear()).slerp(f,Eigen::Quaterniond(to.linear())).toRotationMatrix();
     std::vector<double> candidate(6);for(int j=0;j<6;++j)candidate[j]=(1-f)*a[j]+f*b[j];
     for(int iteration=0;iteration<40;++iteration) {
-        const auto actual=forward(candidate);Eigen::Matrix<double,6,1> residual;
+        const auto actual=chain.forward(candidate);Eigen::Matrix<double,6,1> residual;
         residual.head<3>()=position-actual.translation();
         const Eigen::AngleAxisd angle(rotation*actual.linear().transpose());residual.tail<3>()=angle.axis()*angle.angle();
         if(residual.head<3>().norm()<1e-10 && residual.tail<3>().norm()<1e-10) {q=std::move(candidate);return true;}
-        const auto jacobian=m_model->chain.jacobian(candidate);
+        const auto jacobian=chain.jacobian(candidate);
         const Eigen::Matrix<double,6,6> normal=jacobian*jacobian.transpose()+1e-12*Eigen::Matrix<double,6,6>::Identity();
         Eigen::Matrix<double,6,1> step=jacobian.transpose()*normal.ldlt().solve(residual);
         if(!step.allFinite())break;
         const double largest=step.cwiseAbs().maxCoeff();if(largest>.15)step*=.15/largest;
         bool improved=false;
         for(double scale=1.;scale>=1./128;scale*=.5) {
-            auto next=candidate;for(int j=0;j<6;++j)next[j]=std::clamp(next[j]+scale*step[j],m_model->lower[j],m_model->upper[j]);
-            const auto pose=forward(next);const Eigen::AngleAxisd change(rotation*pose.linear().transpose());
+            auto next=candidate;for(int j=0;j<6;++j)next[j]=std::clamp(next[j]+scale*step[j],lower[j],upper[j]);
+            const auto pose=chain.forward(next);const Eigen::AngleAxisd change(rotation*pose.linear().transpose());
             const double merit=(position-pose.translation()).squaredNorm()+change.angle()*change.angle();
             if(merit<residual.squaredNorm()) {candidate=std::move(next);improved=true;break;}
         }
         if(!improved)break;
     }
-    error="No continuous MoveL IK on the selected encoder branch.";return false;
+    return false;
+}
+bool CartesianMotionSampler::uniformSamples(const std::vector<double>& a,const std::vector<double>& b,
+    std::size_t intervals,std::vector<std::vector<double>>& samples,std::string& error,
+    const std::function<bool()>& cancelled) const
+{
+    samples.clear();
+    if(a.size()!=6 || b.size()!=6 || intervals==0 || intervals==std::numeric_limits<std::size_t>::max()) {
+        error="Invalid uniform MoveL sampling request.";return false;
+    }
+    if(cancelled && cancelled()) {error="MoveL cancelled.";return false;}
+    // Below this size launch/readback overhead outweighs the parallel solve.
+    if(intervals>=128 && m_model->chain.linearSamples(a,b,intervals,samples,cancelled))return true;
+    std::vector<std::vector<double>> trial(intervals+1);
+    if(!sample(a,b,0.,trial.front(),error) || !sample(a,b,1.,trial.back(),error))return false;
+    const auto from=forward(a),to=forward(b);
+    for(std::size_t k=1;k<intervals;++k) {
+        if(cancelled && cancelled()) {error="MoveL cancelled.";return false;}
+        if(!m_model->sampleInterior(a,b,from,to,double(k)/intervals,trial[k])) {
+            error="No continuous MoveL IK on the selected encoder branch.";return false;
+        }
+    }
+    samples=std::move(trial);return true;
 }
 bool CartesianMotionSampler::connection(const std::vector<double>& a,const std::vector<double>& b,
     double step,std::size_t budget,std::vector<std::vector<double>>& samples,std::string& error,
@@ -97,10 +127,10 @@ bool CartesianMotionSampler::connection(const std::vector<double>& a,const std::
     std::size_t intervals=std::size_t(count);
     for(;;) {
         if(cancelled && cancelled()) {error="MoveL cancelled.";return false;}
-        std::vector<std::vector<double>> trial(intervals+1);double maximum=0;
+        std::vector<std::vector<double>> trial;double maximum=0;
+        if(!uniformSamples(a,b,intervals,trial,error,cancelled))return false;
         for(std::size_t k=0;k<=intervals;++k) {
             if(cancelled && cancelled()) {error="MoveL cancelled.";return false;}
-            if(!sample(a,b,double(k)/intervals,trial[k],error))return false;
             if(k)for(int j=0;j<6;++j)maximum=std::max(maximum,std::abs(trial[k][j]-trial[k-1][j]));
         }
         if(maximum<=step*(1+1e-9)) {samples=std::move(trial);return true;}

@@ -54,7 +54,7 @@ namespace motion_planning
         return true;
     }
 
-    ProjectCdfQpRepairResult runGaApfCdfPipeline(
+    static ProjectCdfQpRepairResult runGaApfCdfPipelineAttempt(
         const simulation_project::ProjectDocument& inputDocument,
         const std::filesystem::path& basePath,
         ExternalTrajectoryEvaluationRequest request, bool useCdf,
@@ -212,10 +212,34 @@ namespace motion_planning
             // The document stays immutable from here through all APF feedback.
             // Reuse only original-edge geometry, never process or final replay gates.
             const auto motionCertificates=std::make_shared<detail::CdfMotionCertificates>();
+            bool denseApfAttempt=false;
+            bool shortApfAttempt=surface.latencyOptimized;
             const auto evaluateStage=[&]() {
                 const auto began=std::chrono::steady_clock::now();
-                request.cdfOptions.pipelineMotionCertificates=request.pipelineStage=="apf"?motionCertificates:nullptr;
-                auto evaluated=ProjectExternalTrajectoryEvaluator::evaluate(document,basePath,request);
+                auto stageRequest=request;
+                if(request.pipelineStage=="apf" && shortApfAttempt)stageRequest.cdfOptions.apfFieldAttempts=2;
+                if(request.pipelineStage=="apf" && denseApfAttempt)stageRequest.densifyOptimizationKnots=true;
+                // Original controls are not execution knots: APF can add four
+                // supports. Keep the requested jump gate on APF and final replay.
+                if(request.pipelineStage=="ga")stageRequest.maxJointDelta=5*request.maxJointDelta;
+                stageRequest.cdfOptions.pipelineMotionCertificates=request.pipelineStage=="apf"?motionCertificates:nullptr;
+                // GA/APF may deliberately change the joint posture while preserving
+                // the immutable surface controls. A cartesianTargets list supplied
+                // by an older imported seed would make CDF repair reject that valid
+                // surface posture as apf_cartesian_seed_stale before it can search a
+                // continuous MoveL connection. The pipeline's source controls and
+                // spray constraints are authoritative; exact target matching remains
+                // available to direct CDF callers that explicitly provide it.
+                stageRequest.cdfOptions.cartesianTargets.clear();
+                if(request.pipelineStage=="apf" && denseApfAttempt && request.startJoints.empty()) {
+                    // The successful reference also rebuilt a coherent IK branch.
+                    // Recreate targets from the accepted GA poses, never from the
+                    // pre-GA import. Full endpoint TCP poses remain unchanged.
+                    stageRequest.cdfOptions.allowEquivalentEndpointConfigurations=true;
+                    for(const auto& point:stageRequest.plan.trajectory.points)
+                        stageRequest.cdfOptions.cartesianTargets.push_back(fk(point.q));
+                }
+                auto evaluated=ProjectExternalTrajectoryEvaluator::evaluate(document,basePath,stageRequest);
                 report(nlohmann::json{{"type","pipeline_stage_timing"},{"stage",request.pipelineStage},
                     {"seconds",std::chrono::duration<double>(std::chrono::steady_clock::now()-began).count()},
                     {"points",evaluated.plan.trajectory.points.size()},{"success",evaluated.success}}.dump());
@@ -347,7 +371,41 @@ namespace motion_planning
             std::map<std::size_t,int> feedbackVisits;
             int feedbackSearchSequence=0;
             for(int feedbackRound=0;;++feedbackRound) {
-                apf=evaluateStage();append(apf);
+                // Spend the full field portfolio on the final feedback attempt.
+                shortApfAttempt=surface.latencyOptimized && feedbackRound<surface.maxConnectionFeedbackRounds;
+                apf={};
+                if(surface.latencyOptimized && feedbackRound==0 && surface.maxConnectionFeedbackRounds>0) {
+                    const auto began=std::chrono::steady_clock::now();
+                    const auto& points=ga.plan.trajectory.points;
+                    for(std::size_t i=1;i<points.size();++i) {
+                        std::vector<std::vector<double>> samples;std::string samplingError;
+                        if(!moveL->connection(points[i-1].q,points[i].q,.04,100000,samples,samplingError,request.cancelled))continue;
+                        for(const auto& q:samples) {
+                            // Only an observed collision triggers early GA feedback.
+                            // A clear coarse probe is never an acceptance certificate.
+                            if(scene->validateState(q).diagnosticCode=="state_in_collision") {
+                                apf.apfConnectionFailures.push_back({points[i-1].time,points[i].time,false});break;
+                            }
+                        }
+                    }
+                    if(!apf.apfConnectionFailures.empty()) {
+                        const auto event=nlohmann::json{{"type","pipeline_collision_preflight"},
+                            {"failed_intervals",apf.apfConnectionFailures.size()},
+                            {"seconds",std::chrono::duration<double>(std::chrono::steady_clock::now()-began).count()},
+                            {"scope","early rejection only; APF and unchanged fine final validation still required"}}.dump();
+                        result.diagnostics.push_back({"pipeline_collision_preflight",event});report(event);
+                    }
+                }
+                if(apf.apfConnectionFailures.empty()){apf=evaluateStage();append(apf);}
+                if(!surface.latencyOptimized && !apf.success && !apf.cancelled && apf.retimingCandidate.empty() && !apf.apfConnectionFailures.empty()) {
+                    // Reference bf1c0ea/d8afb685: give anticipatory APF a dense
+                    // planning lattice before changing the GA controls. Keep the
+                    // current MoveL, surface/process and independent replay gates.
+                    const auto sparseFailures=apf.apfConnectionFailures;
+                    report("APF: sparse connection failed; retrying the bf1c0ea dense planning method with actual-model MoveL validation");
+                    denseApfAttempt=true;apf=evaluateStage();denseApfAttempt=false;append(apf);
+                    if(!apf.success && apf.apfConnectionFailures.empty())apf.apfConnectionFailures=sparseFailures;
+                }
                 pendingRetime=!apf.success && request.cdfOptions.retimeOutput && !apf.retimingCandidate.empty() &&
                     std::any_of(apf.diagnostics.begin(),apf.diagnostics.end(),[](const auto& d){return d.code=="apf_velocity_retime_required";});
                 if(apf.success || pendingRetime)break;
@@ -366,6 +424,11 @@ namespace motion_planning
                         if(interval.requiresDirectProcess)directProcessEdges.insert(i);
                     }
                 if(failedEdges.empty())return fail("pipeline_feedback_mapping_failed","APF failure does not map to an original control interval.");
+                if(surface.latencyOptimized && failedEdges.size()>1) {
+                    const auto first=*failedEdges.begin();failedEdges={first};
+                    for(auto it=directProcessEdges.begin();it!=directProcessEdges.end();)
+                        if(*it!=first)it=directProcessEdges.erase(it);else ++it;
+                }
                 int visit=0;
                 for(const auto edge:failedEdges) {
                     visit=std::max(visit,++feedbackVisits[edge]);
@@ -392,6 +455,10 @@ namespace motion_planning
                 request.controlPointsOnly=true;request.optimizeAvoidance=false;
                 request.gaResampleControls.assign(controls.begin(),controls.end());
                 request.gaRejectedConnections=rejectedConnections;
+                if(surface.latencyOptimized) {
+                    request.gaInitialPostures=std::min(request.gaInitialPostures,512);
+                    request.gaFeedbackPostureLimit=12;
+                }
                 request.pointSearchSequence=++feedbackSearchSequence;
                 prepareSurface(sourceTimes);
                 auto replacement=evaluateStage();append(replacement);
@@ -497,5 +564,41 @@ namespace motion_planning
             result.diagnostics.push_back({"pipeline_sampled_valid","GA -> APF -> optional CDF completed; sampled collision checks passed, not a conservative whole-motion certificate."});
             return result;
         } catch(const std::exception& e) {return fail("pipeline_exception",e.what());}
+    }
+
+    ProjectCdfQpRepairResult runGaApfCdfPipeline(
+        const simulation_project::ProjectDocument& inputDocument,
+        const std::filesystem::path& basePath,
+        ExternalTrajectoryEvaluationRequest request, bool useCdf,
+        const GaSurfaceSearchOptions& surface)
+    {
+        // Full search retains the established CPU multi-seed candidate portfolio.
+        // GPU candidate IK is a different numerical branch search, so reserve it
+        // for the fast attempt. Dense MoveL sampling still uses verified GPU IK.
+        if(!surface.latencyOptimized)request.gaGpuIkEnabled=false;
+        auto attempted=runGaApfCdfPipelineAttempt(inputDocument,basePath,request,useCdf,surface);
+        if(attempted.success || attempted.cancelled || (request.cancelled && request.cancelled()))return attempted;
+        // A numerical GPU portfolio is not equivalent to the original CPU seed
+        // portfolio. Neither a bounded fast search nor partial GPU roots establish
+        // that the full search failed. Retry once from the untouched caller input.
+        const bool searchFailed=std::any_of(attempted.diagnostics.begin(),attempted.diagnostics.end(),[](const auto& d) {
+            return d.code=="pipeline_ga_failed" || d.code=="pipeline_apf_failed" ||
+                d.code=="pipeline_feedback_ga_failed" || d.code=="pipeline_apf_replay_failed" ||
+                d.code=="pipeline_feedback_ga_replay_failed";
+        });
+        const bool invalidOrBudget=std::any_of(attempted.diagnostics.begin(),attempted.diagnostics.end(),[](const auto& d) {
+            return d.code.compare(0,8,"invalid_")==0 || d.code=="stage_budget_exhausted";
+        });
+        if(!searchFailed || invalidOrBudget || !surface.latencyOptimized)return attempted;
+        const std::string message="Search portfolio exhausted; restarting complete CPU multi-seed candidate search from original input. GPU MoveL and all acceptance gates remain enabled.";
+        if(request.progress)request.progress(message);
+        auto fullSurface=surface;fullSurface.latencyOptimized=false;
+        request.gaGpuIkEnabled=false;
+        request.gaFeedbackPostureLimit=0;
+        request.cdfOptions.apfFieldAttempts=0;
+        auto full=runGaApfCdfPipelineAttempt(inputDocument,basePath,request,useCdf,fullSurface);
+        full.diagnostics.insert(full.diagnostics.begin(),{"pipeline_full_search_fallback",message});
+        full.diagnostics.insert(full.diagnostics.begin(),attempted.diagnostics.begin(),attempted.diagnostics.end());
+        return full;
     }
 }

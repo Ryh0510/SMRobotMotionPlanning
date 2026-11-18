@@ -18,6 +18,7 @@ namespace motion_planning::detail
         double influenceDistance = .08;
         double repulsionGain = 2.5;
         int iterationBudget = 1200;
+        int fieldAttempts = 0;
         std::function<double(const ApfState&)> distance;
         // Optional equivalent distance observations in input order (e.g. finite differences).
         std::function<std::vector<double>(const ApfPath&)> distances;
@@ -38,6 +39,8 @@ namespace motion_planning::detail
         std::function<ApfState(const ApfState&)> position;
         ApfPath positions;
         std::function<bool(const ApfState&,const ApfState&,double,ApfState&)> sampleMotion;
+        // Equivalent k/intervals samples, in order and including raw endpoints.
+        std::function<bool(const ApfState&,const ApfState&,std::size_t,ApfPath&)> sampleMotionBatch;
         std::function<bool(const ApfState&,double)> orderedStateAdmissible;
         double maxDeviation = 0.10;
         std::function<bool(const ApfState&, const ApfState&)> stateAdmissible;

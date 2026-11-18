@@ -193,6 +193,8 @@ namespace motion_planning
                 }
                 previousTime = point.time; point.tcpPose = worldFromFrame * point.tcpPose;
             }
+            if(request.gaFeedbackPostureLimit<0 || request.gaFeedbackPostureLimit>128)
+                return fail("invalid_feedback_parent_quota","Feedback parent quota must be 0..128.");
             if(request.gaPointWorkers<1 || request.gaPointWorkers>3)
                 return fail("invalid_ga_workers","GA point workers must be 1..3.");
             if(request.gaCandidateGenerationOnly && (request.pipelineStage!="ga" || request.gaSearchControls.empty() || request.gaPointWorkers!=1))
@@ -378,6 +380,9 @@ namespace motion_planning
             const bool serialIkReady=!request.pipelineStage.empty() &&
                 gpuIk.configure(runtime->model,source.jointNames,request.tcpLinkName,gpuIkOptions);
             const bool gpuIkReady=request.gaGpuEnabled && request.gaGpuIkEnabled && serialIkReady;
+            const auto fastFk=[&](const std::vector<double>& q)->Eigen::Isometry3d {
+                return serialIkReady?gpuIk.forward(q):fk(q);
+            };
             std::shared_ptr<const CartesianMotionSampler> moveL;
             if(request.cartesianLinearMotion) {
                 moveL=CartesianMotionSampler::create(*scene,request.tcpLinkName,request.linkFromTcp,error);
@@ -701,9 +706,10 @@ namespace motion_planning
                         stateFailure="clearance_unavailable_or_too_small"; ++result.rejectedStates; return false;
                     }
                 }
-                const auto actualOrigin=fk(q);
-                const auto origin=serialIkReady?gpuIk.forward(q):actualOrigin;
-                if(serialIkReady && (actualOrigin.matrix()-origin.matrix()).norm()>1e-8){stateFailure="kinematic_model_mismatch";return false;}
+                const auto origin=fastFk(q);
+                // Planning proposals use the chain independently calibrated at
+                // setup. Physical/final state admission still compares runtime FK.
+                if(serialIkReady && collisionChecks && (fk(q).matrix()-origin.matrix()).norm()>1e-8){stateFailure="kinematic_model_mismatch";return false;}
                 Eigen::MatrixXd jacobian(6,static_cast<Eigen::Index>(dimension));
                 const auto finiteDifference=[&] {
                     for(std::size_t j=0;j<dimension;++j) {
@@ -742,7 +748,7 @@ namespace motion_planning
                 return radiusMappingValid(surfaceAt(time),actual);
             };
             const auto processValid=[&](const std::vector<double>& q,double time) {
-                const auto actual=fk(q);
+                const auto actual=fastFk(q);
                 const auto& originals=request.plan.cartesianControlPoints.points;
                 auto upper=std::upper_bound(originals.begin(),originals.end(),time,[](double t,const auto& p){return t<p.time;});
                 const auto i=upper==originals.begin()?0:std::size_t(upper-originals.begin()-1);
@@ -785,6 +791,11 @@ namespace motion_planning
             }
             // Feedback-only search probes: they rank/exclude candidate edges,
             // never replace APF's fine sampling or the independent final replay.
+            std::map<std::vector<double>,Eigen::Isometry3d> feedbackPoses;
+            const auto feedbackPose=[&](const std::vector<double>& q)->const Eigen::Isometry3d& {
+                const auto found=feedbackPoses.find(q);if(found!=feedbackPoses.end())return found->second;
+                return feedbackPoses.emplace(q,moveL?moveL->forward(q):fk(q)).first->second;
+            };
             const auto feedbackPairAllowed=[&](std::size_t index,const auto& a,const auto& b) {
                 for(const auto& failed:request.gaRejectedConnections) {
                     if(failed.sourceEdge!=index)continue;
@@ -794,23 +805,51 @@ namespace motion_planning
                         to=std::max(to,std::abs(b[j]-failed.toJoints[j]));
                     }
                     if(from<1e-4 && to<1e-4)return false;
+                    if(request.gaFeedbackPostureLimit>0 && moveL) {
+                        const auto near=[&](const auto& x,const auto& y) {
+                            const auto& px=feedbackPose(x);const auto& py=feedbackPose(y);
+                            return (px.translation()-py.translation()).norm()<.005 &&
+                                Eigen::Quaterniond(px.linear()).angularDistance(Eigen::Quaterniond(py.linear()))<.025;
+                        };
+                        // Search diversification only: numerical perturbations of
+                        // an already failed physical chord are not new APF seeds.
+                        if(near(a,failed.fromJoints) && near(b,failed.toJoints))return false;
+                    }
                 }
                 return true;
             };
-            std::map<std::tuple<std::size_t,bool,std::vector<double>,std::vector<double>>,bool> feedbackProbeCache;
-            const auto feedbackConnectionProbe=[&](std::size_t edge,const auto& a,const auto& b,bool includeDirectProcess=true) {
+            std::map<std::tuple<std::size_t,bool,bool,std::vector<double>,std::vector<double>>,bool> feedbackProbeCache;
+            const auto feedbackConnectionProbe=[&](std::size_t edge,const auto& a,const auto& b,bool includeDirectProcess=true,bool requireClearChord=false) {
                 if(!gaFeedback)return true;
                 if(!feedbackPairAllowed(edge,a,b))return false;
                 if(std::none_of(request.gaRejectedConnections.begin(),request.gaRejectedConnections.end(),
                     [&](const auto& failed){return failed.sourceEdge==edge;}))return true;
                 if(feedbackProbeCache.size()>=131072)feedbackProbeCache.clear();
-                const auto key=std::make_tuple(edge,includeDirectProcess,a,b);const auto found=feedbackProbeCache.find(key);
+                const auto key=std::make_tuple(edge,includeDirectProcess,requireClearChord,a,b);const auto found=feedbackProbeCache.find(key);
                 if(found!=feedbackProbeCache.end())return found->second;
                 const bool directProcess=includeDirectProcess && std::any_of(request.gaRejectedConnections.begin(),request.gaRejectedConnections.end(),
                     [&](const auto& failed){return failed.sourceEdge==edge && failed.requiresDirectProcess;});
+                // Collision feedback permits a bounded APF detour. Rejecting its
+                // direct chord here would discard repairable point-safe parents.
+                // Process failures explicitly request a direct process-compatible
+                // chord; those retain all probes. Every accepted path still needs
+                // APF and independent full MoveL collision/process validation.
+                if(!directProcess && !requireClearChord){feedbackProbeCache.emplace(key,true);return true;}
                 const auto begin=ik.layers[edge].time,end=ik.layers[edge+1].time;
-                const double leftDistance=directProcess && spray?mappedDistance(surfaceAt(begin),fk(a)):0.;
-                const double rightDistance=directProcess && spray?mappedDistance(surfaceAt(end),fk(b)):0.;
+                const auto from=moveL?moveL->forward(a):fk(a),to=moveL?moveL->forward(b):fk(b);
+                const double leftDistance=directProcess && spray?mappedDistance(surfaceAt(begin),from):0.;
+                const double rightDistance=directProcess && spray?mappedDistance(surfaceAt(end),to):0.;
+                if(directProcess && spray && moveL)for(double fraction:{.5,.25,.75}) {
+                    const auto reference=surfaceAt((1-fraction)*begin+fraction*end);
+                    if(!reference.constrained)continue;
+                    const Eigen::Vector3d position=(1-fraction)*from.translation()+fraction*to.translation();
+                    const auto rotation=Eigen::Quaterniond(from.linear()).slerp(fraction,Eigen::Quaterniond(to.linear()));
+                    const double distance=(1-fraction)*leftDistance+fraction*rightDistance;
+                    // Exact Cartesian MoveL geometry can reject an impossible aim
+                    // before doing any IK. Passing still needs all original gates.
+                    if((position+distance*(rotation*request.sprayAxis)-reference.anchor).norm()>
+                        request.maximumTcpPositionDeviation+1e-9) {feedbackProbeCache.emplace(key,false);return false;}
+                }
                 std::vector<std::vector<double>> samples;
                 for(double fraction:{.5,.25,.75}) {
                     auto q=a;if(!interpolateMotion(a,b,fraction,q)){feedbackProbeCache.emplace(key,false);return false;}
@@ -1222,9 +1261,10 @@ namespace motion_planning
                     }
                     gaSafetyMs+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-began).count();
                 };
-                const bool pairedFeedback=gaFeedback && !request.gaCandidateGenerationOnly &&
-                    std::any_of(request.gaRejectedConnections.begin(),request.gaRejectedConnections.end(),
-                        [](const auto& edge){return edge.requiresDirectProcess;});
+                // Collision feedback also moves both ends of a failed edge.
+                // Testing each new pose against its old movable neighbor can
+                // reject an entire feasible pair before graph selection.
+                const bool pairedFeedback=gaFeedback && !request.gaCandidateGenerationOnly;
                 std::vector<bool> feedbackFinalized(ik.layers.size(),false);
                 std::vector<std::vector<std::vector<double>>> feedbackReachable(ik.layers.size());
                 std::vector<std::map<std::vector<double>,double>> generatedScores(ik.layers.size());
@@ -1403,6 +1443,10 @@ namespace motion_planning
                             gpuPostures.erase(cached);
                         }
                         else {std::vector<std::vector<CartesianIkCandidate>> roots;if(gpuIk.solve({point.tcpPose},seeds,roots,true) && !roots.empty() && !roots.front().empty()){for(const auto& c:roots.front())inspect(c);gpuSolved=true;}}
+                        // Numerical non-convergence and roots rejected by physical
+                        // gates are not proof that the CPU seed portfolio has no
+                        // admissible branch. Preserve that search on both paths.
+                        if(candidates.empty())gpuSolved=false;
                         if(!gpuSolved)++gpuIkFallbacks;
                     }
                     if(!gpuSolved) {
@@ -1526,6 +1570,16 @@ namespace motion_planning
                         }
                         return true;
                     };
+                    const auto directConnected=[&](const auto& q) {
+                        if(!connectable(q))return false;
+                        if(!pairedFeedback || i+1>=ik.layers.size() || !feedbackFinalized[i+1] ||
+                            std::none_of(request.gaRejectedConnections.begin(),request.gaRejectedConnections.end(),
+                                [&](const auto& edge){return edge.sourceEdge==i;}))return true;
+                        const auto& following=feedbackReachable[i+1];
+                        return std::any_of(following.begin(),following.end(),[&](const auto& next) {
+                            return encoderJump(q,next)<=request.maxJointDelta && feedbackConnectionProbe(i,q,next,true,true);
+                        });
+                    };
                     if(!gaFeedback && !request.gaEvaluateAllPoints && !connectionRepair && std::any_of(layer.candidates.begin(),layer.candidates.end(),[&](const auto& c){return safeAt(c,i);}))return std::nullopt;
                     if(i==0 && !request.startJoints.empty())return fail("ga_locked_boundary","Previous segment boundary is unsafe; it cannot be changed independently");
                     const auto began=std::chrono::steady_clock::now();const auto r=referenceFor(i);
@@ -1605,6 +1659,7 @@ namespace motion_planning
                                 double value=0.;for(std::size_t j=0;j<dimension;++j)value+=std::pow(c.joints[j]-previous[j],2);
                                 cost=std::min(cost,value);
                             }
+                            if(!directConnected(c.joints))cost+=10000.;
                             return cost;
                         };
                         if(connectedReserve.size()<32){connectedReserve.push_back(candidate);return;}
@@ -1634,8 +1689,15 @@ namespace motion_planning
                             const double rightDistance=(b.anchor-to.translation()).dot(to.linear()*request.sprayAxis);
                             double violation=.1*std::max(0.,encoderJump(q,next)-request.maxJointDelta);
                             for(double fraction:{.25,.5,.75}) {
-                                auto sample=q;if(!interpolateMotion(q,next,fraction,sample)){violation=1.;break;}
-                                const auto actual=meritFk(sample);const auto reference=surfaceAt((1-fraction)*ik.layers[i].time+fraction*ik.layers[i+1].time);
+                                Eigen::Isometry3d actual=Eigen::Isometry3d::Identity();
+                                if(moveL) {
+                                    actual.translation()=(1-fraction)*from.translation()+fraction*to.translation();
+                                    actual.linear()=Eigen::Quaterniond(from.linear()).slerp(fraction,Eigen::Quaterniond(to.linear())).toRotationMatrix();
+                                } else {
+                                    auto sample=q;if(!interpolateMotion(q,next,fraction,sample)){violation=1.;break;}
+                                    actual=meritFk(sample);
+                                }
+                                const auto reference=surfaceAt((1-fraction)*ik.layers[i].time+fraction*ik.layers[i+1].time);
                                 if(spray && reference.constrained) {
                                     const double distance=(1-fraction)*leftDistance+fraction*rightDistance;
                                     violation=std::max(violation,(actual.translation()+distance*actual.linear()*request.sprayAxis-reference.anchor).norm());
@@ -1656,7 +1718,7 @@ namespace motion_planning
                         if(visited.count(key))return visited.at(key);
                         ++evaluations;
                         const auto candidates=solvePosture(i,rotation,pointPreferred,true,distance);
-                        if(std::any_of(candidates.begin(),candidates.end(),[&](const auto& c){return connectable(c.joints);}))++safePostures;
+                        if(std::any_of(candidates.begin(),candidates.end(),[&](const auto& c){return directConnected(c.joints);}))++safePostures;
                         Population::Fitness fitness=lastPostureFitness;
                         if(fitness.hasDepth)++measuredTrials;
                         if(fitness.hasDepth && !enhancedFeedback)++physicalTrials;
@@ -1674,7 +1736,7 @@ namespace motion_planning
                                 }
                                 if(sides)connection=cost;
                             }
-                            const bool connected=connectable(c.joints);
+                            const bool connected=directConnected(c.joints);
                             const double violation=connected?0.:connectionViolation(c.joints);
                             const double connectionPenalty=pairedFeedback?500.*violation/(request.maximumTcpPositionDeviation+violation):0.;
                             const double score=(connectionRepair?(connected?10000.:1000.):1000.)+10*clearance-request.gaContinuityWeight*connection
@@ -1692,7 +1754,8 @@ namespace motion_planning
                     population.useGuidedGeneticEvolution(request.sprayAxis,request.allowSprayAxisRotation);
                     enhancedFeedback=true;
                     int initialCompleted=0,offspringTrials=0,radiusOffspring=0,feedbackOffspring=0;bool radiusInterrupted=false;
-                    const auto canSearch=[&](){return evaluations<request.gaPointEvaluations && !stop() &&
+                    const auto parentQuotaReached=[&](){return gaFeedback && request.gaFeedbackPostureLimit>0 && safePostures>=request.gaFeedbackPostureLimit;};
+                    const auto canSearch=[&](){return !parentQuotaReached() && evaluations<request.gaPointEvaluations && !stop() &&
                         (request.anchorSearchSeconds==0 || std::chrono::duration<double>(std::chrono::steady_clock::now()-began).count()<request.anchorSearchSeconds);};
                     const auto prefetch=[&](int first) {
                         if(!gpuIkReady)return;
@@ -1728,6 +1791,21 @@ namespace motion_planning
                             for(std::size_t n=0;n<roots.size();++n)gpuPostures[std::make_pair(i,keys[n])]=std::move(roots[n]);
                         }
                     };
+                    if(gaFeedback && request.gaFeedbackPostureLimit>0) {
+                        const auto f=evaluate(initialGene);population.guide(initialGene,f);
+                        nominalPopulation.guide(initialGene.head<4>().eval(),{f.rank,f.depth,f.hasDepth});
+                        for(const auto& neighbor:neighborGenes) {
+                            if(!canSearch())break;
+                            const auto score=evaluate(neighbor);population.guide(neighbor,score);
+                            nominalPopulation.guide(neighbor.head<4>().eval(),{score.rank,score.depth,score.hasDepth});
+                        }
+                        if(radius.fraction()>0)for(double sign:{1.,-1.})for(int bin=1;bin<=16;++bin) {
+                            if(!canSearch())break;
+                            auto radial=initialGene;radial[4]=sign*(double(bin)/16)*radius.fraction()/.8;
+                            const auto score=evaluate(radial);population.guide(radial,score);
+                        }
+                    }
+                    const int warmEvaluations=evaluations;
                     while(initialCompleted<int(initial.size()) && canSearch()) {
                         if(initialCompleted%128==0)prefetch(initialCompleted);
                         X x=X::Zero();x.head<4>()=initial[initialCompleted];const auto f=evaluate(x);
@@ -1737,7 +1815,7 @@ namespace motion_planning
                                 {"completed",initialCompleted},{"total",initial.size()},{"safe_postures",safePostures},
                                 {"elapsed_ms",std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-began).count()}}.dump());
                     }
-                    const int initialEvaluations=evaluations;
+                    const int initialEvaluations=evaluations-warmEvaluations;
                     if(gaFeedback && canSearch()) {
                         const auto f=evaluate(initialGene);population.guide(initialGene,f);
                         nominalPopulation.guide(initialGene.head<4>().eval(),{f.rank,f.depth,f.hasDepth});
@@ -1757,6 +1835,15 @@ namespace motion_planning
                             radiusRounds.push_back({{"generation",generation},{"fraction",radius.fraction()},
                                 {"minimum_mm",nominal*(1-radius.fraction())*1000},{"maximum_mm",nominal*(1+radius.fraction())*1000},
                                 {"safe_postures_before",safePostures},{"expanded",radius.fraction()!=old}});
+                            if(gaFeedback && request.gaFeedbackPostureLimit>0 && radius.fraction()>old) {
+                                // Preserve a useful safe normal while exploring the newly
+                                // authorized radius. Random tilt need not precede this local gene.
+                                for(double sign:{1.,-1.})for(int bin=1;bin<=16;++bin) {
+                                    if(!canSearch())break;
+                                    auto radial=initialGene;radial[4]=sign*(double(bin)/16)*radius.fraction()/.8;
+                                    const auto f=evaluate(radial);population.guide(radial,f);++radiusOffspring;
+                                }
+                            }
                         }
                         const auto base=nominalPopulation.ask(1);X nominalGene=X::Zero();nominalGene.head<4>()=base;
                         const auto nominalFitness=evaluate(nominalGene);
@@ -1790,13 +1877,18 @@ namespace motion_planning
                             {"radius_offspring",radiusOffspring},{"evaluations",evaluations},{"safe_postures",safePostures},
                             {"elapsed_ms",std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-began).count()}}.dump());
                     }
-                    const bool scheduleComplete=initialCompleted==int(initial.size()) && initialEvaluations==int(initial.size()) && offspringTrials==offspringBudget && !radiusInterrupted;
+                    // Warm genes can already have evaluated members of the pool.
+                    // Completion counts proposals, not only new cache entries.
+                    const bool scheduleComplete=initialCompleted==int(initial.size()) && offspringTrials==offspringBudget && !radiusInterrupted;
                     int rescueBatches=0,rescueProposals=0,firstSafeBatch=-1;
                     nlohmann::json rescueHistory=nlohmann::json::array();
                     // Retain the established full schedule, then search the complete
                     // authorized shell in large real-model IK batches. Failed merit
                     // can guide exploration; refinement parents must be CPU-safe.
-                    while(scheduleComplete && (!(optionalProbe || gaFeedback) || rescueBatches<4) && (feasibleGenes.empty() || (rescueBatches<firstSafeBatch+2 && feasibleGenes.size()<8)) && canSearch()) {
+                    const int rescueBatchLimit=gaFeedback && request.gaFeedbackPostureLimit>0?1:4;
+                    while(scheduleComplete && (!(optionalProbe || gaFeedback) || rescueBatches<rescueBatchLimit) &&
+                        (feasibleGenes.empty() || (gaFeedback && request.gaFeedbackPostureLimit>0 && safePostures==0) ||
+                         (rescueBatches<firstSafeBatch+2 && feasibleGenes.size()<8)) && canSearch()) {
                         const auto checksBefore=gaExactChecks,filteredBefore=rescueMeritFilteredRoots;
                         const int size=std::min(request.gaFeasibilityBatchSize,request.gaPointEvaluations-evaluations);
                         if(size<=0)break;
@@ -1866,14 +1958,14 @@ namespace motion_planning
                         {"safe_candidates_found",safeCount},{"safe_postures",safePostures},{"connected_roots_preserved",preservedConnections},{"connected_reserve_limit",32},
                         {"safe_postures_scope",connectionRepair?"point_safe_and_search_connected":"point_safe"},
                         {"guided_proposals",initialCompleted},{"genetic_offspring",offspringTrials},
-                        {"radius_offspring",radiusOffspring},{"feedback_local_offspring",feedbackOffspring},{"nominal_generation_budget_preserved",true},
+                        {"radius_offspring",radiusOffspring},{"feedback_local_offspring",feedbackOffspring},{"nominal_generation_budget_preserved",!parentQuotaReached()},
                         {"feasibility_batches",rescueBatches},{"feasibility_proposals",rescueProposals},{"feasibility_history",rescueHistory},
                         {"feasible_refinement_parents",feasibleGenes.size()},{"gpu_merit_filtered_roots",rescueMeritFilteredRoots-pointMeritStart},{"batch_gpu_no_root",rescueGpuNoRoot-pointNoRootStart},
                         {"initial_postures_evaluated",initialEvaluations},{"initial_pool_completed",initialCompleted},
-                        {"schedule_complete",scheduleComplete},{"early_exit_on_safe",false},
+                        {"schedule_complete",scheduleComplete},{"early_exit_on_safe",parentQuotaReached()},
                         {"generations_requested",request.gaGenerations},{"generations_completed",offspringTrials/Population::populationSize()},{"population_size",Population::populationSize()},
                         {"measured_penetration_trials",physicalTrials},{"measured_violation_trials",measuredTrials},
-                        {"stop_reason",scheduleComplete?(solved?"full_schedule_safe":"full_schedule_no_safe_posture"):
+                        {"stop_reason",parentQuotaReached()?"connected_parent_quota":scheduleComplete?(solved?"full_schedule_safe":"full_schedule_no_safe_posture"):
                             stop()?"stage_interrupted":request.anchorSearchSeconds>0 && elapsed>=request.anchorSearchSeconds?"point_time_budget":"point_evaluation_budget"},
                         {"rejections",rejections},{"elapsed_ms",elapsed*1000},
                         {"gpu_enabled",request.gaGpuEnabled},{"gpu_search",nlohmann::json::parse(scene->virtualBaffleSearchStatus())},
@@ -1886,7 +1978,7 @@ namespace motion_planning
                         {"cumulative_profile",{{"ik_ms",gaIkMs},{"cpu_safety_ms",gaSafetyMs},{"merit_ms",gaMeritMs},{"exact_checks",gaExactChecks}}}};
                     result.pointSearchReports.push_back(audit.dump());
                     if(request.progress)request.progress(nlohmann::json{{"type","genetic_point"},{"report",audit}}.dump());
-                    if(!scheduleComplete) {if(request.returnCandidates)result.candidateLayers=ik.layers;return fail("ga_schedule_incomplete","Initial pool or requested generations were interrupted; full schedule was not completed");}
+                    if(!scheduleComplete && !parentQuotaReached()) {if(request.returnCandidates)result.candidateLayers=ik.layers;return fail("ga_schedule_incomplete","Initial pool or requested generations were interrupted; full schedule was not completed");}
                     if(!solved && optionalProbe){prunePointCaches(i);return std::nullopt;}
                     if(!solved) {if(request.returnCandidates)result.candidateLayers=ik.layers;return fail(connectionRepair?"ga_connection_unresolved":"ga_point_unresolved","Genetic search did not produce an eligible safe candidate at source point "+std::to_string(i)+"; APF/CDF must not start");}
                     if(pairedFeedback) {
@@ -2638,7 +2730,24 @@ namespace motion_planning
                 }
                 return true;
             };
-            auto paths=ProjectLayeredIkGraph::filter(ik,graph);
+            // First choose jointly compatible clear chords from the complete
+            // feedback pools. If none exist, keep point-safe APF detour seeds;
+            // a sparse probe must never claim final execution validity.
+            auto preferredGraph=graph;
+            if(gaFeedback && request.controlPointsOnly)
+                preferredGraph.edgeAdmissible=[&](std::size_t index,const auto& a,const auto& b) {
+                    return feedbackConnectionProbe(index,a.joints,b.joints,true,true);
+                };
+            auto paths=ProjectLayeredIkGraph::filter(ik,preferredGraph);
+            if(gaFeedback && request.controlPointsOnly && !paths.cancelled) {
+                if(paths.success)result.diagnostics.push_back({"ga_feedback_direct_chord_preferred",
+                    "Selected a connected point-safe field whose failed original intervals pass sparse MoveL collision/process probes. Full APF and independent replay remain required."});
+                else {
+                    paths=ProjectLayeredIkGraph::filter(ik,graph);
+                    result.diagnostics.push_back({"ga_feedback_detour_seed",
+                        "No compatible direct-chord field passed sparse probes; retained point-safe parents for the bounded four-support APF attempt. This is not an accepted motion."});
+                }
+            }
             result.continuousPaths=paths.paths;
             if((request.pipelineStage=="ga" || request.pipelineStage=="posture") && !paths.success && !stop()) {
                 // Diagnose insufficient source durations without accepting them or
@@ -2678,6 +2787,10 @@ namespace motion_planning
                 auto seeds=paths;
                 if(!seeds.success) {
                     auto relaxed=graph; relaxed.maxPaths=request.optimizationSeedPaths;
+                    // APF will insert bounded support knots before replay. A
+                    // coarse original-control span is only a repair seed here,
+                    // never an accepted execution edge.
+                    if(request.pipelineStage=="apf")relaxed.maxJointDelta=5*request.maxJointDelta;
                     relaxed.nodeAdmissible=[&](std::size_t,const CartesianIkCandidate& c){return stateValid(c.joints,false);};
                     relaxed.edgeAdmissible={};
                     seeds=ProjectLayeredIkGraph::filter(ik,relaxed);
@@ -2825,7 +2938,7 @@ namespace motion_planning
                     options.detectorIds=request.collisionDetectorIds;
                     options.cartesianMotion=moveL;
                     options.detectorId.clear(); options.obstacleId.clear(); options.obstacleRobotSourcePath.clear();
-                    options.worldForwardKinematics=fk; options.cancelled=stop;
+                    options.worldForwardKinematics=fastFk; options.cancelled=stop;
                     if(!request.pipelineStage.empty()) {
                         options.stage=request.pipelineStage=="apf"?ProjectCdfQpRepairOptions::Stage::ApfOnly:ProjectCdfQpRepairOptions::Stage::CdfOnly;
                         options.densifyKnots=request.densifyOptimizationKnots;
@@ -2849,7 +2962,7 @@ namespace motion_planning
                         if(processValid(q,time))return true;
                         // Only the proposed ORIENTATION is retained. Position is rebuilt at its
                         // immutable surface station before IK, collision scoring or acceptance.
-                        Eigen::Quaterniond adjusted(fk(q).linear());
+                        Eigen::Quaterniond adjusted(fastFk(q).linear());
                         adjusted=clampSurfacePosture(r.orientation,adjusted,std::max(0.,r.angle-1e-5));
                         const auto proposed=q;
                         const auto project=[&](const Eigen::Quaterniond& rotation,const std::vector<double>& initial,bool expanded) {
@@ -2867,7 +2980,7 @@ namespace motion_planning
                                 double x=0,y=0;for(std::size_t k=0;k<dimension;++k){x+=std::pow(a.joints[k]-proposed[k],2);y+=std::pow(b.joints[k]-proposed[k],2);}return x<y;
                             });
                             for(const auto& candidate:candidates) {
-                                const auto actual=fk(candidate.joints);
+                                const auto actual=fastFk(candidate.joints);
                                 if(stateValid(candidate.joints,false) && processValid(candidate.joints,time) &&
                                     (actual.translation()-target.translation()).norm()<=request.maximumTcpPositionDeviation &&
                                     Eigen::Quaterniond(actual.linear()).angularDistance(rotation)<=request.maximumTcpOrientationDeviation &&
@@ -2882,7 +2995,7 @@ namespace motion_planning
                         // seed must not declare a reachable surface station invalid.
                         if(project(adjusted,proposed,false))return true;
                         const auto& left=seed.trajectory.points[edge].q;const auto& right=seed.trajectory.points[j].q;
-                        const Eigen::Quaterniond a(fk(left).linear()),b(fk(right).linear());
+                        const Eigen::Quaterniond a(fastFk(left).linear()),b(fastFk(right).linear());
                         const auto geodesic=clampSurfacePosture(r.orientation,a.slerp(fraction,b),std::max(0.,r.angle-1e-5));
                         std::vector<Eigen::Quaterniond> rotations{adjusted};
                         for(const auto& rotation:std::vector<Eigen::Quaterniond>{adjusted.slerp(.5,geodesic),geodesic,a,b}) {
@@ -2902,7 +3015,8 @@ namespace motion_planning
                     };
                     // Collision samples are not output knots. Keep valid raw
                     // chords and add local support only where direct motion fails.
-                    options.selectiveSupport=request.pipelineStage=="apf";
+                    options.selectiveSupport=request.pipelineStage=="apf" && !request.densifyOptimizationKnots;
+                    options.selectiveSupportMaxJointStep=request.maxJointDelta;
                     options.processStateAdmissible=[&](const std::vector<double>& q,double time){return processValid(q,time);};
                     options.previewState=[&](const std::vector<double>& q) {
                         if(request.progress) request.progress(nlohmann::json{{"type","preview_state"},{"q_rad",q},
@@ -2915,7 +3029,14 @@ namespace motion_planning
                     options.apfMaxTcpDeviation=request.maximumTcpPositionDeviation;
                     if(!request.pipelineStage.empty() && spray) {
                         const double distance=*std::max_element(request.sprayDistances.begin(),request.sprayDistances.end());
-                        options.apfMaxTcpDeviation+=2*distance*std::sin(request.pointSearchMaxAngleDeg*std::acos(-1.)/360);
+                        // The guide joins the accepted GA TCP positions, not the
+                        // nominal normal-axis positions. Two authorized surface
+                        // poses can lie on opposite sides of the standoff sphere;
+                        // a half-cone chord is therefore not a valid envelope.
+                        // This triangle bound only encloses the process manifold;
+                        // ordered aiming, radius and cone gates remain authoritative.
+                        options.apfMaxTcpDeviation=std::max(options.apfMaxTcpDeviation,
+                            2*(distance+request.maximumTcpPositionDeviation));
                         // Surface correspondence, including interpolated samples, remains authoritative.
                         options.tcpStateAdmissible=[&](const std::vector<double>& q,const Eigen::Vector3d&) {return stateValid(q,false);};
                     }

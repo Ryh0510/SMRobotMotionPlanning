@@ -11,8 +11,14 @@ public:
     static bool isMoveL(const StoredMotionPlan& plan);
     ~CartesianMotionSampler();
     Eigen::Isometry3d forward(const std::vector<double>& q) const;
+    Eigen::Matrix<double,6,6> jacobian(const std::vector<double>& q) const;
     bool sample(const std::vector<double>& a, const std::vector<double>& b, double fraction,
         std::vector<double>& q, std::string& error) const;
+    // Exactly k/intervals, including both original encoder endpoints. GPU
+    // proposals are CPU-FK checked; any failure uses the ordinary CPU sampler.
+    bool uniformSamples(const std::vector<double>& a, const std::vector<double>& b,
+        std::size_t intervals, std::vector<std::vector<double>>& samples, std::string& error,
+        const std::function<bool()>& cancelled = {}) const;
     bool connection(const std::vector<double>& a, const std::vector<double>& b,
         double maxJointStep, std::size_t maxSamples, std::vector<std::vector<double>>& samples,
         std::string& error, const std::function<bool()>& cancelled = {}) const;

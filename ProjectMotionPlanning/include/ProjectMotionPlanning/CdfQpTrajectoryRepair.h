@@ -27,6 +27,8 @@ namespace motion_planning
         bool densifyKnots = true;
         // Direct valid chords remain sparse. Blocked intervals get 2..4 knots.
         bool selectiveSupport = false;
+        // Zero disables the output-knot jump trigger; collision spacing is separate.
+        double selectiveSupportMaxJointStep = 0.0;
         std::shared_ptr<const CartesianMotionSampler> cartesianMotion;
         // Internal, invocation-scoped original-edge geometry certificates.
         // Only the immutable GA/APF pipeline creates these; final replay is fresh.
@@ -36,6 +38,7 @@ namespace motion_planning
         double apfInfluenceDistance = .08;
         double apfRepulsionGain = 2.5;
         int apfIterationBudget = 1200;
+        int apfFieldAttempts = 0; // zero retains all deterministic local fields
         std::string detectorId = "cdf_abb4600_burnner_detector";
         // Explicit generic mode uses existing selected detectors unchanged.
         std::vector<std::string> detectorIds;

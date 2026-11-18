@@ -6,6 +6,7 @@
 #include <cmath>
 #include <filesystem>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -21,6 +22,7 @@ public:
     std::vector<double> triangles,edges;
     std::mutex mutex;
     bool attempted=false,ready=false;
+    bool compilationCacheHit=false;
     std::string error,device;
     std::size_t queries=0,taskCount=0,triangleCount=0;
     double elapsedMs=0,initializationMs=0;
@@ -98,8 +100,19 @@ public:
             char label[256]={};check(cuDeviceGetName(label,256,gpu),"cuDeviceGetName");device=label;
             int major=0,minor=0;check(cuDeviceGetAttribute(&major,75,gpu),"compute capability");check(cuDeviceGetAttribute(&minor,76,gpu),"compute capability");
             const auto source=std::string(gpuBaffleKernel)+gpuIkKernel;
-            void* program=nullptr;check(nvrtcCreateProgram(&program,source.c_str(),"rws_planning.cu",0,nullptr,nullptr),"nvrtcCreateProgram");
             const std::string architecture="--gpu-architecture=compute_"+std::to_string(major)+std::to_string(minor);
+            // PTX contains code only. Each owner still has a private module,
+            // stream and buffers, and no scene data or query result is shared.
+            static std::mutex compilationMutex;
+            static std::map<std::string,std::vector<char>> compiledPrograms;
+            std::vector<char> ptx;
+            {
+            std::lock_guard<std::mutex> compilationGuard(compilationMutex);
+            const auto cacheKey=architecture+"\n--std=c++14 --fmad=false\n"+source;
+            const auto cached=compiledPrograms.find(cacheKey);
+            if(cached!=compiledPrograms.end()) {ptx=cached->second;compilationCacheHit=true;}
+            else {
+            void* program=nullptr;check(nvrtcCreateProgram(&program,source.c_str(),"rws_planning.cu",0,nullptr,nullptr),"nvrtcCreateProgram");
             const char* options[]={architecture.c_str(),"--std=c++14","--fmad=false"};
             // NVRTC uses a deep compiler stack. Keep it off the caller's Debug
             // planning/Eigen stack; source, options and CUDA ownership are unchanged.
@@ -109,7 +122,10 @@ public:
                 compilerThread.join();
             } catch(...) {nvrtcDestroyProgram(&program);throw;}
             if(compiled){std::size_t count=0;nvrtcGetProgramLogSize(program,&count);std::string log(count,'\0');if(count)nvrtcGetProgramLog(program,log.data());nvrtcDestroyProgram(&program);throw std::runtime_error("NVRTC compile: "+log.substr(0,4000));}
-            std::size_t count=0;check(nvrtcGetPTXSize(program,&count),"nvrtcGetPTXSize");std::vector<char> ptx(count);check(nvrtcGetPTX(program,ptx.data()),"nvrtcGetPTX");nvrtcDestroyProgram(&program);
+            std::size_t count=0;check(nvrtcGetPTXSize(program,&count),"nvrtcGetPTXSize");ptx.resize(count);check(nvrtcGetPTX(program,ptx.data()),"nvrtcGetPTX");nvrtcDestroyProgram(&program);
+            compiledPrograms.emplace(cacheKey,ptx);
+            }
+            }
             // Share only the device primary context. Every planner keeps its own
             // module, stream and buffers; releasing this owner never resets CUDA.
             gpuOrdinal=gpu;check(cuDevicePrimaryCtxRetain(&context,gpu),"cuDevicePrimaryCtxRetain");
@@ -200,7 +216,7 @@ nlohmann::json GpuBaffleSearch::status() const {
     std::lock_guard<std::mutex> guard(impl->mutex);
     return {{"attempted",impl->attempted},{"available",impl->ready},{"device",impl->device},{"error",impl->error},
         {"batch_queries",impl->queries},{"body_tasks",impl->taskCount},{"triangles_scored",impl->triangleCount},
-        {"query_ms",impl->elapsedMs},{"initialization_ms",impl->initializationMs},
+        {"query_ms",impl->elapsedMs},{"initialization_ms",impl->initializationMs},{"compilation_cache_hit",impl->compilationCacheHit},
         {"ik_batches",impl->ikQueries},{"ik_tasks",impl->ikTasks},{"ik_converged",impl->ikConverged},{"ik_ms",impl->ikMs},
         {"execution","shared_primary_context_private_nonblocking_stream_and_buffers"},
         {"scope","actual-model IK candidates and mesh/slab/aperture merit; independent CPU FK and safety gates required"}};

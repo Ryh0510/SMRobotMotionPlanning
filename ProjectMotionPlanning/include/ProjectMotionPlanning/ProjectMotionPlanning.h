@@ -31,6 +31,8 @@ namespace motion_planning
         PlannerOptions planner;
         MotionValidationOptions validation;
         TrajectoryPostProcessOptions postProcess;
+        // Simulation playback may keep unbounded encoder values; planning defaults stay physical.
+        bool enforceJointPositionLimits = true;
     };
 
     struct PlanningSceneDistanceSample
@@ -71,6 +73,7 @@ namespace motion_planning
         const std::string& robotId() const;
         const std::vector<std::string>& jointNames() const;
         const std::vector<JointBound>& jointBounds() const;
+        bool enforcesJointPositionLimits() const;
         const std::vector<std::string>& collisionDetectorIds() const;
 
         // Nonnegative geometric separation; collision is zero, not penetration depth.

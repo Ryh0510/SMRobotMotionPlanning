@@ -63,6 +63,8 @@ namespace motion_planning
         std::vector<double> gaNominalSprayDistances; // immutable source metres, optional for legacy callers
         int gaFieldEvaluations = 48;
         int gaFeasibilityBatchSize = 256;
+        // Feedback search effort only; zero retains the complete requested schedule.
+        int gaFeedbackPostureLimit = 0;
         double gaContinuityWeight = 2.;
         double gaPostureWeight = .2;
         // Finite search effort, never an acceptance tolerance. Zero preserves legacy unlimited execution.

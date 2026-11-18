@@ -55,6 +55,7 @@ int main(int argc,char** argv)
             auto imported=ProjectTrajectoryImporter::importFile(std::filesystem::u8path(argv[2]),importOptions);
             if(!imported.success)throw std::runtime_error(imported.message());
             request.plan=imported.plan;
+            options.detectorIds=ProjectCdfQpTrajectoryRepairService::distanceDetectorIds(document,robot.id);
             if(!ProjectCdfQpTrajectoryRepairService::ensureCollisionSetup(document,robot.id,options))throw std::runtime_error("Cannot configure actual robot/workpiece collisions");
             request.collisionDetectorIds=ProjectCdfQpTrajectoryRepairService::distanceDetectorIds(document,robot.id);
             request.cdfOptions=options;
