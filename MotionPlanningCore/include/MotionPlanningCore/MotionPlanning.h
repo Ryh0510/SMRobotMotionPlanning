@@ -156,6 +156,13 @@ namespace motion_planning
         MotionPlanningResult plan(const MotionPlanningRequest& request) const override;
     };
 
+    struct MotionProcessInterval
+    {
+        double endTime = 0.0;
+        bool sprayEnabled = false;
+        double positionerRpm = 0.0;
+    };
+
     struct StoredMotionPlan
     {
         std::string id;
@@ -164,6 +171,12 @@ namespace motion_planning
         std::vector<std::string> jointNames;
         robottrajectory::JointTrajectory trajectory;
         robottrajectory::CartesianTrajectory cartesianControlPoints;
+        // Optional execution metadata; legacy motion plans remain readable.
+        std::string sourceSignature;
+        std::string targetObjectId;
+        std::string tcpAttachmentId;
+        std::string tcpFrameId;
+        std::vector<MotionProcessInterval> processIntervals;
     };
 
     class MotionPlanningProjectStore

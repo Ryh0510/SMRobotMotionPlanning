@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cmath>
 #include <memory>
+#include <set>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -17,6 +18,37 @@ namespace motion_planning
     {
         constexpr double kPi = 3.14159265358979323846;
         constexpr double kTwoPi = 2.0 * kPi;
+
+        bool motionSnapshotCoversDetector(
+            const simulation_runtime::ProjectCollisionRuntime& runtime,
+            const std::string& detectorId)
+        {
+            const auto& detectors = runtime.detectors();
+            const auto detector = std::find_if(detectors.begin(), detectors.end(),
+                [&](const auto& value) { return value.id == detectorId; });
+            if(detector == detectors.end() || !detector->enabled || !detector->valid)
+                return false;
+
+            // The 1.0.6 SDK can omit selected link pairs from its motion snapshot.
+            // A Clear verdict only certifies the pairs present in that snapshot.
+            // Require the same effective pairs as the existing detector first.
+            using Pair = std::pair<collision::ObjectID, collision::ObjectID>;
+            std::set<Pair> expected;
+            for(const auto& pair : runtime.pairDiagnostics(detectorId)) {
+                if(pair.effective)
+                    expected.insert(std::minmax(pair.first.object, pair.second.object));
+            }
+            collision::CollisionMotionSnapshot snapshot;
+            if(runtime.scene().motionSnapshot(detector->options, snapshot) != collision::CollisionStatus::Success)
+                return false;
+            std::set<Pair> actual;
+            for(const auto& pair : snapshot.pairs) {
+                if(pair.first >= snapshot.objects.size() || pair.second >= snapshot.objects.size())
+                    return false;
+                actual.insert(std::minmax(snapshot.objects[pair.first].key, snapshot.objects[pair.second].key));
+            }
+            return actual == expected;
+        }
 
         void setError(std::string* errorMessage, const std::string& message)
         {
@@ -154,6 +186,9 @@ namespace motion_planning
         std::vector<std::string> jointNames;
         std::vector<JointBound> jointBounds;
         std::vector<std::string> detectorIds;
+        bool conservativeMotion = false;
+        collision::MotionQueryRequest motionRequest;
+        std::vector<std::string> collisionFreeLinks;
 
         StateValidationResult applyState(const std::vector<double>& jointValues, bool checkCollision)
         {
@@ -221,6 +256,44 @@ namespace motion_planning
     {
         if (from.size() != m_impl->jointNames.size() || to.size() != from.size())
             return StateValidationResult::failure("motion_size_mismatch", "Motion endpoint sizes do not match the planning scene.");
+        if (m_impl->conservativeMotion)
+        {
+            for(const auto& detectorId : m_impl->detectorIds) {
+                if(!motionSnapshotCoversDetector(m_impl->collision, detectorId))
+                    return StateValidationResult::failure("motion_indeterminate",
+                        "Motion snapshot does not cover the effective detector pairs: " + detectorId);
+            }
+            const auto* robot = m_impl->simulation.robot(m_impl->robotId);
+            if (!robot || !robot->instance)
+                return StateValidationResult::failure("motion_robot_missing", "Planning robot is unavailable.");
+            auto fullFrom = robot->instance->getState().q;
+            auto fullTo = fullFrom;
+            for (std::size_t i=0;i<from.size();++i) {
+                const auto& bound=m_impl->jointBounds[i];
+                const double first = normalizedJointValueForBounds(from[i], bound);
+                const double last = bound.continuous
+                    ? first + shortestContinuousDelta(from[i], to[i]) : to[i];
+                if (!std::isfinite(from[i]) || !std::isfinite(to[i]) ||
+                    !std::isfinite(first) || !std::isfinite(last) ||
+                    (!bound.continuous &&
+                     (std::min(first, last) < bound.lower || std::max(first, last) > bound.upper)))
+                    return StateValidationResult::failure("motion_out_of_bounds", "Invalid joint segment.");
+                const auto* joint=findJoint(robot->model,m_impl->jointNames[i]);
+                if (!joint || joint->dofIndex<0 || static_cast<std::size_t>(joint->dofIndex)>=fullFrom.size())
+                    return StateValidationResult::failure("motion_joint_mapping", "Invalid joint mapping.");
+                fullFrom[joint->dofIndex] = first;
+                fullTo[joint->dofIndex] = last;
+            }
+            const auto results=m_impl->collision.queryRobotJointMotion(m_impl->simulation,m_impl->robotId,
+                fullFrom,fullTo,m_impl->detectorIds,m_impl->collisionFreeLinks,m_impl->motionRequest);
+            if (results.empty()) return StateValidationResult::failure("motion_no_detectors", "No motion validation result.");
+            for (const auto& result:results) {
+                if (result.status!=collision::CollisionStatus::Success || result.verdict!=collision::MotionVerdict::Clear)
+                    return StateValidationResult::failure(
+                        result.verdict==collision::MotionVerdict::Collision?"motion_in_collision":"motion_indeterminate",result.message);
+            }
+            return StateValidationResult::success();
+        }
         if (!(options.maxJointStep > 0.0) || !std::isfinite(options.maxJointStep))
             return StateValidationResult::failure("invalid_motion_step", "Maximum joint validation step must be positive and finite.");
 
@@ -264,6 +337,20 @@ namespace motion_planning
             }
         }
         return StateValidationResult::success();
+    }
+
+    void ProjectPlanningSceneSnapshot::useConservativeMotionValidation(
+        const collision::MotionQueryRequest& request,const std::vector<std::string>& collisionFreeLinks)
+    {
+        m_impl->motionRequest=request;
+        m_impl->motionRequest.mode=collision::MotionQueryMode::Conservative;
+        m_impl->collisionFreeLinks=collisionFreeLinks;
+        m_impl->conservativeMotion=true;
+    }
+
+    void ProjectPlanningSceneSnapshot::useSampledMotionValidation()
+    {
+        m_impl->conservativeMotion=false;
     }
 
     const std::string& ProjectPlanningSceneSnapshot::robotId() const

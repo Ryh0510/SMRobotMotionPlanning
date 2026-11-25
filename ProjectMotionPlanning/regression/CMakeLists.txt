@@ -1,3 +1,3 @@
 cmake_minimum_required(VERSION 3.20)
 
-add_subdirectory(ProjectMotionPlanningHeadless)
+rs2026_add_test_unit(ProjectMotionPlanningHeadless)

@@ -277,6 +277,16 @@ namespace motion_planning
                     plan.cartesianControlPoints =
                         readCartesianTrajectory(planJson.at("cartesianControlPoints"));
                 }
+                plan.sourceSignature = planJson.value("sourceSignature", std::string());
+                plan.targetObjectId = planJson.value("targetObjectId", std::string());
+                plan.tcpAttachmentId = planJson.value("tcpAttachmentId", std::string());
+                plan.tcpFrameId = planJson.value("tcpFrameId", std::string());
+                if(planJson.contains("processIntervals")) {
+                    for(const auto& value : planJson.at("processIntervals")) {
+                        plan.processIntervals.push_back({ value.at("endTime").get<double>(),
+                            value.at("sprayEnabled").get<bool>(), value.at("positionerRpm").get<double>() });
+                    }
+                }
                 if(!plan.id.empty()) {
                     result.push_back(std::move(plan));
                 }
@@ -315,7 +325,16 @@ namespace motion_planning
 
         Json planArray = Json::array();
         for(const StoredMotionPlan& storedPlan : storedPlans) {
+            Json intervals = Json::array();
+            for(const auto& interval : storedPlan.processIntervals)
+                intervals.push_back({ {"endTime", interval.endTime}, {"sprayEnabled", interval.sprayEnabled},
+                    {"positionerRpm", interval.positionerRpm} });
             planArray.push_back(Json{
+                { "sourceSignature", storedPlan.sourceSignature },
+                { "targetObjectId", storedPlan.targetObjectId },
+                { "tcpAttachmentId", storedPlan.tcpAttachmentId },
+                { "tcpFrameId", storedPlan.tcpFrameId },
+                { "processIntervals", intervals },
                 { "id", storedPlan.id },
                 { "name", storedPlan.name },
                 { "robotId", storedPlan.robotId },

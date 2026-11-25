@@ -48,3 +48,7 @@ if(_build_examples)
 endif()
 
 message(STATUS "-------------  Config ${PACKAGE_NAME}::${TARGET_NAME}  -------------\n")
+
+if(BuildTests)
+    rs2026_add_test_unit(../../ProjectMotionPlanning/regression/ConservativeMotionTests)
+endif()

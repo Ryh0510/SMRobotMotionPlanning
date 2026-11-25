@@ -46,6 +46,11 @@ namespace motion_planning
             const std::vector<double>& to,
             const MotionValidationOptions& options) override;
 
+        // Opt-in conservative edge validation. Default remains legacy sampling.
+        void useConservativeMotionValidation(const collision::MotionQueryRequest& request,
+            const std::vector<std::string>& collisionFreeLinks = {});
+        void useSampledMotionValidation();
+
         const std::string& robotId() const;
         const std::vector<std::string>& jointNames() const;
         const std::vector<JointBound>& jointBounds() const;
