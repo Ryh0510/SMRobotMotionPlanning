@@ -13,7 +13,7 @@ add_library(${TARGET_NAME} STATIC ${SOURCES} ${HEADERS} ${INTERFACE_HEADERS})
 add_library(${PACKAGE_NAME}::${TARGET_NAME} ALIAS ${TARGET_NAME})
 if(MSVC)
     # Eigen/JSON search lambdas exceed the normal COFF section count in VS2019.
-    set_source_files_properties(src/ExternalTrajectoryEvaluation.cpp PROPERTIES COMPILE_OPTIONS /bigobj)
+    set_source_files_properties(src/ExternalTrajectoryEvaluation.cpp src/SprayAxisContinuity.cpp PROPERTIES COMPILE_OPTIONS /bigobj)
 endif()
 
 target_include_directories(${TARGET_NAME}
@@ -77,6 +77,11 @@ add_executable(RwsTrajectorySegment tools/RwsTrajectorySegment.cpp)
 target_link_libraries(RwsTrajectorySegment PRIVATE ${TARGET_NAME})
 target_compile_features(RwsTrajectorySegment PRIVATE cxx_std_17)
 copy_runtime_dlls(RwsTrajectorySegment)
+
+add_executable(SprayAxisContinuityCheck tools/SprayAxisContinuityCheck.cpp)
+target_link_libraries(SprayAxisContinuityCheck PRIVATE ${TARGET_NAME} nlohmann_json::nlohmann_json)
+target_compile_features(SprayAxisContinuityCheck PRIVATE cxx_std_17)
+copy_runtime_dlls(SprayAxisContinuityCheck)
 
 option(BuildExternalTrajectoryTests "Build focused external trajectory and IK graph tests" OFF)
 

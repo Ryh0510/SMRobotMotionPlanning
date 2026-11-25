@@ -1,4 +1,5 @@
 #include <ProjectMotionPlanning/CdfJointAngleImport.h>
+#include "TrajectoryTextMetadata.h"
 
 #include <nlohmann/json.hpp>
 
@@ -317,6 +318,7 @@ CdfJointAngleImportResult ProjectCdfJointAngleImporter::importFile(const std::fi
             }
             result.plan.optimizationMetadata = nlohmann::json{
                 {"motion", motion}, {"joint_convention", convention}}.dump();
+            detail::importTrajectoryProcessMetadata(exact,result.plan,rows.size());
             result.jointNames = names;
             result.hasMotionMetadata = true;
         } catch(const std::exception& error) {

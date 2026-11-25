@@ -12,6 +12,10 @@ public:
     // Uses every enabled link collision element and installed tool, independently of detector pair filters.
     bool validState(const simulation_runtime::ProjectSimulationRuntime& runtime,
         double clearance, std::string& reason) const;
+    // Certifies every body pose in a Euclidean revolute-joint ball. The
+    // geometric displacement enclosure inflates the slab and shrinks apertures.
+    bool validMotionBall(const simulation_runtime::ProjectSimulationRuntime& runtime,
+        const std::string& robotId, double jointRadius, double clearance, std::string& reason) const;
     const std::vector<WorkpieceBaffle>& baffles() const { return baffles_; }
     // Geometric search merit (not signed clearance and never an acceptance test).
     double searchViolation(const simulation_runtime::ProjectSimulationRuntime&, double clearance) const;
@@ -33,8 +37,10 @@ private:
         struct Node {Eigen::Vector3d lower,upper;std::size_t first=0,count=0;int left=-1,right=-1;};
         std::vector<Node> nodes;
         std::vector<std::size_t> triangleOrder;
-        double margin=0;
+        double margin=0, jointBallLever=0;
     };
+    bool validStateImpl(const simulation_runtime::ProjectSimulationRuntime&, double clearance,
+        std::string& reason, const std::string& movingRobot, double jointRadius) const;
     std::vector<WorkpieceBaffle> baffles_;
     std::vector<std::shared_ptr<const detail::BaffleRimIndex>> searchIndices_;
     std::vector<Body> bodies_;

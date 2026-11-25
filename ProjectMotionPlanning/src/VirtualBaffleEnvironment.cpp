@@ -2,6 +2,7 @@
 #include "GpuBaffleSearch.h"
 #include "BaffleRimIndex.h"
 #include <AssetCore/AssetManager.h>
+#include <RobotInstance/RobotInstance.h>
 #include <SimulationProject/AssetResolver.h>
 #include <filesystem>
 #include <stdexcept>
@@ -96,6 +97,31 @@ void VirtualBaffleEnvironment::build(const simulation_runtime::ProjectSimulation
         }
         for(auto& body:bodies_)for(const auto& t:body.triangles)for(const auto& p:t){body.lower=body.lower.cwiseMin(p);body.upper=body.upper.cwiseMax(p);}
         for(auto& body:bodies_) {
+            const auto* robot=runtime.robot(body.robotId);
+            if(!robot || !robot->instance)throw std::runtime_error("baffle motion robot missing");
+            std::string link=body.link;Eigen::Isometry3d local=body.local;
+            if(!body.attachmentId.empty()) {
+                const auto* attachment=runtime.mountedAttachment(body.attachmentId);
+                if(!attachment || !attachment->owner.valid)throw std::runtime_error("baffle motion attachment missing");
+                link=attachment->owner.linkName;
+                local=robot->instance->getLinkTransform(link).inverse()*attachment->transform.worldVisual;
+            }
+            double length=0,squared=0;
+            for(int c=0;c<8;++c) {
+                const V3 p(c&1?body.upper.x():body.lower.x(),c&2?body.upper.y():body.lower.y(),c&4?body.upper.z():body.lower.z());
+                length=std::max(length,(local*p).norm());
+            }
+            std::size_t visited=0;
+            while(link!=robot->model.root && ++visited<=robot->model.links.size()) {
+                const auto joint=std::find_if(robot->model.joints.begin(),robot->model.joints.end(),[&](const auto& j){return j.child==link;});
+                if(joint==robot->model.joints.end())throw std::runtime_error("incomplete baffle motion chain");
+                length+=robot->model.links.at(link).T_local.translation().norm()+joint->T_joint_child.translation().norm();
+                if(joint->type==robot::JointType::Prismatic)squared=std::numeric_limits<double>::infinity();
+                if(joint->type!=robot::JointType::Fixed)squared+=length*length;
+                length+=joint->T_parent_joint.translation().norm();link=joint->parent;
+            }
+            if(visited>robot->model.links.size())throw std::runtime_error("cycle in baffle motion chain");
+            body.jointBallLever=std::sqrt(squared);
             body.triangleOrder.resize(body.triangles.size());std::iota(body.triangleOrder.begin(),body.triangleOrder.end(),0);
             std::function<int(std::size_t,std::size_t)> buildNode;
             buildNode=[&](std::size_t first,std::size_t count){
@@ -113,6 +139,18 @@ void VirtualBaffleEnvironment::build(const simulation_runtime::ProjectSimulation
     }catch(const std::exception& e){error_=e.what();}
 }
 bool VirtualBaffleEnvironment::validState(const simulation_runtime::ProjectSimulationRuntime& runtime,double clearance,std::string& reason)const{
+    return validStateImpl(runtime,clearance,reason,{},0.);
+}
+bool VirtualBaffleEnvironment::validMotionBall(const simulation_runtime::ProjectSimulationRuntime& runtime,
+    const std::string& robotId,double jointRadius,double clearance,std::string& reason)const {
+    if(robotId.empty() || !runtime.robot(robotId) || !std::isfinite(jointRadius) || jointRadius<0) {
+        reason="invalid virtual-baffle joint ball";return false;
+    }
+    return validStateImpl(runtime,clearance,reason,robotId,jointRadius);
+}
+bool VirtualBaffleEnvironment::validStateImpl(const simulation_runtime::ProjectSimulationRuntime& runtime,
+    double clearance,std::string& reason,const std::string& movingRobot,double jointRadius)const {
+    if(!std::isfinite(clearance) || clearance<0){reason="invalid virtual-baffle clearance";return false;}
     if(!error_.empty()){reason="virtual_baffle_unavailable: "+error_;return false;}
     for(const auto& b:baffles_){if(!b.geometry.enabled)continue;const auto* object=runtime.object(b.objectId);if(!object){reason="virtual_baffle_workpiece_missing";return false;}
         const auto fromWorld=object->transform.inverse();
@@ -122,7 +160,11 @@ bool VirtualBaffleEnvironment::validState(const simulation_runtime::ProjectSimul
             const Eigen::Isometry3d tf=fromWorld*world;
             double minBound=1e300,maxBound=-1e300;
             for(int i=0;i<8;++i){V3 p;for(int j=0;j<3;++j)p[j]=i&(1<<j)?body.upper[j]:body.lower[j];double z=b.geometry.normal.dot(tf*p-b.geometry.center);minBound=std::min(minBound,z);maxBound=std::max(maxBound,z);}
-            const double margin=clearance+body.margin;
+            // Cauchy-Schwarz bounds every point displacement along the joint
+            // ball by ||ancestor levers||_2 * ||dq||_2, at every intermediate q.
+            const double displacement=body.robotId==movingRobot && jointRadius>0?body.jointBallLever*jointRadius:0.;
+            if(!std::isfinite(displacement)){reason="unsupported baffle joint-ball chain";return false;}
+            const double margin=clearance+body.margin+displacement;
             if(minBound>b.geometry.thickness/2+margin || maxBound<-b.geometry.thickness/2-margin)continue;
             const V3 normalLocal=tf.linear().transpose()*b.geometry.normal;
             const double offset=b.geometry.normal.dot(tf.translation()-b.geometry.center);

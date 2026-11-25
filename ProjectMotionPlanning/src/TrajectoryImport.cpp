@@ -1,4 +1,6 @@
 #include <ProjectMotionPlanning/TrajectoryImport.h>
+#include "TrajectoryTextMetadata.h"
+#include "FanucTrajectoryImport.h"
 #include <ProjectMotionPlanning/CdfJointAngleImport.h>
 
 #include <nlohmann/json.hpp>
@@ -1201,8 +1203,12 @@ namespace motion_planning
                 if(metadata.is_object() && metadata.value("kind",std::string())=="tcp_joint_seeds_v1" &&
                     metadata.value("robot_id",std::string())==options.robotId &&
                     metadata.value("joint_names",std::vector<std::string>())==options.jointNames)
+                {
                     plan.optimizationMetadata=metadata.dump();
-            } catch(const Json::exception&) {}
+                    detail::importTrajectoryProcessMetadata(metadata,plan,plan.cartesianControlPoints.points.size());
+                }
+                else if(metadata.contains("spray_execution"))return failure("invalid_tcp_metadata","Spray TCP provenance does not match the selected robot/joints.");
+            } catch(const std::exception& e) {return failure("invalid_tcp_metadata",e.what());}
             return finalizeImportedPlan(
                 path,
                 options,
@@ -1229,6 +1235,13 @@ namespace motion_planning
         }
 
         const std::string extension = lowerCopy(path.extension().generic_u8string());
+        if(extension == ".ls") {
+            auto parsed = detail::importFanucLs(path, options);
+            if(!parsed.success) return parsed;
+            auto result = finalizeImportedPlan(path, options, std::move(parsed.plan), parsed.dataKind);
+            result.diagnostics.insert(result.diagnostics.end(), parsed.diagnostics.begin(), parsed.diagnostics.end());
+            return result;
+        }
         if(extension == ".json") {
             return importJsonFile(path, options);
         }

@@ -44,7 +44,7 @@ void environmentRegression(){
         for(const auto& triangle:mesh){file<<"facet normal 0 0 0\nouter loop\n";for(const auto& v:triangle)file<<"vertex "<<v.x()<<' '<<v.y()<<' '<<v.z()<<'\n';file<<"endloop\nendfacet\n";}file<<"endsolid test\n";};
     save(dir/"body.stl",body);std::vector<VirtualBaffle::Triangle> opening;const auto model=tube();const auto& data=model.mainModelData_;
     for(std::size_t i=0;i<data.m_indices.size();i+=3){VirtualBaffle::Triangle triangle;for(int j=0;j<3;++j){const auto k=3*data.m_indices[i+j];triangle[j]=V3(data.m_vertices[k],data.m_vertices[k+1],data.m_vertices[k+2]);}opening.push_back(triangle);}save(dir/"opening.stl",opening);
-    {std::ofstream file(dir/"robot.urdf");file<<"<robot name='test'><link name='base'><collision><geometry><mesh filename='body.stl'/></geometry></collision></link></robot>";}
+    {std::ofstream file(dir/"robot.urdf");file<<"<robot name='test'><link name='base'/><link name='body'><collision><geometry><mesh filename='body.stl'/></geometry></collision></link><joint name='hinge' type='revolute'><parent link='base'/><child link='body'/><axis xyz='0 1 0'/><limit lower='-3' upper='3' effort='1' velocity='1'/></joint></robot>";}
     simulation_project::ProjectDocument document;simulation_project::RobotDesc robot;robot.id="robot";robot.sourceType="urdf";robot.sourcePath=(dir/"robot.urdf").generic_u8string();document.robots.push_back(robot);
     simulation_project::SceneObjectDesc object;object.id="opening";object.objectType="workpiece";object.sourcePath=(dir/"opening.stl").generic_u8string();document.objects.push_back(object);
     simulation_runtime::ProjectSimulationRuntime runtime;const auto loaded=runtime.loadProject(document,dir);require(loaded.success,loaded.message.c_str());
@@ -60,6 +60,7 @@ void environmentRegression(){
         for(const auto& triangle:body){VirtualBaffle::Triangle world;for(int j=0;j<3;++j){world[j]=pose*triangle[j];lower=lower.cwiseMin(world[j]);upper=upper.cwiseMax(world[j]);}hit=hit||baffle.intersectsTriangle(world,clearance);transformed.push_back(world);}
         if(!hit)for(const auto& ring:baffle.contours)for(const auto& uv:ring){const V3 p=baffle.center+baffle.axisX*uv.x()+baffle.axisY*uv.y();if((p.array()>=lower.array()).all() && (p.array()<=upper.array()).all() && referenceContains(transformed,p))hit=true;}
         std::string reason;const bool valid=environment.validState(runtime,clearance,reason);if(valid)++validCount;else ++hitCount;require(valid==!hit,"BVH/slab/containment differs from brute-force full mesh");
+        require(environment.validMotionBall(runtime,"robot",0.,clearance,reason)==valid,"Zero-radius ball must agree with exact baffle state");
     }
     require(validCount>0 && hitCount>0,"BVH regression must include passing and rejected states");
     const auto batch=environment.searchViolationBatch(searchPoses,.001,true);
@@ -73,6 +74,15 @@ void environmentRegression(){
             require(std::abs(cpu[first+i]-batch[first+i])<1e-10,"GPU staging differs from independent CPU baffle score");
         }
     }
+    simulation_project::TransformDesc base;base.x=.2;base.z=.02;
+    require(runtime.setRobotBaseTransform("robot",base).success,"Joint ball fixture base moves");
+    std::string reason;
+    require(environment.validMotionBall(runtime,"robot",.01,0.,reason),"Small separated revolute ball is certified");
+    require(!environment.validMotionBall(runtime,"robot",.5,0.,reason),"Ball containing an interior baffle crossing refuses certification");
+    require(runtime.setRobotJointValues("robot",{"hinge"},{.5}).success,"Joint ball fixture rotates");
+    require(!environment.validState(runtime,0.,reason),"Rejected ball contains an actual colliding pose");
+    require(!environment.validMotionBall(runtime,"robot",-1.,0.,reason),"Negative ball radius is rejected");
+    require(!environment.validMotionBall(runtime,"missing",.01,0.,reason),"Missing moving robot is rejected");
     std::cout<<"512 parallel/serial/CPU baffle merit comparisons passed "<<environment.gpuSearchStatus().dump()<<'\n';
     for(const char* file:{"robot.urdf","body.stl","opening.stl"})std::filesystem::remove(dir/file);std::filesystem::remove(dir);
     std::cout<<"512 independent full-mesh/BVH comparisons passed\n";

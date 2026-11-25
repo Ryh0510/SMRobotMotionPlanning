@@ -1,6 +1,7 @@
 #include <ProjectMotionPlanning/TrajectoryControlPointEditing.h>
 #include <ProjectMotionPlanning/CartesianMotion.h>
 #include <ProjectMotionPlanning/TrajectoryInverseKinematics.h>
+#include "TrajectoryTextMetadata.h"
 
 #include <exception>
 
@@ -71,6 +72,11 @@ double positiveTimeStepNear(const std::vector<robottrajectory::TimedCartesianPoi
 void invalidateSolvedJointTrajectory(StoredMotionPlan& plan)
 {
     plan.trajectory.points.clear();
+    auto metadata=nlohmann::json::parse(plan.optimizationMetadata,nullptr,false);
+    if(metadata.is_object()) {
+        for(const char* key:{"spray_axis_continuity","spray_enabled","source_stations","spray_axis"})metadata.erase(key);
+        plan.optimizationMetadata=metadata.dump();
+    }
 }
 
 } // namespace
@@ -269,9 +275,12 @@ bool ProjectTrajectoryControlPointEditor::serializeCartesianMatrices(const Store
         }
         const auto metadata=nlohmann::json::parse(plan.optimizationMetadata,nullptr,false);
         const std::string convention=metadata.is_object()?metadata.value("joint_convention",std::string("caller")):"caller";
-        if(valid)text="# RWS_JOINT_SEEDS_V1 "+nlohmann::json{{"kind","tcp_joint_seeds_v1"},
+        nlohmann::json header={{"kind","tcp_joint_seeds_v1"},
             {"robot_id",plan.robotId},{"joint_names",plan.jointNames},{"points",joints},
-            {"motion",CartesianMotionSampler::isMoveL(plan)?"cartesian_linear":"joint_linear"},{"joint_convention",convention}}.dump()+"\n"+text;
+            {"motion",CartesianMotionSampler::isMoveL(plan)?"cartesian_linear":"joint_linear"},{"joint_convention",convention}};
+        try {detail::exportTrajectoryProcessMetadata(plan,header);}
+        catch(const std::exception& e){setError(errorMessage,e.what());text.clear();return false;}
+        if(valid)text="# RWS_JOINT_SEEDS_V1 "+header.dump()+"\n"+text;
     }
     return true;
 }
@@ -301,6 +310,7 @@ bool ProjectTrajectoryControlPointEditor::serializeJointTable(const StoredMotion
     std::ostringstream output;
     output.imbue(std::locale::classic());
     output << std::fixed << std::setprecision(6);
+    if(metadata.is_object() && metadata.contains("spray_enabled"))output<<std::setprecision(17);
     output << "# IK joint angle export\n# Time unit: seconds\n# Joint angle unit: degrees\ntime_s";
     for(std::size_t j = 0; j < plan.jointNames.size(); ++j) output << "\tJ" << j + 1 << "_deg";
     output << '\n';
@@ -317,10 +327,13 @@ bool ProjectTrajectoryControlPointEditor::serializeJointTable(const StoredMotion
         }
         rows.push_back({{"time", point.time}, {"q", point.q}});
     }
-    output << "# RWS_JOINT_TABLE_V1 " << nlohmann::json{
+    nlohmann::json header={
         {"kind", "joint_table_v1"}, {"robot_id", plan.robotId}, {"joint_names", plan.jointNames},
         {"motion", CartesianMotionSampler::isMoveL(plan) ? "cartesian_linear" : "joint_linear"},
-        {"joint_convention", convention}, {"points", rows}}.dump() << '\n';
+        {"joint_convention", convention}, {"points", rows}};
+    try {detail::exportTrajectoryProcessMetadata(plan,header);}
+    catch(const std::exception& e){setError(errorMessage,e.what());return false;}
+    output << "# RWS_JOINT_TABLE_V1 " << header.dump() << '\n';
     for(const auto& point : plan.trajectory.points) {
         output << point.time;
         for(double q : point.q) output << '\t' << q * 180.0 / 3.14159265358979323846;
